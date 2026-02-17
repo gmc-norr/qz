@@ -1,0 +1,18 @@
+[package]
+name = "bz-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "BZ command-line tool for BAM compression"
+
+[[bin]]
+name = "bz"
+path = "src/main.rs"
+
+[dependencies]
+bz-lib.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

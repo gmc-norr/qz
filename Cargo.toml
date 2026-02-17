@@ -1,0 +1,44 @@
+[workspace]
+members = ["crates/qz-lib", "crates/qz-cli", "crates/qz-python", "crates/qz-bench", "crates/bz-lib", "crates/bz-cli"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["QZ Contributors"]
+license = "SEE LICENSE FILE"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-with-debug]
+inherits = "release"
+strip = false
+debug = true
+
+[workspace.dependencies]
+anyhow = "1.0"
+rayon = "1.10"
+flate2 = "1.0"
+gzp = { version = "0.11", default-features = false, features = ["deflate_default"] }
+zstd = "0.13"
+constriction = "0.4"
+openzl-sys = "0.1"
+rustc-hash = "2"
+minimizer-iter = "1.2"
+syncmers = "0.1"
+libc = "0.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+tempfile = "3.13"
+cc = "1.0"
+memmap2 = "0.9"
+qz-lib = { path = "crates/qz-lib" }
+bz-lib = { path = "crates/bz-lib" }
+noodles = { version = "0.104", features = ["bam", "sam", "bgzf"] }

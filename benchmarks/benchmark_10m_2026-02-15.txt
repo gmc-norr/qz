@@ -1,0 +1,30 @@
+=== QZ Benchmark: 10M reads, 150bp WGS ===
+Input: ERR3239334_1.10m.fastq (3,661,155,213 bytes = 3,491 MB)
+Date: 2026-02-15
+CPU: 72 cores
+All benchmarks run sequentially (no concurrent load)
+All tools verified byte-identical roundtrip (except SPRING which reorders reads)
+
+┌───────────────────┬───────────┬───────┬──────────┬──────────┬──────────┬──────────┐
+│ Tool              │ Size (MB) │ Ratio │ Compress │ Comp RAM │ Decomp   │ Dec RAM  │
+├───────────────────┼───────────┼───────┼──────────┼──────────┼──────────┼──────────┤
+│ QZ default        │       446 │ 7.83x │   17.4s  │   5.5 GB │   14.8s  │   7.2 GB │
+│ QZ ultra 3        │       416 │ 8.40x │   37.0s  │  16.1 GB │   22.0s  │   8.5 GB │
+│ SPRING (no reord) │       431 │ 8.10x │  1:02.5  │  12.1 GB │   17.9s  │  10.0 GB │
+│ bzip2 -9          │       542 │ 6.44x │  2:49.6  │   7.3 MB │  1:30.6  │   4.5 MB │
+│ pigz -9           │       695 │ 5.02x │    9.7s  │  21.9 MB │    8.0s  │   1.7 MB │
+└───────────────────┴───────────┴───────┴──────────┴──────────┴──────────┴──────────┘
+
+Notes:
+- QZ default: pipelined chunked mode (2.5M reads/chunk), BSC adaptive no-LZP
+- QZ ultra 3: 5M reads/chunk (2 parallel), BSC adaptive with LZP
+  BWT thread cap raised to 16, OpenMP limited to 12 threads per BSC call
+- SPRING: local reorder only 
+- bzip2: single-threaded (1 core), hence slow wall time but low RAM
+- pigz: parallel gzip (72 threads), fastest wall time but worst compression ratio
+
+Changes since initial benchmark:
+- Ultra 3: LZP restored for compress_adaptive_mt (helps order/rl streams)
+  Compressed size improved 436.9 MB → 416 MB, speed 40.6s → 37.0s
+- libbsc bwt.cpp: BWT encode thread cap raised from 8 → 16
+- bsc.rs: OpenMP threads set to 12 for MT path (ultra/decompress_mt)

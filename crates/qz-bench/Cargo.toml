@@ -1,0 +1,74 @@
+[package]
+name = "qz-bench"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Benchmarking tools for QZ FASTQ compression"
+
+[dependencies]
+qz-lib.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+syncmers.workspace = true
+anyhow.workspace = true
+
+[[bin]]
+name = "analyze_hashes"
+path = "src/bin/analyze_hashes.rs"
+
+[[bin]]
+name = "bench_bsc_assists"
+path = "src/bin/bench_bsc_assists.rs"
+
+[[bin]]
+name = "bench_coil_strategies"
+path = "src/bin/bench_coil_strategies.rs"
+
+[[bin]]
+name = "bench_columnar"
+path = "src/bin/bench_columnar.rs"
+
+[[bin]]
+name = "bench_full_pipeline"
+path = "src/bin/bench_full_pipeline.rs"
+
+[[bin]]
+name = "bench_greedy_contig"
+path = "src/bin/bench_greedy_contig.rs"
+
+[[bin]]
+name = "bench_header_col"
+path = "src/bin/bench_header_col.rs"
+
+[[bin]]
+name = "bench_kmer_prior"
+path = "src/bin/bench_kmer_prior.rs"
+
+[[bin]]
+name = "bench_openzl_graphs"
+path = "src/bin/bench_openzl_graphs.rs"
+
+[[bin]]
+name = "bench_quality_ctx"
+path = "src/bin/bench_quality_ctx.rs"
+
+[[bin]]
+name = "bench_quality_reorder"
+path = "src/bin/bench_quality_reorder.rs"
+
+[[bin]]
+name = "bench_sequence_strategies"
+path = "src/bin/bench_sequence_strategies.rs"
+
+[[bin]]
+name = "bench_sort_strategies"
+path = "src/bin/bench_sort_strategies.rs"
+
+[[bin]]
+name = "bench_template"
+path = "src/bin/bench_template.rs"
+
+[[bin]]
+name = "bench_qctx_blocksize"
+path = "../../benchmarks/bench_qctx_blocksize.rs"

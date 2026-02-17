@@ -1,0 +1,18 @@
+[package]
+name = "qz-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "QZ command-line tool for FASTQ compression"
+
+[[bin]]
+name = "qz"
+path = "src/main.rs"
+
+[dependencies]
+qz-lib.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "qz-lib"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "High-performance FASTQ compression library using columnar encoding and BSC/BWT"
+
+[lib]
+name = "qz_lib"
+
+[dependencies]
+anyhow.workspace = true
+rayon.workspace = true
+flate2.workspace = true
+gzp.workspace = true
+zstd.workspace = true
+constriction.workspace = true
+openzl-sys.workspace = true
+rustc-hash.workspace = true
+minimizer-iter.workspace = true
+syncmers.workspace = true
+libc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+memmap2.workspace = true
+tempfile.workspace = true
+
+[build-dependencies]
+cc.workspace = true

@@ -1,0 +1,44 @@
+=== QZ Benchmark ===
+Date: 2026-02-17 10:31
+Input: ERR3239334_1.10m.fastq (3,661,155,213 bytes = 3492 MB)
+Threads: 72
+All benchmarks run sequentially (no concurrent load)
+
+## Results
+
+| Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM | Roundtrip |
+|------|-----------|-------|----------|----------|------------|---------|-----------|
+| QZ default | 435 | 8.03x | 20.9s | 5.9 GB | 14.4s | 7.0 GB | PASS |
+| QZ ultra 3 | 416 | 8.39x | 42.6s | 16.2 GB | 20.9s | 8.5 GB | PASS |
+
+## Raw timing data
+
+### QZ default — compress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz compress -i /home/parlar_ai/dev/qz/real_data/ERR3239334_1.10m.fastq -o /tmp/qz_bench_js8diw78/default.qz -t 72"
+  User time (seconds): 295.02
+  System time (seconds): 18.47
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:20.89
+  Maximum resident set size (kbytes): 6206660
+  Exit status: 0
+### QZ default — decompress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz decompress -i /tmp/qz_bench_js8diw78/default.qz -o /tmp/qz_bench_js8diw78/default_dec.fastq -t 72"
+  User time (seconds): 258.80
+  System time (seconds): 20.18
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:14.43
+  Maximum resident set size (kbytes): 7312908
+  Exit status: 0
+
+### QZ ultra 3 — compress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz compress --ultra 3 -i /home/parlar_ai/dev/qz/real_data/ERR3239334_1.10m.fastq -o /tmp/qz_bench_js8diw78/ultra3.qz -t 72"
+  User time (seconds): 477.19
+  System time (seconds): 26.94
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:42.64
+  Maximum resident set size (kbytes): 16990916
+  Exit status: 0
+### QZ ultra 3 — decompress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz decompress -i /tmp/qz_bench_js8diw78/ultra3.qz -o /tmp/qz_bench_js8diw78/ultra3_dec.fastq -t 72"
+  User time (seconds): 295.83
+  System time (seconds): 18.31
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:20.88
+  Maximum resident set size (kbytes): 8918240
+  Exit status: 0

@@ -1,0 +1,29 @@
+thread 'rustc' panicked at /rustc-dev/6efa357bff60d192688e02de0c78cae24a7f3a55/compiler/rustc_codegen_llvm/src/back/lto.rs:93:54:
+couldn't open rlib: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+stack backtrace:
+   0:     0x74901fd62b3b - <std[cdb9479801f2212]::backtrace::Backtrace>::create
+   1:     0x74901fd62a85 - <std[cdb9479801f2212]::backtrace::Backtrace>::force_capture
+   2:     0x74901ed531f0 - std[cdb9479801f2212]::panicking::update_hook::<alloc[b955d701586b82ad]::boxed::Box<rustc_driver_impl[bda132bf6546c841]::install_ice_hook::{closure#1}>>::{closure#0}
+   3:     0x74901fd75622 - std[cdb9479801f2212]::panicking::panic_with_hook
+   4:     0x74901fd58038 - std[cdb9479801f2212]::panicking::panic_handler::{closure#0}
+   5:     0x74901fd4c5a9 - std[cdb9479801f2212]::sys::backtrace::__rust_end_short_backtrace::<std[cdb9479801f2212]::panicking::panic_handler::{closure#0}, !>
+   6:     0x74901fd59a9d - __rustc[c7814f27025f9cf5]::rust_begin_unwind
+   7:     0x74901cbfce7c - core[146b6d8a7427327f]::panicking::panic_fmt
+   8:     0x74901c5c6732 - core[146b6d8a7427327f]::result::unwrap_failed
+   9:     0x749021985e3b - rustc_codegen_llvm[277e614417e4b6ba]::back::lto::prepare_lto
+  10:     0x74901eb6c54b - <rustc_codegen_llvm[277e614417e4b6ba]::LlvmCodegenBackend as rustc_codegen_ssa[7006b086d5f8af3a]::traits::write::WriteBackendMethods>::run_and_optimize_fat_lto
+  11:     0x74902181ae18 - <rustc_codegen_llvm[277e614417e4b6ba]::LlvmCodegenBackend as rustc_codegen_ssa[7006b086d5f8af3a]::traits::backend::CodegenBackend>::join_codegen
+  12:     0x74902181c214 - <rustc_interface[80ef507291031e9f]::queries::Linker>::link
+  13:     0x749021683a74 - rustc_interface[80ef507291031e9f]::interface::run_compiler::<(), rustc_driver_impl[bda132bf6546c841]::run_compiler::{closure#0}>::{closure#1}
+  14:     0x74902166d17e - std[cdb9479801f2212]::sys::backtrace::__rust_begin_short_backtrace::<rustc_interface[80ef507291031e9f]::util::run_in_thread_with_globals<rustc_interface[80ef507291031e9f]::util::run_in_thread_pool_with_globals<rustc_interface[80ef507291031e9f]::interface::run_compiler<(), rustc_driver_impl[bda132bf6546c841]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>
+  15:     0x74902166d6a0 - <std[cdb9479801f2212]::thread::lifecycle::spawn_unchecked<rustc_interface[80ef507291031e9f]::util::run_in_thread_with_globals<rustc_interface[80ef507291031e9f]::util::run_in_thread_pool_with_globals<rustc_interface[80ef507291031e9f]::interface::run_compiler<(), rustc_driver_impl[bda132bf6546c841]::run_compiler::{closure#0}>::{closure#1}, ()>::{closure#0}, ()>::{closure#0}::{closure#0}, ()>::{closure#1} as core[146b6d8a7427327f]::ops::function::FnOnce<()>>::call_once::{shim:vtable#0}
+  16:     0x74902166e52c - <std[cdb9479801f2212]::sys::thread::unix::Thread>::new::thread_start
+  17:     0x74901ae9caa4 - start_thread
+                               at ./nptl/pthread_create.c:447:8
+  18:     0x74901af29c6c - clone3
+                               at ./misc/../sysdeps/unix/sysv/linux/x86_64/clone3.S:78:0
+  19:                0x0 - <unknown>
+
+
+rustc version: 1.95.0-nightly (6efa357bf 2026-02-08)
+platform: x86_64-unknown-linux-gnu

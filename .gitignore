@@ -1,0 +1,35 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE / build
+.vscode/
+.idea/
+cmake-build-*/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test data and outputs
+test_data/
+*.qz
+decompressed*.fastq
+test_*_decompressed.fastq
+target/
+
+# Benchmark results
+benchmark_results/
+
+# Real data
+real_data/
+demo/
+
+# Third-party tools
+third_party/
+ideas/
+# pixi environments
+.pixi/*
+!.pixi/config.toml

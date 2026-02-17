@@ -1,0 +1,124 @@
+=== QZ Benchmark ===
+Date: 2026-02-17 19:23
+Input: ERR3239334_1.10m.fastq (3,661,155,213 bytes = 3492 MB)
+Threads: 72
+All benchmarks run sequentially (no concurrent load)
+
+## Results
+
+| Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM | Roundtrip |
+|------|-----------|-------|----------|----------|------------|---------|-----------|
+| pigz -9 | 695 | 5.02x | 9.7s | 20.8 MB | 7.9s | 1.7 MB | PASS |
+| bzip2 -9 | 542 | 6.44x | 2:47.8 | 7.3 MB | 1:26.6 | 4.5 MB | PASS |
+| SPRING | 431 | 8.10x | 1:01.4 | 11.9 GB | 15.4s | 10.0 GB | PASS |
+| QZ default | 435 | 8.03x | 17.4s | 5.8 GB | 13.8s | 6.9 GB | PASS |
+| QZ ultra 1 | 426 | 8.21x | 28.4s | 7.6 GB | 14.2s | 8.7 GB | PASS |
+| QZ ultra 3 | 416 | 8.39x | 37.1s | 13.8 GB | 21.6s | 8.5 GB | PASS |
+| QZ ultra 5 | 416 | 8.39x | 31.4s | 14.0 GB | 1:02.5 | 8.5 GB | PASS |
+
+## Raw timing data
+
+### pigz -9 — compress
+  Command being timed: "pigz -9 -p 72 -c /home/parlar_ai/dev/qz/real_data/symlinked/ERR3239334_1.10m.fastq"
+  User time (seconds): 683.72
+  System time (seconds): 2.20
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:09.71
+  Maximum resident set size (kbytes): 21312
+  Exit status: 0
+### pigz -9 — decompress
+  Command being timed: "pigz -d -p 72 -c /tmp/qz_bench_gn0r0k0e/compressed.gz"
+  User time (seconds): 11.20
+  System time (seconds): 4.80
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:07.94
+  Maximum resident set size (kbytes): 1728
+  Exit status: 0
+
+### bzip2 -9 — compress
+  Command being timed: "bzip2 -9 -c /home/parlar_ai/dev/qz/real_data/symlinked/ERR3239334_1.10m.fastq"
+  User time (seconds): 166.74
+  System time (seconds): 1.05
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 2:47.82
+  Maximum resident set size (kbytes): 7488
+  Exit status: 0
+### bzip2 -9 — decompress
+  Command being timed: "bzip2 -d -c /tmp/qz_bench_gn0r0k0e/compressed.bz2"
+  User time (seconds): 84.52
+  System time (seconds): 2.04
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 1:26.59
+  Maximum resident set size (kbytes): 4608
+  Exit status: 0
+
+### SPRING — compress
+  Command being timed: "/home/parlar_ai/dev/qz/.pixi/envs/default/bin/spring -c -i /home/parlar_ai/dev/qz/real_data/symlinked/ERR3239334_1.10m.fastq -o /tmp/qz_bench_gn0r0k0e/spring.spring -t 72 -w /tmp/qz_bench_gn0r0k0e/spring_work"
+  User time (seconds): 2147.88
+  System time (seconds): 32.70
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 1:01.42
+  Maximum resident set size (kbytes): 12446624
+  Exit status: 0
+### SPRING — decompress
+  Command being timed: "/home/parlar_ai/dev/qz/.pixi/envs/default/bin/spring -d -i /tmp/qz_bench_gn0r0k0e/spring.spring -o /tmp/qz_bench_gn0r0k0e/spring_dec.fastq -t 72 -w /tmp/qz_bench_gn0r0k0e/spring_work"
+  User time (seconds): 240.32
+  System time (seconds): 63.41
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:15.37
+  Maximum resident set size (kbytes): 10451504
+  Exit status: 0
+
+### QZ default — compress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz compress -i /home/parlar_ai/dev/qz/real_data/symlinked/ERR3239334_1.10m.fastq -o /tmp/qz_bench_gn0r0k0e/default.qz -t 72"
+  User time (seconds): 222.13
+  System time (seconds): 14.41
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:17.38
+  Maximum resident set size (kbytes): 6067160
+  Exit status: 0
+### QZ default — decompress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz decompress -i /tmp/qz_bench_gn0r0k0e/default.qz -o /tmp/qz_bench_gn0r0k0e/default_dec.fastq -t 72"
+  User time (seconds): 232.68
+  System time (seconds): 17.59
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:13.79
+  Maximum resident set size (kbytes): 7201112
+  Exit status: 0
+
+### QZ ultra 1 — compress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz compress --ultra 1 -i /home/parlar_ai/dev/qz/real_data/symlinked/ERR3239334_1.10m.fastq -o /tmp/qz_bench_gn0r0k0e/ultra1.qz -t 72"
+  User time (seconds): 478.80
+  System time (seconds): 25.31
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:28.44
+  Maximum resident set size (kbytes): 7924124
+  Exit status: 0
+### QZ ultra 1 — decompress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz decompress -i /tmp/qz_bench_gn0r0k0e/ultra1.qz -o /tmp/qz_bench_gn0r0k0e/ultra1_dec.fastq -t 72"
+  User time (seconds): 362.74
+  System time (seconds): 28.91
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:14.18
+  Maximum resident set size (kbytes): 9140912
+  Exit status: 0
+
+### QZ ultra 3 — compress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz compress --ultra 3 -i /home/parlar_ai/dev/qz/real_data/symlinked/ERR3239334_1.10m.fastq -o /tmp/qz_bench_gn0r0k0e/ultra3.qz -t 72"
+  User time (seconds): 467.80
+  System time (seconds): 24.45
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:37.13
+  Maximum resident set size (kbytes): 14504812
+  Exit status: 0
+### QZ ultra 3 — decompress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz decompress -i /tmp/qz_bench_gn0r0k0e/ultra3.qz -o /tmp/qz_bench_gn0r0k0e/ultra3_dec.fastq -t 72"
+  User time (seconds): 277.31
+  System time (seconds): 19.29
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:21.56
+  Maximum resident set size (kbytes): 8915508
+  Exit status: 0
+
+### QZ ultra 5 — compress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz compress --ultra 5 -i /home/parlar_ai/dev/qz/real_data/symlinked/ERR3239334_1.10m.fastq -o /tmp/qz_bench_gn0r0k0e/ultra5.qz -t 72"
+  User time (seconds): 390.38
+  System time (seconds): 17.23
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 0:31.45
+  Maximum resident set size (kbytes): 14714388
+  Exit status: 0
+### QZ ultra 5 — decompress
+  Command being timed: "/home/parlar_ai/dev/qz/target/release/qz decompress -i /tmp/qz_bench_gn0r0k0e/ultra5.qz -o /tmp/qz_bench_gn0r0k0e/ultra5_dec.fastq -t 72"
+  User time (seconds): 161.93
+  System time (seconds): 14.70
+  Elapsed (wall clock) time (h:mm:ss or m:ss): 1:02.53
+  Maximum resident set size (kbytes): 8885308
+  Exit status: 0
