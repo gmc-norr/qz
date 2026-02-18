@@ -12,7 +12,25 @@ All streams are split into blocks (25 MB for BSC, 500K reads for quality_ctx) an
 
 ## Results
 
-10M reads, 150 bp, whole-genome sequencing (ERR3239334), 3,492 MB uncompressed. 72-core machine, sequential runs, byte-identical roundtrip verified via MD5.
+10M reads, 150 bp, whole-genome sequencing (ERR3239334), 3,492 MB uncompressed. Sequential runs, byte-identical roundtrip verified via MD5.
+
+| Component | Specification |
+|-----------|--------------|
+| CPU | 72 cores, 128 GB RAM |
+| GPU | NVIDIA RTX 2080 Ti (11 GB VRAM) |
+
+### With CUDA GPU acceleration
+
+QZ built with `--features cuda`. GPU accelerates the BWT suffix array construction.
+
+| Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
+|------|-----------|-------|----------|----------|------------|---------|
+| **QZ default** | 435 | **8.03x** | 15.0 s | 4.1 GB | 13.6 s | 6.2 GB |
+| **QZ ultra 1** | 426 | **8.21x** | 18.1 s | 5.5 GB | 12.9 s | 6.4 GB |
+| **QZ ultra 3** | 416 | **8.39x** | 35.7 s | 14.0 GB | 14.3 s | 6.2 GB |
+| **QZ ultra 5** | 416 | **8.39x** | 35.6 s | 13.9 GB | 48.5 s | 6.1 GB |
+
+### CPU only
 
 | Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
 |------|-----------|-------|----------|----------|------------|---------|
@@ -24,7 +42,7 @@ All streams are split into blocks (25 MB for BSC, 500K reads for quality_ctx) an
 | bzip2 -9 | 542 | 6.44x | 2:47.8 | 7.3 MB | 1:26.6 | 4.5 MB |
 | pigz -9 | 695 | 5.02x | 9.7 s | 20.8 MB | 7.9 s | 1.7 MB |
 
-SPRING was run without `-r` (read order preserved). Raw timing data in [`benchmarks/results_10m_all_ultra.txt`](benchmarks/results_10m_all_ultra.txt).
+SPRING was run without `-r` (read order preserved). Raw timing data in [`benchmarks/results_10m_cuda.txt`](benchmarks/results_10m_cuda.txt) and [`benchmarks/results_10m_all_ultra.txt`](benchmarks/results_10m_all_ultra.txt).
 
 ## Architecture
 
@@ -421,6 +439,16 @@ rustup install nightly
 rustup run nightly cargo build --release
 # Binary: target/release/qz
 ```
+
+### Build with CUDA GPU acceleration (optional)
+
+CUDA accelerates the BWT suffix array construction via [libcubwt](https://github.com/IlyaGrebnov/libcubwt). Requires NVIDIA GPU with CUDA toolkit installed.
+
+```bash
+rustup run nightly cargo build --release --features cuda
+```
+
+Falls back to CPU gracefully when GPU is unavailable at runtime.
 
 ### Python bindings
 

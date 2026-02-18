@@ -32,6 +32,17 @@ const LIBBSC_CODER_QLFC_ADAPTIVE: c_int = 2;
 // Features (bitmask)
 const LIBBSC_FEATURE_FASTMODE: c_int = 1;
 const LIBBSC_FEATURE_MULTITHREADING: c_int = 2;
+#[cfg(feature = "cuda")]
+const LIBBSC_FEATURE_CUDA: c_int = 8;
+
+/// Returns LIBBSC_FEATURE_CUDA when cuda feature is enabled, 0 otherwise.
+#[inline]
+fn cuda_feature() -> c_int {
+    #[cfg(feature = "cuda")]
+    { LIBBSC_FEATURE_CUDA }
+    #[cfg(not(feature = "cuda"))]
+    { 0 }
+}
 
 // Header size
 const LIBBSC_HEADER_SIZE: usize = 28;
@@ -82,7 +93,8 @@ fn ensure_initialized() {
     BSC_INIT.call_once(|| {
         unsafe {
             // Init with both features so we can use either per-call
-            let result = bsc_init(LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING);
+            let features = LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING | cuda_feature();
+            let result = bsc_init(features);
             if result != LIBBSC_NO_ERROR {
                 eprintln!("Warning: BSC initialization failed with code {}", result);
             }
@@ -125,7 +137,7 @@ pub fn compress_with_params(
             lzp_min_len as c_int,
             block_sorter,
             coder,
-            LIBBSC_FEATURE_FASTMODE,
+            LIBBSC_FEATURE_FASTMODE | cuda_feature(),
         )
     };
 
@@ -186,7 +198,7 @@ fn compress_mt_inner(data: &[u8], lzp_hash_size: i32, lzp_min_len: i32) -> Resul
             lzp_min_len as c_int,
             LIBBSC_BLOCKSORTER_BWT,
             LIBBSC_CODER_QLFC_ADAPTIVE,
-            LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING,
+            LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING | cuda_feature(),
         )
     };
 
@@ -316,13 +328,13 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Decompress BSC-compressed data
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
-    decompress_with_features(data, LIBBSC_FEATURE_FASTMODE)
+    decompress_with_features(data, LIBBSC_FEATURE_FASTMODE | cuda_feature())
 }
 
 /// Decompress with BSC-internal multithreading (OpenMP parallel inverse BWT).
 pub fn decompress_mt(data: &[u8]) -> Result<Vec<u8>> {
     unsafe { omp_set_num_threads(BSC_MT_THREADS); }
-    decompress_with_features(data, LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING)
+    decompress_with_features(data, LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING | cuda_feature())
 }
 
 fn decompress_with_features(data: &[u8], features: c_int) -> Result<Vec<u8>> {

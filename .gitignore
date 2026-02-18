@@ -33,3 +33,5 @@ ideas/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+manuscript.md

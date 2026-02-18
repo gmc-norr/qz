@@ -9,6 +9,10 @@ description = "High-performance FASTQ compression library using columnar encodin
 [lib]
 name = "qz_lib"
 
+[features]
+default = []
+cuda = []
+
 [dependencies]
 anyhow.workspace = true
 rayon.workspace = true

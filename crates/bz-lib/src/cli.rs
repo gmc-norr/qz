@@ -13,3 +13,10 @@ pub struct DecompressConfig {
     pub working_dir: PathBuf,
     pub threads: usize,
 }
+
+pub struct ExtractConfig {
+    pub input: PathBuf,
+    pub output_prefix: String,
+    pub working_dir: PathBuf,
+    pub threads: usize,
+}

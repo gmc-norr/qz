@@ -10,6 +10,10 @@ description = "QZ command-line tool for FASTQ compression"
 name = "qz"
 path = "src/main.rs"
 
+[features]
+default = []
+cuda = ["qz-lib/cuda"]
+
 [dependencies]
 qz-lib.workspace = true
 clap.workspace = true

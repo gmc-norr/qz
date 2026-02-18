@@ -19,6 +19,8 @@ enum Commands {
     Compress(CompressArgs),
     /// Decompress BZ archives to BAM
     Decompress(DecompressArgs),
+    /// Extract FASTQ from BAM and compress to QZ format
+    Extract(ExtractArgs),
 }
 
 #[derive(Parser)]
@@ -45,6 +47,22 @@ struct DecompressArgs {
     /// Output BAM file
     #[arg(short, long, value_name = "FILE", required = true)]
     output: PathBuf,
+    /// Working directory for temporary files
+    #[arg(short, long, default_value = ".")]
+    working_dir: PathBuf,
+    /// Number of threads (0 = auto-detect)
+    #[arg(short = 't', long, default_value = "0")]
+    threads: usize,
+}
+
+#[derive(Parser)]
+struct ExtractArgs {
+    /// Input BAM file
+    #[arg(short, long, value_name = "FILE", required = true)]
+    input: PathBuf,
+    /// Output prefix (creates {prefix}_R1.qz and {prefix}_R2.qz for paired-end, or {prefix}.qz for single-end)
+    #[arg(short, long, value_name = "PREFIX", required = true)]
+    output: String,
     /// Working directory for temporary files
     #[arg(short, long, default_value = ".")]
     working_dir: PathBuf,
@@ -92,6 +110,17 @@ fn main() -> Result<()> {
             };
             bz_lib::decompress(&config)?;
             info!("Decompression complete!");
+        }
+        Commands::Extract(args) => {
+            info!("Starting BAM to QZ extraction...");
+            let config = bz_lib::ExtractConfig {
+                input: args.input,
+                output_prefix: args.output,
+                working_dir: args.working_dir,
+                threads: args.threads,
+            };
+            bz_lib::extract(&config)?;
+            info!("Extraction complete!");
         }
     }
 
