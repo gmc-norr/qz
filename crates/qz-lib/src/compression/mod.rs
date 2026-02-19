@@ -147,6 +147,7 @@ pub(crate) fn header_compressor_to_code(compressor: HeaderCompressor) -> u8 {
         HeaderCompressor::Zstd => 0,
         HeaderCompressor::Bsc => 1,
         HeaderCompressor::OpenZl => 2,
+        HeaderCompressor::Columnar => 3,
     }
 }
 
@@ -156,6 +157,7 @@ fn code_to_header_compressor(code: u8) -> Result<HeaderCompressor> {
         0 => Ok(HeaderCompressor::Zstd),
         1 => Ok(HeaderCompressor::Bsc),
         2 => Ok(HeaderCompressor::OpenZl),
+        3 => Ok(HeaderCompressor::Columnar),
         _ => anyhow::bail!("Invalid header compressor code: {}", code),
     }
 }
@@ -383,9 +385,9 @@ fn humanize_bytes(bytes: usize) -> String {
 /// Compress a single stream into BSC blocks using rayon par_iter.
 /// Blocks are shrunk to actual compressed size to avoid excess capacity
 /// (BSC allocates output buffers = input + header, but compressed data is typically ~40%).
-fn compress_stream_to_bsc_blocks(data: &[u8], bsc_static: bool) -> Result<Vec<Vec<u8>>> {
+fn compress_stream_to_bsc_blocks(data: &[u8], bsc_static: bool, block_size_mb: usize) -> Result<Vec<Vec<u8>>> {
     use rayon::prelude::*;
-    const BSC_BLOCK_SIZE: usize = 25 * 1024 * 1024; // 25 MB: matches SPRING
+    let block_size = block_size_mb * 1024 * 1024;
 
     if data.is_empty() {
         return Ok(Vec::new());
@@ -397,7 +399,7 @@ fn compress_stream_to_bsc_blocks(data: &[u8], bsc_static: bool) -> Result<Vec<Ve
         bsc::compress_adaptive_no_lzp
     };
 
-    let mut blocks: Vec<Vec<u8>> = data.par_chunks(BSC_BLOCK_SIZE)
+    let mut blocks: Vec<Vec<u8>> = data.par_chunks(block_size)
         .map(|chunk| compress_fn(chunk))
         .collect::<Result<Vec<_>>>()?;
 
@@ -430,6 +432,7 @@ fn write_archive_header(
     encoding_type: u8,
     quality_binning: QualityBinning,
     quality_compressor: QualityCompressor,
+    header_compressor: HeaderCompressor,
     no_quality: bool,
     num_reads: usize,
     headers_len: usize,
@@ -456,7 +459,7 @@ fn write_archive_header(
     out.write_all(&[binning_to_code(quality_binning)])?;
     out.write_all(&[compressor_to_code(quality_compressor)])?;
     out.write_all(&[seq_compressor_to_code(SequenceCompressor::Bsc)])?;
-    out.write_all(&[header_compressor_to_code(HeaderCompressor::Bsc)])?;
+    out.write_all(&[header_compressor_to_code(header_compressor)])?;
     out.write_all(&[0u8])?;                          // quality_model = disabled
     out.write_all(&[0u8])?;                          // quality_delta = disabled
     out.write_all(&[0u8])?;                          // quality_dict = disabled
@@ -515,6 +518,7 @@ fn write_chunked_archive(
     output_path: &std::path::Path,
     quality_binning: QualityBinning,
     quality_compressor: QualityCompressor,
+    header_compressor: HeaderCompressor,
     no_quality: bool,
     encoding_type: u8,
     num_reads: usize,
@@ -539,14 +543,14 @@ fn write_chunked_archive(
     let mut output_file: Box<dyn Write> = if crate::cli::is_stdio_path(output_path) {
         Box::new(BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout().lock()))
     } else {
-        Box::new(std::fs::File::create(output_path)?)
+        Box::new(BufWriter::new(std::fs::File::create(output_path)?))
     };
 
     let rc_flags_len = rc_stream.as_ref().map(|rc| rc.flags_len).unwrap_or(0);
     let metadata_size = write_archive_header(
         &mut output_file, encoding_type, quality_binning, quality_compressor,
-        no_quality, num_reads, headers_len, sequences_len, qualities_len,
-        const_seq_len, const_qual_len, rc_flags_len,
+        header_compressor, no_quality, num_reads, headers_len, sequences_len,
+        qualities_len, const_seq_len, const_qual_len, rc_flags_len,
     )?;
 
     let copy_stream = |num_blocks: u32, tmp_path: &std::path::Path, out: &mut dyn Write| -> Result<()> {
@@ -617,6 +621,35 @@ fn decompress_headers_dispatch(
                     .context("Failed to decompress headers (OpenZL)")
             }
         }
+        HeaderCompressor::Columnar => {
+            // Columnar data is stored in block format:
+            // [num_blocks: u32][block_len: u32][num_reads: u32][columnar_blob]...
+            if headers.len() < 4 {
+                anyhow::bail!("Columnar header data too short");
+            }
+            let num_blocks = read_le_u32(headers, 0)? as usize;
+            let mut offset = 4;
+            let mut all_headers = Vec::with_capacity(num_reads);
+            for _ in 0..num_blocks {
+                let block_len = read_le_u32(headers, offset)? as usize;
+                offset += 4;
+                if offset + block_len > headers.len() {
+                    anyhow::bail!("Columnar header block truncated");
+                }
+                let block_data = &headers[offset..offset + block_len];
+                offset += block_len;
+                if block_data.len() < 4 {
+                    anyhow::bail!("Columnar header block too short for num_reads");
+                }
+                let chunk_reads = u32::from_le_bytes(
+                    [block_data[0], block_data[1], block_data[2], block_data[3]]
+                ) as usize;
+                let blob = &block_data[4..];
+                let chunk_headers = header_col::decompress_headers_columnar(blob, chunk_reads)?;
+                all_headers.extend(chunk_headers);
+            }
+            Ok(all_headers)
+        }
     }
 }
 
@@ -628,6 +661,13 @@ pub fn compress(args: &CompressConfig) -> Result<()> {
 /// Decompress a QZ archive back to FASTQ.
 pub fn decompress(args: &DecompressConfig) -> Result<()> {
     decompress_impl::decompress(args)
+}
+
+pub use decompress_impl::VerifyResult;
+
+/// Verify a QZ archive: decompress all streams and compute CRC32.
+pub fn verify(config: &crate::cli::VerifyConfig) -> Result<VerifyResult> {
+    decompress_impl::verify(config)
 }
 
 /// Write variable-length integer
@@ -676,8 +716,8 @@ fn compress_zstd(data: &[u8], level: i32) -> Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("Zstd compression failed: {}", e))
 }
 
-/// Decompress data with Zstd
+/// Decompress data with Zstd (streaming — no size limit)
 fn decompress_zstd(compressed: &[u8]) -> Result<Vec<u8>> {
-    zstd::bulk::decompress(compressed, 100_000_000) // 100MB limit
+    zstd::stream::decode_all(compressed)
         .map_err(|e| anyhow::anyhow!("Zstd decompression failed: {}", e))
 }

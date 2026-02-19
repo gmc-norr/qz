@@ -21,28 +21,30 @@ All streams are split into blocks (25 MB for BSC, 500K reads for quality_ctx) an
 
 ### With CUDA GPU acceleration
 
-QZ built with `--features cuda`. GPU accelerates the BWT suffix array construction.
+QZ built with `--features cuda`. GPU accelerates the BWT suffix array construction. Warns at startup if GPU VRAM is insufficient for the configured block size.
 
 | Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
 |------|-----------|-------|----------|----------|------------|---------|
-| **QZ default** | 435 | **8.03x** | 15.0 s | 4.1 GB | 13.6 s | 6.2 GB |
-| **QZ ultra 1** | 426 | **8.21x** | 18.1 s | 5.5 GB | 12.9 s | 6.4 GB |
-| **QZ ultra 3** | 416 | **8.39x** | 35.7 s | 14.0 GB | 14.3 s | 6.2 GB |
-| **QZ ultra 5** | 416 | **8.39x** | 35.6 s | 13.9 GB | 48.5 s | 6.1 GB |
+| **QZ default** | 427 | **8.17x** | 18.2 s | 4.3 GB | 31.6 s | 6.6 GB |
+| **QZ ultra 1** | 418 | **8.35x** | 19.9 s | 6.2 GB | 34.1 s | 6.9 GB |
+| **QZ ultra 3** | 408 | **8.55x** | 44.4 s | 14.9 GB | 30.6 s | 6.6 GB |
+| **QZ ultra 5** | 408 | **8.56x** | 43.7 s | 14.8 GB | 49.7 s | 6.6 GB |
+
+Note: Ultra 3 and 5 compress paths exceed GPU VRAM (750 MB sequence blocks need ~15.8 GB; RTX 2080 Ti has 11 GB). BWT falls back to CPU for these blocks. Decompress still benefits from GPU (inverse BWT needs less VRAM).
 
 ### CPU only
 
 | Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
 |------|-----------|-------|----------|----------|------------|---------|
-| **QZ default** | 435 | **8.03x** | 17.4 s | 5.8 GB | 13.8 s | 6.9 GB |
-| **QZ ultra 1** | 426 | **8.21x** | 28.4 s | 7.6 GB | 14.2 s | 8.7 GB |
-| **QZ ultra 3** | 416 | **8.39x** | 37.1 s | 13.8 GB | 21.6 s | 8.5 GB |
-| **QZ ultra 5** | 416 | **8.39x** | 31.4 s | 14.0 GB | 1:02.5 | 8.5 GB |
+| **QZ default** | 427 | **8.17x** | 22.7 s | 5.4 GB | 33.5 s | 7.5 GB |
+| **QZ ultra 1** | 418 | **8.35x** | 30.4 s | 7.9 GB | 33.5 s | 8.0 GB |
+| **QZ ultra 3** | 408 | **8.55x** | 42.9 s | 14.9 GB | 40.1 s | 7.7 GB |
+| **QZ ultra 5** | 408 | **8.56x** | 44.5 s | 14.7 GB | 66.7 s | 9.0 GB |
 | SPRING | 431 | 8.10x | 1:01.4 | 11.9 GB | 15.4 s | 10.0 GB |
 | bzip2 -9 | 542 | 6.44x | 2:47.8 | 7.3 MB | 1:26.6 | 4.5 MB |
 | pigz -9 | 695 | 5.02x | 9.7 s | 20.8 MB | 7.9 s | 1.7 MB |
 
-SPRING was run without `-r` (read order preserved). Raw timing data in [`benchmarks/results_10m_cuda.txt`](benchmarks/results_10m_cuda.txt) and [`benchmarks/results_10m_all_ultra.txt`](benchmarks/results_10m_all_ultra.txt).
+SPRING was run without `-r` (read order preserved).
 
 ## Architecture
 
@@ -264,14 +266,7 @@ The default compression path uses **FASTMODE only**: each 25 MB block gets a sin
 
 The MT path (`FASTMODE | MULTITHREADING`) is available for single large blocks where intra-block parallelism matters more. When used, OpenMP threads are capped at 12 via `omp_set_num_threads()`.
 
-**libbsc modification.** QZ patches one file in the libbsc source: `bwt.cpp`. Upstream libbsc caps the thread count passed to `libsais_bwt_omp()` at 8. QZ raises this cap to 16 to better utilize high-core machines:
-
-```c
-// upstream:  numThreads > 8 ? 8 : numThreads
-// QZ:        numThreads > 16 ? 16 : numThreads
-```
-
-This affects both `libsais_bwt_aux_omp()` and `libsais_bwt_omp()` calls. On a 72-core system, the effective thread count per BWT call is `min(omp_get_max_threads() / omp_get_num_threads(), 16)`, allowing better scaling when the MT path is used for large individual blocks.
+**libbsc usage.** QZ uses unmodified libbsc source. The upstream BWT thread cap (8 threads per `libsais_bwt_omp()` call) is retained. On high-core machines, the rayon inter-block parallelism provides scaling rather than intra-block OpenMP threading.
 
 ### Quality score compression
 
@@ -448,7 +443,7 @@ CUDA accelerates the BWT suffix array construction via [libcubwt](https://github
 rustup run nightly cargo build --release --features cuda
 ```
 
-Falls back to CPU gracefully when GPU is unavailable at runtime.
+Falls back to CPU gracefully when GPU is unavailable at runtime. Warns at startup if GPU VRAM is insufficient for the configured block size.
 
 ### Python bindings
 
@@ -480,6 +475,14 @@ qz decompress -i reads.qz -o reads.fastq
 qz decompress -i reads.qz -o reads.fastq.gz --gzipped           # gzipped output
 ```
 
+### Verify
+
+Verify archive integrity without writing output. Fully decompresses all streams and reports metadata and a CRC32 hash.
+
+```bash
+qz verify -i reads.qz
+```
+
 ### Piping (stdin/stdout)
 
 Use `-` for `-i` or `-o` to read from stdin or write to stdout:
@@ -508,6 +511,7 @@ All log output goes to stderr, so stdout remains clean for piped data. Decompres
 | `-q, --quality-mode MODE` | `lossless`, `illumina-bin`, or `discard` | `lossless` |
 | `--no-quality` | Equivalent to `--quality-mode discard` | off |
 | `--ultra [LEVEL]` | Ultra compression (1–5, or omit for auto) | off |
+| `--config FILE` | JSON config file for advanced compression options | none |
 
 **Decompress:**
 
@@ -519,6 +523,14 @@ All log output goes to stderr, so stdout remains clean for piped data. Decompres
 | `-t, --threads N` | Thread count | auto |
 | `--gzipped` | Output gzipped FASTQ | off |
 | `--gzip-level N` | Gzip level (0–9) | `6` |
+
+**Verify:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i, --input FILE` | Input QZ archive | required |
+| `-w, --working-dir PATH` | Working directory for temp files | `.` |
+| `-t, --threads N` | Thread count | auto |
 
 ### Python
 
@@ -557,7 +569,6 @@ qz/
 ├── Cargo.toml                     workspace root
 ├── third_party/
 │   ├── libbsc/                    libbsc (BWT + QLFC), compiled via build.rs
-│   │   └── libbsc/bwt/bwt.cpp     ← patched: BWT thread cap 8→16
 │   └── htscodecs/                 htscodecs (fqzcomp quality codec), unmodified
 ├── crates/
 │   ├── qz-lib/                    core library (all algorithms, no CLI deps)
@@ -591,7 +602,7 @@ qz/
 
 `build.rs` compiles two C/C++ libraries as static archives linked into the final binary:
 
-**libbsc** — Block-sorting compressor. All source files are compiled with `-O3 -march=native -std=c++11 -fopenmp`. The `LIBBSC_OPENMP_SUPPORT` and `LIBSAIS_OPENMP` defines enable OpenMP-parallel BWT/suffix-array construction. One source file is patched (see [BSC block compression](#bsc-block-compression) above).
+**libbsc** — Block-sorting compressor. All source files are compiled with `-O3 -march=native -std=c++11 -fopenmp`. The `LIBBSC_OPENMP_SUPPORT` and `LIBSAIS_OPENMP` defines enable OpenMP-parallel BWT/suffix-array construction. No modifications to upstream source.
 
 **htscodecs** — Only `fqzcomp_qual.c` and `utils.c` are compiled (not the full library). These provide the fqzcomp quality compression algorithm, available as an alternative quality backend. No modifications to upstream source.
 
@@ -601,7 +612,7 @@ qz/
 rustup run nightly cargo test --release
 ```
 
-131 tests total: 88 unit tests (per-module codec roundtrips) and 43 integration tests covering lossless, lossy quality modes, ultra mode, FASTA, arithmetic/de Bruijn/delta/RLE encodings, error handling on corrupt archives, and edge cases.
+123 tests covering lossless and lossy quality modes, ultra mode, FASTA, verify, piping, error handling on corrupt archives, and edge cases.
 
 ## Environment Variables
 

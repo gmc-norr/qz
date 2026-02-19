@@ -25,7 +25,15 @@ use super::codecs;
 pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Result<()> {
     use std::io::Write;
 
-    let chunk_size: usize = if sort_chunks { 5_000_000 } else { 2_500_000 };
+    // Warn early if GPU VRAM is too small for the BSC block size
+    super::bsc::check_cuda_vram(args.advanced.bsc_block_size_mb * 1024 * 1024);
+
+    let chunk_size: usize = if sort_chunks {
+        args.advanced.chunk_records * 2
+    } else {
+        args.advanced.chunk_records
+    };
+    let bsc_block_mb = args.advanced.bsc_block_size_mb;
     let start_time = Instant::now();
     let input_path = &args.input[0];
     let bsc_static = args.advanced.bsc_static;
@@ -104,10 +112,11 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
         fn drop(&mut self) { for p in &self.0 { let _ = std::fs::remove_file(p); } }
     }
     let working_dir = &args.working_dir;
-    let h_tmp_path = working_dir.join(".qz_chunked_h.tmp");
-    let s_tmp_path = working_dir.join(".qz_chunked_s.tmp");
-    let q_tmp_path = working_dir.join(".qz_chunked_q.tmp");
-    let rc_tmp_path = working_dir.join(".qz_chunked_rc.tmp");
+    let pid = std::process::id();
+    let h_tmp_path = working_dir.join(format!(".qz_chunked_h_{pid}.tmp"));
+    let s_tmp_path = working_dir.join(format!(".qz_chunked_s_{pid}.tmp"));
+    let q_tmp_path = working_dir.join(format!(".qz_chunked_q_{pid}.tmp"));
+    let rc_tmp_path = working_dir.join(format!(".qz_chunked_rc_{pid}.tmp"));
 
     let (mut h_tmp, mut s_tmp, mut q_tmp, mut rc_tmp, _cleanup);
     let (mut h_num_blocks, mut s_num_blocks, mut q_num_blocks, mut rc_num_blocks) = (0u32, 0u32, 0u32, 0u32);
@@ -161,22 +170,39 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
                 )?;
 
                 // Parallel compress: headers ‖ (sequences ‖ quality)
+                let use_columnar_headers = args.advanced.header_compressor == HeaderCompressor::Columnar;
                 let (h_result, (s_result, q_result)) = rayon::join(
                     || -> Result<Vec<Vec<u8>>> {
                         let t = Instant::now();
-                        let r = compress_stream_to_bsc_blocks(&h_data, bsc_static);
-                        info!("  BSC headers: {:.2}s", t.elapsed().as_secs_f64());
+                        let r = if use_columnar_headers {
+                            // Columnar: compress headers from records directly
+                            let header_strs: Vec<String> = records.iter()
+                                .map(|r| String::from_utf8_lossy(&r.id).into_owned())
+                                .collect();
+                            let header_refs: Vec<&str> = header_strs.iter().map(|s| s.as_str()).collect();
+                            let blob = header_col::compress_headers_columnar(&header_refs)?;
+                            // Prepend num_reads so decompressor knows how many headers per block
+                            let mut prefixed = Vec::with_capacity(4 + blob.len());
+                            prefixed.extend_from_slice(&(header_refs.len() as u32).to_le_bytes());
+                            prefixed.extend_from_slice(&blob);
+                            info!("  Columnar headers: {:.2}s", t.elapsed().as_secs_f64());
+                            Ok(vec![prefixed])
+                        } else {
+                            let r = compress_stream_to_bsc_blocks(&h_data, bsc_static, bsc_block_mb);
+                            info!("  BSC headers: {:.2}s", t.elapsed().as_secs_f64());
+                            r
+                        };
                         r
                     },
                     || rayon::join(
                     || -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
                         let t = Instant::now();
-                        let s_blocks = compress_stream_to_bsc_blocks(&s_data, bsc_static)?;
+                        let s_blocks = compress_stream_to_bsc_blocks(&s_data, bsc_static, bsc_block_mb)?;
                         info!("  BSC sequences: {:.2}s", t.elapsed().as_secs_f64());
                         let rc_blocks = if rc_data.is_empty() {
                             Vec::new()
                         } else {
-                            compress_stream_to_bsc_blocks(&rc_data, bsc_static)?
+                            compress_stream_to_bsc_blocks(&rc_data, bsc_static, bsc_block_mb)?
                         };
                         Ok((s_blocks, rc_blocks))
                     },
@@ -190,7 +216,7 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
                         } else if use_quality_ctx {
                             use rayon::prelude::*;
                             let qual_refs: Vec<&[u8]> = records.iter()
-                                .filter_map(|r| r.quality.as_deref())
+                                .map(|r| r.quality.as_deref().unwrap_or(&[]))
                                 .collect();
                             let seq_refs: Vec<&[u8]> = records.iter()
                                 .map(|r| r.sequence.as_slice())
@@ -215,7 +241,7 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
                                 Ok(blobs)
                             }
                         } else {
-                            compress_stream_to_bsc_blocks(&q_data, bsc_static)
+                            compress_stream_to_bsc_blocks(&q_data, bsc_static, bsc_block_mb)
                         };
                         info!("  Quality: {:.2}s", qt.elapsed().as_secs_f64());
                         qr
@@ -325,7 +351,8 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
             None
         };
         write_chunked_archive(
-            &args.output, stream_quality_binning, quality_compressor_used, no_quality, encoding_type,
+            &args.output, stream_quality_binning, quality_compressor_used,
+            args.advanced.header_compressor, no_quality, encoding_type,
             num_reads, headers_len, sequences_len, qualities_len,
             h_num_blocks, s_num_blocks, q_num_blocks,
             &h_tmp_path, &s_tmp_path, &q_tmp_path,
@@ -361,8 +388,9 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
 
         let metadata_size = write_archive_header(
             &mut output_file, encoding_type, stream_quality_binning, quality_compressor_used,
-            no_quality, num_reads, headers_len, sequences_len, qualities_len,
-            global_const_seq_len, global_const_qual_len, rc_flags_len,
+            args.advanced.header_compressor, no_quality, num_reads, headers_len,
+            sequences_len, qualities_len, global_const_seq_len, global_const_qual_len,
+            rc_flags_len,
         )?;
 
         // Write streams in multi-block format: [num_blocks: u32][block_len: u32, block_data]...
@@ -407,6 +435,7 @@ pub(super) fn compress_global_reorder_bsc(args: &CompressConfig) -> Result<()> {
     let start_time = Instant::now();
     let input_path = &args.input[0];
     let bsc_static = args.advanced.bsc_static;
+    let bsc_block_mb = args.advanced.bsc_block_size_mb;
     let no_quality = args.no_quality;
     let quality_mode = args.quality_mode;
     let quality_binning = if no_quality {
@@ -418,16 +447,17 @@ pub(super) fn compress_global_reorder_bsc(args: &CompressConfig) -> Result<()> {
     info!("Global reorder mode: two-pass bucket sort with {} buckets", NUM_BUCKETS);
 
     let working_dir = &args.working_dir;
+    let pid = std::process::id();
 
     // --- Temp file setup ---
     // Bucket files for pass 1
     let bucket_paths: Vec<std::path::PathBuf> = (0..NUM_BUCKETS)
-        .map(|i| working_dir.join(format!(".qz_bucket_{:03}.tmp", i)))
+        .map(|i| working_dir.join(format!(".qz_bucket_{pid}_{i:03}.tmp")))
         .collect();
     // Output stream temp files (same as chunked mode)
-    let h_tmp_path = working_dir.join(".qz_reorder_h.tmp");
-    let s_tmp_path = working_dir.join(".qz_reorder_s.tmp");
-    let q_tmp_path = working_dir.join(".qz_reorder_q.tmp");
+    let h_tmp_path = working_dir.join(format!(".qz_reorder_h_{pid}.tmp"));
+    let s_tmp_path = working_dir.join(format!(".qz_reorder_s_{pid}.tmp"));
+    let q_tmp_path = working_dir.join(format!(".qz_reorder_q_{pid}.tmp"));
 
     // Cleanup guard for ALL temp files
     struct TmpCleanup(Vec<std::path::PathBuf>);
@@ -564,16 +594,16 @@ pub(super) fn compress_global_reorder_bsc(args: &CompressConfig) -> Result<()> {
         let (h_data, s_data, q_data, _rc_unused) = records_to_streams(&records, quality_mode, quality_binning, no_quality, args.advanced.sequence_hints, args.advanced.sequence_delta, false, 0, 0)?;
         drop(records);
 
-        let h_blocks = compress_stream_to_bsc_blocks(&h_data, bsc_static)?;
+        let h_blocks = compress_stream_to_bsc_blocks(&h_data, bsc_static, bsc_block_mb)?;
         drop(h_data);
         h_num_blocks += write_blocks_to_tmp(h_blocks, &mut h_tmp)?;
 
-        let s_blocks = compress_stream_to_bsc_blocks(&s_data, bsc_static)?;
+        let s_blocks = compress_stream_to_bsc_blocks(&s_data, bsc_static, bsc_block_mb)?;
         drop(s_data);
         s_num_blocks += write_blocks_to_tmp(s_blocks, &mut s_tmp)?;
 
         if !no_quality && !q_data.is_empty() {
-            let q_blocks = compress_stream_to_bsc_blocks(&q_data, bsc_static)?;
+            let q_blocks = compress_stream_to_bsc_blocks(&q_data, bsc_static, bsc_block_mb)?;
             q_num_blocks += write_blocks_to_tmp(q_blocks, &mut q_tmp)?;
         }
 
@@ -604,7 +634,8 @@ pub(super) fn compress_global_reorder_bsc(args: &CompressConfig) -> Result<()> {
     // Write final output (identical archive format)
     let encoding_type: u8 = if args.advanced.sequence_delta { 5 } else if args.advanced.sequence_hints { 4 } else { 0 };
     write_chunked_archive(
-        &args.output, quality_binning, QualityCompressor::Bsc, no_quality, encoding_type,
+        &args.output, quality_binning, QualityCompressor::Bsc,
+        HeaderCompressor::Bsc, no_quality, encoding_type,
         num_reads, headers_len, sequences_len, qualities_len,
         h_num_blocks, s_num_blocks, q_num_blocks,
         &h_tmp_path, &s_tmp_path, &q_tmp_path,
@@ -669,8 +700,9 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
         if args.advanced.sequence_compressor != SequenceCompressor::Bsc {
             anyhow::bail!("{mode_name} requires BSC sequence compressor (default)");
         }
-        if args.advanced.header_compressor != HeaderCompressor::Bsc {
-            anyhow::bail!("{mode_name} requires BSC header compressor (default)");
+        if args.advanced.header_compressor != HeaderCompressor::Bsc
+            && args.advanced.header_compressor != HeaderCompressor::Columnar {
+            anyhow::bail!("{mode_name} requires BSC or Columnar header compressor (default)");
         }
     }
 
@@ -678,9 +710,10 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
         anyhow::bail!("Expected exactly 1 input file, got {}", args.input.len());
     }
 
-    // Chunked pipeline: BSC for headers/sequences, no advanced quality encoding
+    // Chunked pipeline: BSC/Columnar for headers, BSC for sequences, no advanced quality encoding
     let can_stream = args.advanced.sequence_compressor == SequenceCompressor::Bsc
-        && args.advanced.header_compressor == HeaderCompressor::Bsc
+        && (args.advanced.header_compressor == HeaderCompressor::Bsc
+            || args.advanced.header_compressor == HeaderCompressor::Columnar)
         && !args.advanced.quality_modeling
         && !args.advanced.quality_delta
         && !args.advanced.dict_training
@@ -698,9 +731,10 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
         };
     }
 
-    // Local reorder mode: center-hash grouping + delta encoding
+    // Local reorder mode: uses ReorderLocal (same as ultra) with auto-selected level
     if args.advanced.local_reorder {
-        return ultra::compress_harc(args);
+        let level = ultra::resolve_ultra_level(0);
+        return ultra::compress_reorder_local_with_level(args, level);
     }
 
     // Ultra mode: level-based compression with auto-tuning
@@ -735,7 +769,7 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
 
     info!("Reading FASTQ file...");
     let input_path = &args.input[0];
-    let mut reader = FastqReader::from_path_or_stdin(input_path, false)?; // false = FASTQ format
+    let mut reader = FastqReader::from_path_or_stdin(input_path, args.fasta)?;
     let mut records = Vec::new();
 
     while let Some(record) = reader.next()? {
@@ -744,8 +778,8 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
 
     info!("Read {} records", records.len());
 
-    // Apply quality quantization if needed
-    let processed_records: Vec<FastqRecord> = if !args.no_quality {
+    // Apply quality quantization if needed (skip for lossless — avoids ~1.5 GB clone)
+    let processed_records: Vec<FastqRecord> = if !args.no_quality && args.quality_mode != QualityMode::Lossless {
         records
             .into_iter()
             .map(|mut record| {
@@ -882,6 +916,25 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
                     };
                     Ok((compressed, dummy_template))
                 }
+                HeaderCompressor::Columnar => {
+                    info!("Compressing headers with columnar encoding...");
+                    let blob = codecs::compress_headers_columnar(&processed_records)?;
+                    // Wrap in block format to match chunked path output:
+                    // [num_blocks: u32][block_len: u32][num_reads: u32][columnar_blob]
+                    let num_reads_u32 = processed_records.len() as u32;
+                    let block_data_len = 4 + blob.len();
+                    let mut compressed = Vec::with_capacity(8 + block_data_len);
+                    compressed.extend_from_slice(&1u32.to_le_bytes()); // 1 block
+                    compressed.extend_from_slice(&(block_data_len as u32).to_le_bytes());
+                    compressed.extend_from_slice(&num_reads_u32.to_le_bytes());
+                    compressed.extend_from_slice(&blob);
+                    let dummy_template = read_id::ReadIdTemplate {
+                        prefix: String::new(),
+                        has_comment: false,
+                        common_comment: None,
+                    };
+                    Ok((compressed, dummy_template))
+                }
             }
         },
         || -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
@@ -1004,7 +1057,11 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
 
     // Write v2 prefix + header body + data streams
     let header_size = V2_PREFIX_SIZE + hdr.len();
-    let mut output_file = std::fs::File::create(&args.output)?;
+    let mut output_file: Box<dyn Write> = if crate::cli::is_stdio_path(&args.output) {
+        Box::new(std::io::BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout().lock()))
+    } else {
+        Box::new(std::io::BufWriter::new(std::fs::File::create(&args.output)?))
+    };
     output_file.write_all(&ARCHIVE_MAGIC)?;
     output_file.write_all(&[ARCHIVE_VERSION, 0])?;
     output_file.write_all(&(header_size as u32).to_le_bytes())?;
@@ -1014,6 +1071,7 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
     output_file.write_all(&sequences)?;
     output_file.write_all(&nmasks)?;
     output_file.write_all(&qualities)?;
+    output_file.flush()?;
 
     let metadata_size = header_size;
     let total_compressed = headers.len() + sequences.len() + nmasks.len() + qualities.len() + metadata_size;

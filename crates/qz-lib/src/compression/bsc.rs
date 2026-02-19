@@ -44,6 +44,44 @@ fn cuda_feature() -> c_int {
     { 0 }
 }
 
+/// Query GPU VRAM and warn if it's too small for BWT at the given block size.
+/// `max_block_bytes` is the largest single BSC block that will be passed to BWT.
+/// libcubwt needs ~20.5× the input length in device memory for forward BWT.
+#[cfg(feature = "cuda")]
+pub fn check_cuda_vram(max_block_bytes: usize) {
+    use tracing::warn;
+
+    unsafe extern "C" {
+        fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
+    }
+
+    let mut free: usize = 0;
+    let mut total: usize = 0;
+    let status = unsafe { cudaMemGetInfo(&mut free, &mut total) };
+    if status != 0 {
+        warn!("Could not query GPU VRAM (cudaMemGetInfo returned {}). GPU acceleration may fail.", status);
+        return;
+    }
+
+    // libcubwt allocates with max_length = n + n/32, then ~20.5× that
+    let max_length = max_block_bytes + max_block_bytes / 32;
+    let estimated_vram = (max_length as f64 * 20.5) as usize;
+
+    if free < estimated_vram {
+        warn!(
+            "GPU VRAM may be insufficient: {:.0} MB free, ~{:.0} MB needed for {:.0} MB blocks. \
+             BWT will fall back to CPU for large blocks.",
+            free as f64 / 1_048_576.0,
+            estimated_vram as f64 / 1_048_576.0,
+            max_block_bytes as f64 / 1_048_576.0,
+        );
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+pub fn check_cuda_vram(_max_block_bytes: usize) {}
+
+
 // Header size
 const LIBBSC_HEADER_SIZE: usize = 28;
 

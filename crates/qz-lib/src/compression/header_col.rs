@@ -144,13 +144,29 @@ fn compress_sra(headers: &[&str]) -> Result<Vec<u8>> {
         return compress_raw_fallback(headers);
     }
 
-    // BSC-compress each column independently
-    let c_rn = bsc::compress_parallel_adaptive(&read_nums)?;
-    let c_ci = bsc::compress_parallel_adaptive(&combo_idxs)?;
-    let c_ln = bsc::compress_parallel_adaptive(&lanes)?;
-    let c_ti = bsc::compress_parallel_adaptive(&tiles)?;
-    let c_xs = bsc::compress_parallel_adaptive(&xs)?;
-    let c_ys = bsc::compress_parallel_adaptive(&ys)?;
+    // BSC-compress all 6 columns in parallel using rayon
+    let (c_rn, (c_ci, (c_ln, (c_ti, (c_xs, c_ys))))) = rayon::join(
+        || bsc::compress_parallel_adaptive(&read_nums),
+        || rayon::join(
+            || bsc::compress_parallel_adaptive(&combo_idxs),
+            || rayon::join(
+                || bsc::compress_parallel_adaptive(&lanes),
+                || rayon::join(
+                    || bsc::compress_parallel_adaptive(&tiles),
+                    || rayon::join(
+                        || bsc::compress_parallel_adaptive(&xs),
+                        || bsc::compress_parallel_adaptive(&ys),
+                    ),
+                ),
+            ),
+        ),
+    );
+    let c_rn = c_rn?;
+    let c_ci = c_ci?;
+    let c_ln = c_ln?;
+    let c_ti = c_ti?;
+    let c_xs = c_xs?;
+    let c_ys = c_ys?;
 
     // Build output
     let mut out = Vec::new();
@@ -311,12 +327,25 @@ fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
         return compress_raw_fallback(headers);
     }
 
-    // BSC-compress columns
-    let c_ci = bsc::compress_parallel_adaptive(&combo_idxs)?;
-    let c_ln = bsc::compress_parallel_adaptive(&lanes)?;
-    let c_ti = bsc::compress_parallel_adaptive(&tiles)?;
-    let c_xs = bsc::compress_parallel_adaptive(&xs)?;
-    let c_ys = bsc::compress_parallel_adaptive(&ys)?;
+    // BSC-compress all 5 spatial columns in parallel
+    let (c_ci, (c_ln, (c_ti, (c_xs, c_ys)))) = rayon::join(
+        || bsc::compress_parallel_adaptive(&combo_idxs),
+        || rayon::join(
+            || bsc::compress_parallel_adaptive(&lanes),
+            || rayon::join(
+                || bsc::compress_parallel_adaptive(&tiles),
+                || rayon::join(
+                    || bsc::compress_parallel_adaptive(&xs),
+                    || bsc::compress_parallel_adaptive(&ys),
+                ),
+            ),
+        ),
+    );
+    let c_ci = c_ci?;
+    let c_ln = c_ln?;
+    let c_ti = c_ti?;
+    let c_xs = c_xs?;
+    let c_ys = c_ys?;
 
     // Build output
     let mut out = Vec::new();

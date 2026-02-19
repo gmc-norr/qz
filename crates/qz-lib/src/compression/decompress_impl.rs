@@ -3,9 +3,55 @@
 use anyhow::{Context, Result};
 use std::time::Instant;
 use tracing::info;
-use crate::cli::DecompressConfig;
+use crate::cli::{DecompressConfig, VerifyConfig, HeaderCompressor, QualityCompressor};
 use super::*;
 use super::codecs;
+
+// ── Verify support ──────────────────────────────────────────────────────
+
+/// Writer that computes CRC32 of all bytes written, without storing them.
+struct HashWriter {
+    crc: flate2::Crc,
+}
+
+impl HashWriter {
+    fn new() -> Self {
+        Self { crc: flate2::Crc::new() }
+    }
+
+    fn checksum(&self) -> u32 {
+        self.crc.sum()
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.crc.amount() as u64
+    }
+}
+
+impl std::io::Write for HashWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.crc.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Result of archive verification.
+pub struct VerifyResult {
+    pub num_reads: usize,
+    pub encoding_type: u8,
+    pub header_compressor: HeaderCompressor,
+    pub quality_compressor: QualityCompressor,
+    pub headers_compressed_len: usize,
+    pub sequences_compressed_len: usize,
+    pub qualities_compressed_len: usize,
+    pub crc32: u32,
+    pub total_bytes: u64,
+    pub elapsed_secs: f64,
+}
 
 /// Block-by-block BSC stream decoder for memory-efficient decompression.
 ///
@@ -76,6 +122,81 @@ fn stream_decompressor_inner(
         }
 
         blocks_done += batch_size;
+    }
+
+    Ok(())
+}
+
+/// Streaming decompressor for columnar-encoded header blocks.
+/// Each block in the archive is: [num_reads: u32][columnar_blob].
+/// Decompresses to individual headers, re-encodes as varint-prefixed stream
+/// for compatibility with ChannelStreamBuffer.
+fn stream_decompressor_columnar(
+    path: &std::path::Path,
+    offset: u64,
+    stream_len: usize,
+    tx: std::sync::mpsc::SyncSender<std::result::Result<Vec<u8>, String>>,
+) {
+    if let Err(e) = stream_decompressor_columnar_inner(path, offset, stream_len, &tx) {
+        let _ = tx.send(Err(e.to_string()));
+    }
+}
+
+fn stream_decompressor_columnar_inner(
+    path: &std::path::Path,
+    offset: u64,
+    stream_len: usize,
+    tx: &std::sync::mpsc::SyncSender<std::result::Result<Vec<u8>, String>>,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if stream_len == 0 {
+        return Ok(());
+    }
+
+    let mut file = std::io::BufReader::with_capacity(
+        4 * 1024 * 1024,
+        std::fs::File::open(path)?,
+    );
+    file.seek(SeekFrom::Start(offset))?;
+
+    // Read num_blocks (same block format as BSC)
+    let mut buf4 = [0u8; 4];
+    file.read_exact(&mut buf4)?;
+    let num_blocks = u32::from_le_bytes(buf4) as usize;
+
+    for _ in 0..num_blocks {
+        // Read block: [block_len: u32][data]
+        file.read_exact(&mut buf4)?;
+        let block_len = u32::from_le_bytes(buf4) as usize;
+        let mut data = vec![0u8; block_len];
+        file.read_exact(&mut data)?;
+
+        // First 4 bytes of data = num_reads in this block
+        if data.len() < 4 {
+            anyhow::bail!("Columnar header block too short");
+        }
+        let chunk_reads = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        let blob = &data[4..];
+
+        // Decompress columnar blob to individual headers
+        let headers = header_col::decompress_headers_columnar(blob, chunk_reads)?;
+
+        // Re-encode as varint-prefixed stream for ChannelStreamBuffer compatibility
+        let mut stream = Vec::new();
+        for h in &headers {
+            let mut v = h.len();
+            while v >= 0x80 {
+                stream.push(((v & 0x7F) | 0x80) as u8);
+                v >>= 7;
+            }
+            stream.push(v as u8);
+            stream.extend_from_slice(h);
+        }
+
+        if tx.send(Ok(stream)).is_err() {
+            anyhow::bail!("Columnar decompressor channel closed");
+        }
     }
 
     Ok(())
@@ -159,18 +280,25 @@ impl ChannelStreamBuffer {
 
 /// Check if archive can use the streaming BSC decompression path.
 /// Reads the v2 header prefix + body to check all flags.
-pub(super) fn can_stream_decompress(args: &DecompressConfig) -> Result<bool> {
+fn can_stream_decompress_path(input: &std::path::Path) -> Result<bool> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(&args.input)?;
+    let mut file = std::fs::File::open(input)?;
     let mut header = [0u8; 60]; // v2 prefix (8) + base body (52)
     if file.read_exact(&mut header).is_err() {
         return Ok(false);
     }
 
-    // Validate v2 magic
+    // Validate v2 magic and version
     if header[0..2] != ARCHIVE_MAGIC {
         anyhow::bail!("Not a QZ archive (missing magic bytes)");
+    }
+    let version = header[2];
+    if version > ARCHIVE_VERSION {
+        anyhow::bail!(
+            "Archive version {} is newer than this build supports (max {}). Please update qz.",
+            version, ARCHIVE_VERSION
+        );
     }
 
     let b: usize = V2_PREFIX_SIZE; // body starts after v2 prefix
@@ -195,7 +323,7 @@ pub(super) fn can_stream_decompress(args: &DecompressConfig) -> Result<bool> {
         && nmasks_len == 0
         && quality_compressor == 1  // BSC
         && sequence_compressor == 1 // BSC
-        && header_compressor == 1)  // BSC
+        && (header_compressor == 1 || header_compressor == 3))  // BSC or Columnar
 }
 
 /// Memory-efficient parallel streaming decompression for BSC archives.
@@ -223,9 +351,16 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
     file.read_exact(&mut header[..60])
         .context("Failed to read archive header")?;
 
-    // Validate v2 magic
+    // Validate v2 magic and version
     if header[0..2] != ARCHIVE_MAGIC {
         anyhow::bail!("Not a QZ archive (missing magic bytes)");
+    }
+    let version = header[2];
+    if version > ARCHIVE_VERSION {
+        anyhow::bail!(
+            "Archive version {} is newer than this build supports (max {}). Please update qz.",
+            version, ARCHIVE_VERSION
+        );
     }
     let stored_header_size = read_le_u32(&header, 4)? as usize;
 
@@ -236,6 +371,7 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
     let has_rc_canon = encoding_type == 6;
     let quality_binning = code_to_binning(header[b + 2])?;
     let _has_comment = header[b + 11] != 0;
+    let header_compressor = header[b + 5];
 
     let num_reads = read_le_u64(&header, b + 12)? as usize;
     let headers_len = read_le_u64(&header, b + 20)? as usize;
@@ -323,13 +459,13 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
                 .from_writer(file)
         };
 
-        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset)?;
+        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset, header_compressor)?;
 
         output.finish().map_err(|e| anyhow::anyhow!("gzp finish error: {e}"))?;
     } else if is_stdout {
         let mut output = std::io::BufWriter::with_capacity(IO_BUFFER_SIZE, std::io::stdout().lock());
 
-        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset)?;
+        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset, header_compressor)?;
 
         output.flush()?;
     } else {
@@ -337,7 +473,7 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
             .with_context(|| format!("Failed to create output file: {:?}", output_path))?;
         let mut output = std::io::BufWriter::with_capacity(IO_BUFFER_SIZE, file);
 
-        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset)?;
+        stream_records_to_writer(&mut output, num_reads, archive_path, h_offset, headers_len, s_offset, sequences_len, q_offset, qualities_len, has_quality, const_seq_len, const_qual_len, has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon, rc_flags_len, rc_flags_offset, header_compressor)?;
 
         output.flush()?;
     }
@@ -372,6 +508,7 @@ fn stream_records_to_writer(
     has_rc_canon: bool,
     rc_flags_len: usize,
     rc_flags_offset: u64,
+    header_compressor_code: u8,
 ) -> Result<()> {
     std::thread::scope(|scope| -> Result<()> {
         // Bounded channels: capacity 2 = max 2 pre-decompressed blocks buffered per stream
@@ -380,7 +517,12 @@ fn stream_records_to_writer(
         let h_path = archive_path.to_path_buf();
         let s_path = archive_path.to_path_buf();
 
-        scope.spawn(move || stream_decompressor(&h_path, h_offset, headers_len, h_tx));
+        if header_compressor_code == 3 {
+            // Columnar: read columnar blobs, decompress to headers, re-encode as varint stream
+            scope.spawn(move || stream_decompressor_columnar(&h_path, h_offset, headers_len, h_tx));
+        } else {
+            scope.spawn(move || stream_decompressor(&h_path, h_offset, headers_len, h_tx));
+        }
         scope.spawn(move || stream_decompressor(&s_path, s_offset, sequences_len, s_tx));
 
         let q_rx = if has_quality {
@@ -510,11 +652,17 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         anyhow::bail!("Invalid archive: too small");
     }
 
-    // Validate v2 magic
+    // Validate v2 magic and version
     if data[0..2] != ARCHIVE_MAGIC {
         anyhow::bail!("Not a QZ archive (missing magic bytes)");
     }
-    let _version = data[2];
+    let version = data[2];
+    if version > ARCHIVE_VERSION {
+        anyhow::bail!(
+            "Archive version {} is newer than this build supports (max {}). Please update qz.",
+            version, ARCHIVE_VERSION
+        );
+    }
     let _stored_header_size = read_le_u32(data, 4)? as usize;
 
     // Body starts after v2 prefix
@@ -660,39 +808,13 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
     })
 }
 
-pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
-    use std::io::Write;
-
-    // If input is stdin, spool to a temp file first (decompression needs seeking)
-    let (_stdin_tmp, args) = if crate::cli::is_stdio_path(&args.input) {
-        info!("Reading archive from stdin...");
-        let mut tmp = tempfile::NamedTempFile::new_in(&args.working_dir)
-            .context("Failed to create temp file for stdin")?;
-        std::io::copy(&mut std::io::stdin().lock(), &mut tmp)
-            .context("Failed to spool stdin to temp file")?;
-        let path = tmp.path().to_path_buf();
-        let mut new_args = args.clone();
-        new_args.input = path;
-        (Some(tmp), std::borrow::Cow::Owned(new_args))
-    } else {
-        (None, std::borrow::Cow::Borrowed(args))
-    };
-    let args = &*args;
-
-    let start_time = Instant::now();
-
-    // Try streaming decompression for standard BSC archives (>100x less memory)
-    if can_stream_decompress(args)? {
-        return decompress_streaming_bsc(args);
-    }
-
-    info!("Input file: {:?}", args.input);
-    info!("Output files: {:?}", args.output);
-
+/// Decompress an archive into records without writing to disk.
+/// Returns the records and archive header metadata.
+fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io::FastqRecord>, ArchiveHeader)> {
     // Memory-map the compressed archive (no allocation, OS pages in on demand)
     info!("Memory-mapping compressed file...");
-    let input_file = std::fs::File::open(&args.input)
-        .with_context(|| format!("Failed to open archive: {:?}", args.input))?;
+    let input_file = std::fs::File::open(input_path)
+        .with_context(|| format!("Failed to open archive: {:?}", input_path))?;
     let archive_data = unsafe { memmap2::Mmap::map(&input_file) }
         .context("Failed to mmap archive")?;
 
@@ -743,8 +865,10 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
         // Decode headers and sequences in parallel
         // (quality_ctx needs sequences as context, so can't decompress qualities in parallel)
         let (header_result, seq_result) = rayon::join(
-            || codecs::decompress_headers_bsc(headers, num_reads)
-                .context("Failed to decompress headers"),
+            || super::decompress_headers_dispatch(
+                    header_compressor, headers, template_prefix_len,
+                    read_id_template, num_reads,
+                ).context("Failed to decompress headers"),
             || -> Result<ultra::HarcDecoded> {
                 if encoding_type == 8 {
                     ultra::decode_harc_sequences(sequences, num_reads)
@@ -761,7 +885,6 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
         let mut qual_strings: Vec<Option<Vec<u8>>> = vec![None; num_reads];
         if qualities_len > 0 {
             if use_quality_ctx {
-                // Quality_ctx: decompress using sequences as context (in reordered order)
                 let ctx_qualities = quality_ctx::decompress_quality_ctx_multiblock(
                     qualities, &decoded.sequences,
                 ).context("Failed to decompress qualities (quality_ctx)")?;
@@ -769,7 +892,6 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
                     qual_strings[i] = Some(q);
                 }
             } else {
-                // BSC: decompress and parse packed quality bytes
                 let qualities_data = codecs::decompress_qualities_data(qualities, quality_compressor)
                     .context("Failed to decompress qualities")?;
                 let mut qual_offset = 0;
@@ -819,8 +941,6 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
         info!("Decompressing streams in parallel...");
         let use_quality_ctx = quality_compressor == QualityCompressor::QualityCtx;
 
-        // Step 1: Parallel decompression of headers, sequences, qualities
-        // For quality_ctx: skip quality decompression here (needs sequences first)
         let (header_result, (seq_result, qual_result)) = rayon::join(
             || decompress_headers_dispatch(
                 header_compressor, headers, template_prefix_len, &read_id_template, num_reads,
@@ -895,8 +1015,6 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
         let decoded_sequences = seq_result?;
         let qualities_data = qual_result?;
 
-        // For quality_ctx: decompress qualities using sequences as context
-        // Must happen after sequences are available (breaks seq||qual parallelism)
         let quality_ctx_strings = if use_quality_ctx {
             info!("Decompressing quality scores (quality_ctx)...");
             Some(quality_ctx::decompress_quality_ctx_multiblock(qualities, &decoded_sequences)
@@ -905,12 +1023,10 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
             None
         };
 
-        // Step 2: Construct records from decoded headers and sequences
         let mut records: Vec<_> = read_ids.into_iter().zip(decoded_sequences).map(|(id, seq)| {
             crate::io::FastqRecord::new(id, seq, None)
         }).collect();
 
-        // Step 3: Decode quality strings and attach to records
         if let Some(quality_strings) = quality_ctx_strings {
             for (i, qual) in quality_strings.into_iter().enumerate() {
                 if i < records.len() {
@@ -941,8 +1057,6 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
                     }
                 }
             } else {
-                // Two-pass parallel quality decoding:
-                // Pass 1: Sequential scan to locate record boundaries (fast varint parsing)
                 use rayon::prelude::*;
                 let bits_per_qual = quality_binning.bits_per_quality();
                 let mut qual_entries: Vec<(usize, usize)> = Vec::with_capacity(records.len());
@@ -965,7 +1079,6 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
                     qual_offset += data_len;
                 }
 
-                // Pass 2: Parallel decode (each record is independent)
                 let decoded_quals: Vec<Vec<u8>> = qual_entries.par_iter().map(|&(data_off, q_len)| {
                     if quality_compressor == QualityCompressor::Fqzcomp {
                         let raw = &qualities_data[data_off..data_off + q_len];
@@ -989,6 +1102,40 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
 
         records
     };
+
+    Ok((records, hdr))
+}
+
+pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
+    use std::io::Write;
+
+    // If input is stdin, spool to a temp file first (decompression needs seeking)
+    let (_stdin_tmp, args) = if crate::cli::is_stdio_path(&args.input) {
+        info!("Reading archive from stdin...");
+        let mut tmp = tempfile::NamedTempFile::new_in(&args.working_dir)
+            .context("Failed to create temp file for stdin")?;
+        std::io::copy(&mut std::io::stdin().lock(), &mut tmp)
+            .context("Failed to spool stdin to temp file")?;
+        let path = tmp.path().to_path_buf();
+        let mut new_args = args.clone();
+        new_args.input = path;
+        (Some(tmp), std::borrow::Cow::Owned(new_args))
+    } else {
+        (None, std::borrow::Cow::Borrowed(args))
+    };
+    let args = &*args;
+
+    let start_time = Instant::now();
+
+    // Try streaming decompression for standard BSC archives (>100x less memory)
+    if can_stream_decompress_path(&args.input)? {
+        return decompress_streaming_bsc(args);
+    }
+
+    info!("Input file: {:?}", args.input);
+    info!("Output files: {:?}", args.output);
+
+    let (records, _hdr) = decompress_to_records(&args.input)?;
 
     info!("Decompressed {} records", records.len());
 
@@ -1044,3 +1191,132 @@ pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
     Ok(())
 }
 
+// ── Verify ──────────────────────────────────────────────────────────────
+
+/// Parse the streaming header and call stream_records_to_writer with a HashWriter.
+fn verify_streaming(input: &std::path::Path, hasher: &mut HashWriter) -> Result<ArchiveHeader> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(input)
+        .with_context(|| format!("Failed to open archive: {:?}", input))?;
+    let mut header = [0u8; 68];
+    file.read_exact(&mut header[..60])
+        .context("Failed to read archive header")?;
+
+    if header[0..2] != ARCHIVE_MAGIC {
+        anyhow::bail!("Not a QZ archive (missing magic bytes)");
+    }
+    let version = header[2];
+    if version > ARCHIVE_VERSION {
+        anyhow::bail!(
+            "Archive version {} is newer than this build supports (max {}). Please update qz.",
+            version, ARCHIVE_VERSION
+        );
+    }
+    let stored_header_size = read_le_u32(&header, 4)? as usize;
+
+    let b: usize = V2_PREFIX_SIZE;
+    let encoding_type = header[b];
+    let flags = header[b + 1];
+    let has_sequence_hints = encoding_type == 4;
+    let has_rc_canon = encoding_type == 6;
+    let quality_binning = code_to_binning(header[b + 2])?;
+    let header_compressor_code = header[b + 5];
+
+    let num_reads = read_le_u64(&header, b + 12)? as usize;
+    let headers_len = read_le_u64(&header, b + 20)? as usize;
+    let sequences_len = read_le_u64(&header, b + 28)? as usize;
+    let nmasks_len = read_le_u64(&header, b + 36)? as usize;
+    let qualities_len = read_le_u64(&header, b + 44)? as usize;
+
+    let const_length_present = flags & 0x02 != 0;
+    let (const_seq_len, const_qual_len) = if const_length_present {
+        file.read_exact(&mut header[60..68])
+            .context("Failed to read constant-length header fields")?;
+        (read_le_u32(&header, 60)? as usize, read_le_u32(&header, 64)? as usize)
+    } else {
+        (0, 0)
+    };
+    let data_offset = stored_header_size;
+    drop(file);
+
+    let (rc_flags_len, rc_flags_offset) = if has_rc_canon {
+        let q_end = data_offset as u64 + headers_len as u64 + sequences_len as u64 + nmasks_len as u64 + qualities_len as u64;
+        let mut file = std::fs::File::open(input)?;
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(q_end))?;
+        let mut len_buf = [0u8; 8];
+        file.read_exact(&mut len_buf)?;
+        let rc_len = u64::from_le_bytes(len_buf) as usize;
+        (rc_len, q_end + 8)
+    } else {
+        (0, 0u64)
+    };
+
+    let h_offset = data_offset as u64;
+    let s_offset = h_offset + headers_len as u64;
+    let q_offset = s_offset + sequences_len as u64 + nmasks_len as u64;
+    let has_quality = qualities_len > 0;
+    let bits_per_qual = quality_binning.bits_per_quality();
+
+    info!("Verifying {} reads (streaming)...", num_reads);
+    stream_records_to_writer(
+        hasher, num_reads, input, h_offset, headers_len, s_offset, sequences_len,
+        q_offset, qualities_len, has_quality, const_seq_len, const_qual_len,
+        has_sequence_hints, bits_per_qual, quality_binning, has_rc_canon,
+        rc_flags_len, rc_flags_offset, header_compressor_code,
+    )?;
+
+    // Reparse full header for metadata
+    let input_file = std::fs::File::open(input)?;
+    let archive_data = unsafe { memmap2::Mmap::map(&input_file) }?;
+    parse_archive_header(&archive_data)
+}
+
+/// Verify a QZ archive: fully decompress all streams, compute CRC32, report metadata.
+pub(super) fn verify(config: &VerifyConfig) -> Result<VerifyResult> {
+    let start_time = Instant::now();
+
+    // Handle stdin: spool to temp file
+    let (_stdin_tmp, input_path) = if crate::cli::is_stdio_path(&config.input) {
+        info!("Reading archive from stdin...");
+        let mut tmp = tempfile::NamedTempFile::new_in(&config.working_dir)
+            .context("Failed to create temp file for stdin")?;
+        std::io::copy(&mut std::io::stdin().lock(), &mut tmp)
+            .context("Failed to spool stdin to temp file")?;
+        let path = tmp.path().to_path_buf();
+        (Some(tmp), std::borrow::Cow::Owned(path))
+    } else {
+        (None, std::borrow::Cow::Borrowed(&config.input))
+    };
+    let input_path: &std::path::Path = &input_path;
+
+    let mut hasher = HashWriter::new();
+
+    let hdr = if can_stream_decompress_path(input_path)? {
+        info!("Verifying (streaming mode)...");
+        verify_streaming(input_path, &mut hasher)?
+    } else {
+        info!("Verifying (in-memory mode)...");
+        let (records, hdr) = decompress_to_records(input_path)?;
+        info!("Decompressed {} records, computing hash...", records.len());
+        write_records_batched(&mut hasher, &records)?;
+        hdr
+    };
+
+    let elapsed = start_time.elapsed();
+    info!("Verification completed in {:.2}s", elapsed.as_secs_f64());
+
+    Ok(VerifyResult {
+        num_reads: hdr.num_reads,
+        encoding_type: hdr.encoding_type,
+        header_compressor: hdr.header_compressor,
+        quality_compressor: hdr.quality_compressor,
+        headers_compressed_len: hdr.headers_len,
+        sequences_compressed_len: hdr.sequences_len,
+        qualities_compressed_len: hdr.qualities_len,
+        crc32: hasher.checksum(),
+        total_bytes: hasher.total_bytes(),
+        elapsed_secs: elapsed.as_secs_f64(),
+    })
+}

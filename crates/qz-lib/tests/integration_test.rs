@@ -1028,7 +1028,8 @@ fn test_local_reorder_roundtrip() {
     assert!(archive_path.exists());
 
     let archive_data = fs::read(&archive_path).unwrap();
-    assert_eq!(archive_data[8], 8, "encoding_type should be 8 for local-reorder");
+    // local-reorder now uses ReorderLocal (encoding_type=9) instead of deprecated Delta (8)
+    assert_eq!(archive_data[8], 9, "encoding_type should be 9 for local-reorder (ReorderLocal)");
 
     let output_fastq = temp_path.join("decompressed.fastq");
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
@@ -1328,4 +1329,102 @@ fn test_multiple_input_files_rejected() {
 
     let result = qz_lib::compression::compress(&compress_args);
     assert!(result.is_err(), "Multiple input files should be rejected");
+}
+
+// ========== VERIFY TESTS ==========
+
+#[test]
+fn test_verify_valid_archive() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, MULTI_READ_DATA).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ..CompressConfig::default()
+    };
+    qz_lib::compression::compress(&compress_args).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: archive_path,
+        working_dir: temp_path,
+        num_threads: 1,
+    };
+    let result = qz_lib::compression::verify(&verify_config).unwrap();
+    assert_eq!(result.num_reads, 3);
+    assert!(result.total_bytes > 0);
+    assert!(result.crc32 != 0);
+}
+
+#[test]
+fn test_verify_corrupted_archive() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, MULTI_READ_DATA).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ..CompressConfig::default()
+    };
+    qz_lib::compression::compress(&compress_args).unwrap();
+
+    // Corrupt bytes in the data section
+    let mut archive_data = fs::read(&archive_path).unwrap();
+    let mid = archive_data.len() / 2;
+    for i in mid..std::cmp::min(mid + 32, archive_data.len()) {
+        archive_data[i] ^= 0xFF;
+    }
+    let corrupted_path = temp_path.join("corrupted.qz");
+    fs::write(&corrupted_path, &archive_data).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: corrupted_path,
+        working_dir: temp_path,
+        num_threads: 1,
+    };
+    let result = qz_lib::compression::verify(&verify_config);
+    assert!(result.is_err(), "Verifying a corrupted archive should fail");
+}
+
+#[test]
+fn test_verify_truncated_archive() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, MULTI_READ_DATA).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ..CompressConfig::default()
+    };
+    qz_lib::compression::compress(&compress_args).unwrap();
+
+    let archive_data = fs::read(&archive_path).unwrap();
+    let truncated_path = temp_path.join("truncated.qz");
+    fs::write(&truncated_path, &archive_data[..archive_data.len() / 2]).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: truncated_path,
+        working_dir: temp_path,
+        num_threads: 1,
+    };
+    let result = qz_lib::compression::verify(&verify_config);
+    assert!(result.is_err(), "Verifying a truncated archive should fail");
 }

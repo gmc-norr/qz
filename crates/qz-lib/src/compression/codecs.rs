@@ -85,7 +85,7 @@ impl ByteBackend {
         level: i32,
     ) -> Self {
         match hc {
-            HeaderCompressor::Bsc => ByteBackend::Bsc { use_static: bsc_static },
+            HeaderCompressor::Bsc | HeaderCompressor::Columnar => ByteBackend::Bsc { use_static: bsc_static },
             HeaderCompressor::Zstd => ByteBackend::Zstd { level },
             HeaderCompressor::OpenZl => ByteBackend::OpenZl,
         }
@@ -182,6 +182,21 @@ pub(super) fn compress_headers_openzl(records: &[crate::io::FastqRecord]) -> Res
 pub(super) fn decompress_headers_openzl(compressed: &[u8], num_reads: usize) -> Result<Vec<Vec<u8>>> {
     let decompressed = openzl::decompress_parallel(compressed)?;
     decode_header_stream(&decompressed, num_reads)
+}
+
+/// Compress headers using columnar encoding (parse Illumina fields into typed columns + parallel BSC).
+/// Falls back to raw BSC for non-Illumina headers.
+pub(crate) fn compress_headers_columnar(records: &[crate::io::FastqRecord]) -> Result<Vec<u8>> {
+    let header_strs: Vec<String> = records.iter()
+        .map(|r| String::from_utf8_lossy(&r.id).into_owned())
+        .collect();
+    let header_refs: Vec<&str> = header_strs.iter().map(|s| s.as_str()).collect();
+    header_col::compress_headers_columnar(&header_refs)
+}
+
+/// Decompress columnar-encoded headers.
+pub(super) fn decompress_headers_columnar(compressed: &[u8], num_reads: usize) -> Result<Vec<Vec<u8>>> {
+    header_col::decompress_headers_columnar(compressed, num_reads)
 }
 
 // ── Sequences ──────────────────────────────────────────────────────────────

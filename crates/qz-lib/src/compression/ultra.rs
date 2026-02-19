@@ -24,8 +24,6 @@ use super::*;
 
 // ── Parameters ────────────────────────────────────────────────────────────
 
-const CHUNK_SIZE: usize = 5_000_000;
-
 /// Dictionary window size for center hash (HARC/SPRING style).
 const DICT_WINDOW: usize = 32;
 
@@ -37,14 +35,23 @@ pub(super) struct UltraLevel {
     pub chunk_size: usize,
     pub max_parallel_chunks: usize,
     pub quality_sub_block: usize,
+    /// BSC block size (MB) for header/quality streams (larger = better BWT context)
+    pub bsc_block_mb: usize,
+    /// Max BSC block size (MB) for sequence stream (750 = libsais sweet spot)
+    pub max_seq_block_mb: usize,
 }
 
 const ULTRA_LEVELS: [UltraLevel; 5] = [
-    UltraLevel { level: 1, chunk_size: 1_000_000, max_parallel_chunks: 4, quality_sub_block: 250_000 },
-    UltraLevel { level: 2, chunk_size: 2_000_000, max_parallel_chunks: 3, quality_sub_block: 500_000 },
-    UltraLevel { level: 3, chunk_size: 5_000_000, max_parallel_chunks: 2, quality_sub_block: 500_000 },
-    UltraLevel { level: 4, chunk_size: 8_000_000, max_parallel_chunks: 2, quality_sub_block: 1_000_000 },
-    UltraLevel { level: 5, chunk_size: 10_000_000, max_parallel_chunks: 1, quality_sub_block: 1_000_000 },
+    // Level 1: Fast — small chunks, high parallelism
+    UltraLevel { level: 1, chunk_size: 1_000_000, max_parallel_chunks: 4, quality_sub_block: 250_000, bsc_block_mb: 25, max_seq_block_mb: 750 },
+    // Level 2: Balanced — medium chunks
+    UltraLevel { level: 2, chunk_size: 2_500_000, max_parallel_chunks: 3, quality_sub_block: 500_000, bsc_block_mb: 25, max_seq_block_mb: 750 },
+    // Level 3: Good compression — large chunks, larger BSC blocks
+    UltraLevel { level: 3, chunk_size: 5_000_000, max_parallel_chunks: 2, quality_sub_block: 500_000, bsc_block_mb: 50, max_seq_block_mb: 750 },
+    // Level 4: Better compression — very large chunks, pipelined for throughput
+    UltraLevel { level: 4, chunk_size: 8_000_000, max_parallel_chunks: 2, quality_sub_block: 1_000_000, bsc_block_mb: 75, max_seq_block_mb: 750 },
+    // Level 5: Maximum compression — largest chunks, maximum BSC blocks
+    UltraLevel { level: 5, chunk_size: 10_000_000, max_parallel_chunks: 1, quality_sub_block: 1_000_000, bsc_block_mb: 100, max_seq_block_mb: 750 },
 ];
 
 fn available_memory_bytes() -> Option<u64> {
@@ -83,6 +90,7 @@ fn auto_select_level() -> u8 {
     let max_level_for_cores: u8 = if cores < 4 { 1 }
         else if cores < 8 { 2 }
         else if cores < 16 { 3 }
+        else if cores < 32 { 4 }
         else { 5 };
 
     let mut selected = 1u8;
@@ -681,10 +689,11 @@ fn bsc_decompress_from_blob(data: &[u8], off: &mut usize) -> Result<Vec<u8>> {
 // ── Compression ─────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Delta kept for decompression compatibility with encoding_type=8 archives
 enum HarcMode {
-    /// encoding_type=9: sort + raw BSC
+    /// encoding_type=9: sort + raw BSC (default, best compression)
     ReorderLocal,
-    /// encoding_type=8: sort + previous-read delta
+    /// encoding_type=8: sort + previous-read delta (deprecated, kept for compat)
     Delta,
 }
 
@@ -747,6 +756,9 @@ fn compress_chunk(
     bsc_static: bool,
     use_quality_ctx: bool,
     quality_sub_block: usize,
+    bsc_block_mb: usize,
+    max_seq_block_mb: usize,
+    header_compressor: HeaderCompressor,
 ) -> Result<ChunkResult> {
     let n = records.len();
     let compress_fn: fn(&[u8]) -> Result<Vec<u8>> = if bsc_static {
@@ -817,6 +829,7 @@ fn compress_chunk(
 
             // Parallel: quality compression || (BSC headers + BSC sequences)
             // Records kept alive for quality_ctx to borrow (no clone needed)
+            let seq_block_limit = max_seq_block_mb * 1024 * 1024;
             let (q_result, hs_result) = rayon::join(
                 || -> Result<Vec<Vec<u8>>> {
                     if no_quality {
@@ -832,32 +845,46 @@ fn compress_chunk(
                         compress_quality_ctx_refs(&qual_refs, &seq_refs, quality_sub_block)
                     } else {
                         match qual_input {
-                            QualInput::Bsc(ref qual_stream) => compress_stream_to_bsc_blocks(qual_stream, bsc_static),
+                            QualInput::Bsc(ref qual_stream) => compress_stream_to_bsc_blocks(qual_stream, bsc_static, bsc_block_mb),
                             QualInput::None => Ok(Vec::new()),
                         }
                     }
                 },
                 || -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
-                    let h_blocks = compress_stream_to_bsc_blocks(&header_stream, bsc_static)?;
+                    let h_blocks = if header_compressor == HeaderCompressor::Columnar {
+                        let header_strs: Vec<String> = reorder.order.iter()
+                            .map(|&idx| String::from_utf8_lossy(&records[idx as usize].id).into_owned())
+                            .collect();
+                        let header_refs: Vec<&str> = header_strs.iter().map(|s| s.as_str()).collect();
+                        let blob = header_col::compress_headers_columnar(&header_refs)?;
+                        let mut block = Vec::with_capacity(4 + blob.len());
+                        block.extend_from_slice(&(n as u32).to_le_bytes());
+                        block.extend_from_slice(&blob);
+                        vec![block]
+                    } else {
+                        compress_stream_to_bsc_blocks(&header_stream, bsc_static, bsc_block_mb)?
+                    };
                     let seq_streams = vec![order_stream, seq_stream, rl_stream];
                     let num_seq_streams = seq_streams.len() as u8;
 
                     // BSC compress each seq stream. Split large streams into
-                    // <=750MB blocks to stay within libsais's working limits.
-                    // LZP enabled: reduces data before BWT even for DNA (~25% hit
-                    // rate), making the expensive BWT sort faster overall.
-                    const MAX_BSC_BLOCK: usize = 750 * 1024 * 1024;
+                    // blocks capped at max_seq_block_mb to stay within libsais's
+                    // working limits. LZP enabled: reduces data before BWT even
+                    // for DNA (~25% hit rate), making the expensive BWT sort
+                    // faster overall.
                     use rayon::prelude::*;
                     let compressed_blocks: Vec<Vec<Vec<u8>>> = seq_streams.into_par_iter().map(|data| {
                         if data.is_empty() {
                             Ok(Vec::new())
-                        } else if data.len() <= MAX_BSC_BLOCK {
-                            let compressed = bsc::compress_adaptive_mt(&data)?;
+                        } else if data.len() <= seq_block_limit {
+                            let mut compressed = bsc::compress_adaptive_mt(&data)?;
+                            compressed.shrink_to_fit();
                             Ok(vec![compressed])
                         } else {
-                            let blocks: Vec<Vec<u8>> = data.par_chunks(MAX_BSC_BLOCK)
+                            let mut blocks: Vec<Vec<u8>> = data.par_chunks(seq_block_limit)
                                 .map(|chunk| bsc::compress_adaptive_mt(chunk))
                                 .collect::<Result<Vec<_>>>()?;
+                            for b in &mut blocks { b.shrink_to_fit(); }
                             Ok(blocks)
                         }
                     }).collect::<Result<Vec<_>>>()?;
@@ -915,8 +942,7 @@ fn compress_chunk(
             let seq_streams = vec![order_stream, delta_stream, rl_stream];
             let num_seq_streams = seq_streams.len() as u8;
 
-            // BSC compress with large blocks (250MB)
-            const HARC_BSC_BLOCK_SIZE: usize = 250 * 1024 * 1024;
+            let delta_seq_block_limit = max_seq_block_mb * 1024 * 1024;
 
             // Parallel: quality compression || (BSC headers + BSC sequences)
             // Records kept alive for quality_ctx to borrow (no clone needed)
@@ -934,23 +960,36 @@ fn compress_chunk(
                         compress_quality_ctx_refs(&qual_refs, &seq_refs, quality_sub_block)
                     } else {
                         match qual_input {
-                            QualInput::Bsc(ref qual_stream) => compress_stream_to_bsc_blocks(qual_stream, bsc_static),
+                            QualInput::Bsc(ref qual_stream) => compress_stream_to_bsc_blocks(qual_stream, bsc_static, bsc_block_mb),
                             QualInput::None => Ok(Vec::new()),
                         }
                     }
                 },
                 || -> Result<(Vec<Vec<u8>>, Vec<u8>)> {
-                    let h_blocks = compress_stream_to_bsc_blocks(&header_stream, bsc_static)?;
+                    let h_blocks = if header_compressor == HeaderCompressor::Columnar {
+                        let header_strs: Vec<String> = reorder.order.iter()
+                            .map(|&idx| String::from_utf8_lossy(&records[idx as usize].id).into_owned())
+                            .collect();
+                        let header_refs: Vec<&str> = header_strs.iter().map(|s| s.as_str()).collect();
+                        let blob = header_col::compress_headers_columnar(&header_refs)?;
+                        let mut block = Vec::with_capacity(4 + blob.len());
+                        block.extend_from_slice(&(n as u32).to_le_bytes());
+                        block.extend_from_slice(&blob);
+                        vec![block]
+                    } else {
+                        compress_stream_to_bsc_blocks(&header_stream, bsc_static, bsc_block_mb)?
+                    };
                     let compressed_blocks: Vec<Vec<Vec<u8>>> = {
                         use rayon::prelude::*;
                         seq_streams.into_iter().map(|data| {
                             if data.is_empty() {
                                 Ok(Vec::new())
-                            } else if data.len() <= HARC_BSC_BLOCK_SIZE {
-                                let compressed = compress_fn(&data)?;
+                            } else if data.len() <= delta_seq_block_limit {
+                                let mut compressed = compress_fn(&data)?;
+                                compressed.shrink_to_fit();
                                 Ok(vec![compressed])
                             } else {
-                                let mut blocks: Vec<Vec<u8>> = data.par_chunks(HARC_BSC_BLOCK_SIZE)
+                                let mut blocks: Vec<Vec<u8>> = data.par_chunks(delta_seq_block_limit)
                                     .map(|chunk| compress_fn(chunk))
                                     .collect::<Result<Vec<_>>>()?;
                                 for b in &mut blocks { b.shrink_to_fit(); }
@@ -985,11 +1024,7 @@ fn compress_chunk(
 
 // ── Public API: compress ─────────────────────────────────────────────────
 
-fn compress_inner(args: &CompressConfig, mode: HarcMode) -> Result<()> {
-    compress_inner_with(args, mode, CHUNK_SIZE, 2, 500_000)
-}
-
-fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize, max_parallel_chunks: usize, quality_sub_block: usize) -> Result<()> {
+fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize, max_parallel_chunks: usize, quality_sub_block: usize, bsc_block_mb: usize, max_seq_block_mb: usize) -> Result<()> {
     use std::io::{Write, BufWriter};
     use crate::cli::QualityCompressor;
 
@@ -997,18 +1032,16 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
     let bsc_static = args.advanced.bsc_static;
     let no_quality = args.no_quality;
     let quality_mode = args.quality_mode;
+    let header_compressor = args.advanced.header_compressor;
     let quality_binning = if no_quality {
         QualityBinning::None
     } else {
         quality_mode_to_binning(quality_mode)
     };
 
-    // Auto-select quality_ctx for lossless mode with fixed-length reads
-    // (same logic as streaming path: explicit request or large dataset)
-    let use_quality_ctx = !no_quality
-        && quality_mode == QualityMode::Lossless
-        && (args.advanced.quality_compressor == QualityCompressor::QualityCtx
-            || true); // always auto-select for harc path (chunks are 5M reads >> 100K threshold)
+    // Always use quality_ctx for lossless mode in ultra/harc path —
+    // chunks are 1-10M reads, far above the 100K convergence threshold
+    let use_quality_ctx = !no_quality && quality_mode == QualityMode::Lossless;
     if use_quality_ctx {
         info!("Using context-adaptive quality compression (quality_ctx)");
     }
@@ -1018,9 +1051,10 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
         match mode { HarcMode::ReorderLocal => "raw BSC", HarcMode::Delta => "delta" });
 
     let working_dir = &args.working_dir;
-    let h_tmp_path = working_dir.join(".qz_harc_h.tmp");
-    let s_tmp_path = working_dir.join(".qz_harc_s.tmp");
-    let q_tmp_path = working_dir.join(".qz_harc_q.tmp");
+    let pid = std::process::id();
+    let h_tmp_path = working_dir.join(format!(".qz_harc_h_{pid}.tmp"));
+    let s_tmp_path = working_dir.join(format!(".qz_harc_s_{pid}.tmp"));
+    let q_tmp_path = working_dir.join(format!(".qz_harc_q_{pid}.tmp"));
 
     struct TmpCleanup(Vec<std::path::PathBuf>);
     impl Drop for TmpCleanup {
@@ -1110,6 +1144,7 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
                     let result = compress_chunk(
                         records, mode, quality_mode, quality_binning, no_quality,
                         bsc_static, use_quality_ctx, quality_sub_block,
+                        bsc_block_mb, max_seq_block_mb, header_compressor,
                     )?;
                     info!("  Chunk {}: {} reads, {:.2}s",
                         start_idx + i, n, t.elapsed().as_secs_f64());
@@ -1193,7 +1228,7 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
     out.write_all(&[binning_to_code(quality_binning)])?;
     out.write_all(&[compressor_to_code(quality_compressor_used)])?;
     out.write_all(&[seq_compressor_to_code(SequenceCompressor::Bsc)])?;
-    out.write_all(&[header_compressor_to_code(HeaderCompressor::Bsc)])?;
+    out.write_all(&[header_compressor_to_code(header_compressor)])?;
     out.write_all(&[0u8; 3])?;
     out.write_all(&0u16.to_le_bytes())?;
     out.write_all(&[0u8])?;
@@ -1238,14 +1273,17 @@ fn compress_inner_with(args: &CompressConfig, mode: HarcMode, chunk_size: usize,
     Ok(())
 }
 
-pub(super) fn compress_harc(args: &CompressConfig) -> Result<()> {
-    compress_inner(args, HarcMode::Delta)
-}
-
 pub(super) fn compress_reorder_local_with_level(args: &CompressConfig, level: UltraLevel) -> Result<()> {
-    info!("Ultra level {}: chunk_size={}M, parallel_chunks={}, quality_sub_block={}K",
-        level.level, level.chunk_size / 1_000_000, level.max_parallel_chunks, level.quality_sub_block / 1000);
-    compress_inner_with(args, HarcMode::ReorderLocal, level.chunk_size, level.max_parallel_chunks, level.quality_sub_block)
+    info!("Ultra level {}: chunk_size={}M, parallel_chunks={}, quality_sub_block={}K, bsc_block={}MB, seq_block={}MB",
+        level.level, level.chunk_size / 1_000_000, level.max_parallel_chunks, level.quality_sub_block / 1000,
+        level.bsc_block_mb, level.max_seq_block_mb);
+    // Warn early if GPU VRAM is too small for the largest BSC block.
+    // Actual block ≤ min(chunk_data, seq_block_limit). Use 200 bp as generous read length estimate.
+    let estimated_seq_bytes = level.chunk_size * 200;
+    let max_bsc_block = estimated_seq_bytes.min(level.max_seq_block_mb * 1024 * 1024);
+    super::bsc::check_cuda_vram(max_bsc_block);
+    compress_inner_with(args, HarcMode::ReorderLocal, level.chunk_size, level.max_parallel_chunks,
+        level.quality_sub_block, level.bsc_block_mb, level.max_seq_block_mb)
 }
 
 // ── Decoding ────────────────────────────────────────────────────────────
@@ -1389,10 +1427,10 @@ fn decompress_streams(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     Ok((decompressed, num_streams))
 }
 
-fn parse_order(order_data: &[u8]) -> Vec<u32> {
+fn parse_order(order_data: &[u8]) -> Result<Vec<u32>> {
     let n = order_data.len() / 4;
     (0..n).map(|i| {
-        super::read_le_u32(order_data, i * 4).unwrap_or(0)
+        super::read_le_u32(order_data, i * 4)
     }).collect()
 }
 
@@ -1407,7 +1445,7 @@ fn decode_chunk_reorder_local(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
 
         // Decompress order
         let order_data = bsc_decompress_from_blob(data, &mut off)?;
-        let order = parse_order(&order_data);
+        let order = parse_order(&order_data)?;
         let num_reads = order.len();
 
         // Read arithmetic data
@@ -1426,9 +1464,10 @@ fn decode_chunk_reorder_local(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
         let rl_data = bsc_decompress_from_blob(data, &mut off)?;
         let mut rl_off = 0;
         let mut read_lengths = Vec::with_capacity(num_reads);
-        for _ in 0..num_reads {
+        for i in 0..num_reads {
             read_lengths.push(
-                dna_utils::read_varint(&rl_data, &mut rl_off).unwrap_or(0) as usize
+                dna_utils::read_varint(&rl_data, &mut rl_off)
+                    .ok_or_else(|| anyhow::anyhow!("truncated read length at read {i}"))? as usize
             );
         }
 
@@ -1443,16 +1482,17 @@ fn decode_chunk_reorder_local(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
             anyhow::bail!("reorder-local: expected 3 streams, got {}", num_streams);
         }
 
-        let order = parse_order(&streams[0]);
+        let order = parse_order(&streams[0])?;
         let seq_data = &streams[1];
         let rl_data = &streams[2];
         let num_reads = order.len();
 
         let mut rl_off = 0;
         let mut read_lengths = Vec::with_capacity(num_reads);
-        for _ in 0..num_reads {
+        for i in 0..num_reads {
             read_lengths.push(
-                dna_utils::read_varint(rl_data, &mut rl_off).unwrap_or(0) as usize
+                dna_utils::read_varint(rl_data, &mut rl_off)
+                    .ok_or_else(|| anyhow::anyhow!("truncated read length at read {i}"))? as usize
             );
         }
 
@@ -1477,7 +1517,7 @@ fn decode_chunk_delta(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
         anyhow::bail!("HARC delta: expected 3 streams, got {}", num_streams);
     }
 
-    let order = parse_order(&streams[0]);
+    let order = parse_order(&streams[0])?;
     let delta_data = &streams[1];
     let rl_data = &streams[2];
     let num_reads = order.len();
@@ -1485,9 +1525,10 @@ fn decode_chunk_delta(data: &[u8]) -> Result<(Vec<Vec<u8>>, Vec<u32>)> {
     // Parse read lengths
     let mut rl_off = 0;
     let mut read_lengths = Vec::with_capacity(num_reads);
-    for _ in 0..num_reads {
+    for i in 0..num_reads {
         read_lengths.push(
-            dna_utils::read_varint(rl_data, &mut rl_off).unwrap_or(0) as usize
+            dna_utils::read_varint(rl_data, &mut rl_off)
+                .ok_or_else(|| anyhow::anyhow!("truncated read length at read {i}"))? as usize
         );
     }
 

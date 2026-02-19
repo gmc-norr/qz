@@ -1,11 +1,15 @@
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use serde::{Serialize, Deserialize};
+use serde_repr::{Serialize_repr, Deserialize_repr};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum ReorderMode {
     /// Sort within each 5M-record chunk (fast, bounded memory, local ordering only)
-    Local,
+    Local = 0,
     /// Two-pass bucket sort across entire file (better ordering, bounded memory)
-    Global,
+    Global = 1,
 }
 
 /// Core compression configuration.
@@ -55,7 +59,8 @@ impl Default for CompressConfig {
 /// These control compressor selection, encoding variants, reordering, and other
 /// features not exposed in the production CLI. Used by integration tests and
 /// benchmark code.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AdvancedOptions {
     /// Enable positional quality modeling (experimental)
     pub quality_modeling: bool,
@@ -93,6 +98,10 @@ pub struct AdvancedOptions {
     pub fast_ultra: bool,
     /// Number of reads per quality_ctx sub-block (default 500K)
     pub quality_ctx_block_size: usize,
+    /// BSC block size in MB for parallel compression (default 25)
+    pub bsc_block_size_mb: usize,
+    /// Records per chunk for chunked compression (default 2_500_000)
+    pub chunk_records: usize,
 }
 
 impl Default for AdvancedOptions {
@@ -105,7 +114,7 @@ impl Default for AdvancedOptions {
             compression_level: 3,
             quality_compressor: QualityCompressor::Bsc,
             sequence_compressor: SequenceCompressor::Bsc,
-            header_compressor: HeaderCompressor::Bsc,
+            header_compressor: HeaderCompressor::Columnar,
             bsc_static: false,
             twobit: false,
             header_template: false,
@@ -116,6 +125,8 @@ impl Default for AdvancedOptions {
             local_reorder: false,
             fast_ultra: false,
             quality_ctx_block_size: 500_000,
+            bsc_block_size_mb: 25,
+            chunk_records: 2_500_000,
         }
     }
 }
@@ -136,54 +147,70 @@ pub struct DecompressConfig {
     pub gzip_level: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
+pub struct VerifyConfig {
+    /// Input QZ archive
+    pub input: PathBuf,
+    /// Working directory for temporary files
+    pub working_dir: PathBuf,
+    /// Number of threads
+    pub num_threads: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum QualityMode {
     /// Lossless quality preservation
-    Lossless,
+    Lossless = 0,
     /// Illumina 8-level binning
-    IlluminaBin,
+    IlluminaBin = 1,
     /// Illumina 4-level binning (more aggressive)
-    Illumina4,
+    Illumina4 = 2,
     /// Binary thresholding
-    Binary,
+    Binary = 3,
     /// QVZ lossy compression
-    Qvz,
+    Qvz = 4,
     /// Discard quality scores entirely
-    Discard,
+    Discard = 5,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum QualityCompressor {
     /// Legacy zstd (faster, ~20% larger)
-    Zstd,
+    Zstd = 0,
     /// BSC/BWT (best compression, default)
-    Bsc,
+    Bsc = 1,
     /// OpenZL format-aware compression
-    OpenZl,
+    OpenZl = 2,
     /// fqzcomp context-modeled compression
-    Fqzcomp,
+    Fqzcomp = 3,
     /// Context-adaptive range coding
-    QualityCtx,
+    QualityCtx = 4,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum SequenceCompressor {
     /// Legacy zstd with 2-bit encoding + N-mask
-    Zstd,
+    Zstd = 0,
     /// BSC on raw ASCII sequences (best compression, default)
-    Bsc,
+    Bsc = 1,
     /// OpenZL format-aware compression
-    OpenZl,
+    OpenZl = 2,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
 pub enum HeaderCompressor {
     /// Legacy template + zstd
-    Zstd,
-    /// BSC on raw headers (best compression, default)
-    Bsc,
+    Zstd = 0,
+    /// BSC on raw headers
+    Bsc = 1,
     /// OpenZL format-aware compression
-    OpenZl,
+    OpenZl = 2,
+    /// Columnar encoding: parse Illumina fields into typed columns + parallel BSC (default)
+    Columnar = 3,
 }
 
 pub fn num_cpus() -> usize {
