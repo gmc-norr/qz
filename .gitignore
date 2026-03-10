@@ -35,3 +35,12 @@ ideas/
 !.pixi/config.toml
 
 manuscript.md
+scripts/bz_optimizer/__pycache__/sensitivity.cpython-312.pyc
+scripts/bz_optimizer/__pycache__/population.cpython-312.pyc
+scripts/bz_optimizer/__pycache__/main.cpython-312.pyc
+scripts/bz_optimizer/__pycache__/genome.cpython-312.pyc
+scripts/bz_optimizer/__pycache__/ga.cpython-312.pyc
+scripts/bz_optimizer/__pycache__/fitness.cpython-312.pyc
+scripts/bz_optimizer/__pycache__/config.cpython-312.pyc
+scripts/bz_optimizer/__pycache__/checkpoint.cpython-312.pyc
+scripts/bz_optimizer/__pycache__/__init__.cpython-312.pyc

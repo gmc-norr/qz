@@ -1,0 +1,74 @@
+[
+  {
+    "name": "aux_compressor",
+    "default": 0,
+    "perturbed": 1.0,
+    "baseline_fitness": 1.7886483200121157,
+    "perturbed_fitness": 1.6850628256634317,
+    "delta": -0.10358549434868403,
+    "abs_delta": 0.10358549434868403
+  },
+  {
+    "name": "quality_ctx_block_size",
+    "default": 500000,
+    "perturbed": 100000.0,
+    "baseline_fitness": 1.7886483200121157,
+    "perturbed_fitness": 1.7463316009389944,
+    "delta": -0.04231671907312129,
+    "abs_delta": 0.04231671907312129
+  },
+  {
+    "name": "alignment_compressor",
+    "default": 0,
+    "perturbed": 1.0,
+    "baseline_fitness": 1.7886483200121157,
+    "perturbed_fitness": 1.7574593520049901,
+    "delta": -0.03118896800712556,
+    "abs_delta": 0.03118896800712556
+  },
+  {
+    "name": "quality_compressor",
+    "default": 0,
+    "perturbed": 1.0,
+    "baseline_fitness": 1.7886483200121157,
+    "perturbed_fitness": 1.7803295267450858,
+    "delta": -0.00831879326702989,
+    "abs_delta": 0.00831879326702989
+  },
+  {
+    "name": "bsc_adaptive",
+    "default": 1,
+    "perturbed": 0.0,
+    "baseline_fitness": 1.7886483200121157,
+    "perturbed_fitness": 1.7832689333795186,
+    "delta": -0.005379386632597072,
+    "abs_delta": 0.005379386632597072
+  },
+  {
+    "name": "use_lzp",
+    "default": 0,
+    "perturbed": 1.0,
+    "baseline_fitness": 1.7886483200121157,
+    "perturbed_fitness": 1.786238590129217,
+    "delta": -0.00240972988289867,
+    "abs_delta": 0.00240972988289867
+  },
+  {
+    "name": "chunk_size",
+    "default": 2500000,
+    "perturbed": 500000.0,
+    "baseline_fitness": 1.7886483200121157,
+    "perturbed_fitness": 1.7870199312757813,
+    "delta": -0.0016283887363344185,
+    "abs_delta": 0.0016283887363344185
+  },
+  {
+    "name": "bsc_block_size_mb",
+    "default": 25,
+    "perturbed": 25,
+    "baseline_fitness": 1.7886483200121157,
+    "perturbed_fitness": 1.7886483200121157,
+    "delta": 0.0,
+    "abs_delta": 0.0
+  }
+]

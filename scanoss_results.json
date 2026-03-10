@@ -1,0 +1,710 @@
+{
+  "bz-cli/src/main.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/cli.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/compression/archive.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/compression/compress.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/compression/decompress.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/compression/extract.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/compression/mod.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/compression/streams.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/io/bam.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/io/mod.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/src/lib.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "bz-lib/tests/integration_test.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/analyze_hashes.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_bsc_assists.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_coil_strategies.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_columnar.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_full_pipeline.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_greedy_contig.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_header_col.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_kmer_prior.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_openzl_graphs.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_quality_ctx.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_quality_reorder.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_sequence_strategies.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_sort_strategies.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/bin/bench_template.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-bench/src/lib.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-cli/src/main.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/build.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/cli.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/arithmetic_quality.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/arithmetic_sequence.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/bsc.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/codecs.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/columnar.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/compress_impl.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/debruijn.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/decompress_impl.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/dna_utils.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/fqzcomp.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/greedy_contig.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/header_col.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/mod.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/n_mask.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/openzl.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/quality.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/quality_context.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/quality_ctx.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/quality_delta.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/quality_model.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/read_id.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/template.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/ultra.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/compression/zstd_dict.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/io/fastq.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/io/mod.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/src/lib.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-lib/tests/integration_test.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ],
+  "qz-python/src/lib.rs": [
+    {
+      "id": "none",
+      "server": {
+        "kb_version": {
+          "daily": "26.03.09",
+          "monthly": "26.02"
+        },
+        "version": "5.4.22"
+      }
+    }
+  ]
+}

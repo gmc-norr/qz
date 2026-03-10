@@ -1,5 +1,5 @@
 use crate::cli::DecompressConfig;
-use crate::compression::archive::{ArchiveHeader, ChunkHeader, FLAG_QUALITY_CTX};
+use crate::compression::archive::{ArchiveHeader, ChunkHeader, CHUNK_FLAG_QUALITY_CTX};
 use crate::compression::streams::{self, ChunkConsensus, NUM_STREAMS};
 use crate::io::bam::BamWriter;
 use anyhow::Result;
@@ -26,10 +26,10 @@ pub fn decompress(config: &DecompressConfig) -> Result<()> {
 
     // Read archive header
     let header = ArchiveHeader::read_from(&mut reader)?;
-    let use_quality_ctx = (header.flags & FLAG_QUALITY_CTX) != 0;
     info!(
-        "Archive: {} records in {} chunks (quality_ctx: {})",
-        header.num_records, header.num_chunks, use_quality_ctx
+        "Archive: {} records in {} chunks (align_comp={}, aux_comp={})",
+        header.num_records, header.num_chunks,
+        header.alignment_compressor, header.aux_compressor,
     );
 
     // Decompress SAM header
@@ -70,13 +70,21 @@ pub fn decompress(config: &DecompressConfig) -> Result<()> {
             compressed_streams.push(data);
         }
 
-        // Decompress non-quality streams with BSC, quality handled separately
-        let decompressed = decompress_streams(&compressed_streams, use_quality_ctx)?;
+        // Per-chunk quality_ctx flag
+        let chunk_uses_quality_ctx = (chunk_header.chunk_flags & CHUNK_FLAG_QUALITY_CTX) != 0;
+
+        // Decompress non-quality streams, dispatching by compressor type
+        let decompressed = decompress_streams(
+            &compressed_streams,
+            chunk_uses_quality_ctx,
+            header.alignment_compressor,
+            header.aux_compressor,
+        )?;
 
         // Parse consensus
         let consensus = ChunkConsensus::deserialize(&decompressed[0]);
 
-        if use_quality_ctx && num_records > 0 {
+        if chunk_uses_quality_ctx && num_records > 0 {
             decompress_chunk_quality_ctx(
                 &decompressed,
                 &compressed_streams[13],
@@ -462,29 +470,71 @@ fn decompress_chunk_bsc<W: Write>(
     Ok(())
 }
 
-/// Decompress all 15 streams in parallel groups.
-fn decompress_streams(compressed: &[Vec<u8>], use_quality_ctx: bool) -> Result<Vec<Vec<u8>>> {
+/// Decompress a single stream using the appropriate compressor.
+fn decompress_one(data: &[u8], use_zstd: bool) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    if use_zstd {
+        Ok(zstd::bulk::decompress(data, 256 * 1024 * 1024)?)
+    } else {
+        bsc::decompress_parallel(data)
+    }
+}
+
+/// Decompress all 15 streams in parallel groups, dispatching by compressor type.
+fn decompress_streams(
+    compressed: &[Vec<u8>],
+    use_quality_ctx: bool,
+    alignment_compressor: u8,
+    aux_compressor: u8,
+) -> Result<Vec<Vec<u8>>> {
+    let align_zstd = alignment_compressor == 1;
+    let aux_zstd = aux_compressor == 1;
+
     let ((group_a, group_b), (group_c, group_d)) = rayon::join(
         || {
             rayon::join(
-                || decompress_group(&compressed[0..6]),
-                || decompress_group(&compressed[6..9]),
+                || -> Result<Vec<Vec<u8>>> {
+                    // consensus (index 0) always BSC, alignment (1-5) depends on config
+                    let mut results = Vec::with_capacity(6);
+                    results.push(decompress_one(&compressed[0], false)?);
+                    for data in &compressed[1..6] {
+                        results.push(decompress_one(data, align_zstd)?);
+                    }
+                    Ok(results)
+                },
+                || -> Result<Vec<Vec<u8>>> {
+                    // alignment streams 6-8
+                    let mut results = Vec::with_capacity(3);
+                    for data in &compressed[6..9] {
+                        results.push(decompress_one(data, align_zstd)?);
+                    }
+                    Ok(results)
+                },
             )
         },
         || {
             rayon::join(
-                || decompress_group(&compressed[9..13]),
-                || {
+                || -> Result<Vec<Vec<u8>>> {
+                    // read data streams 9-12: always BSC
+                    let mut results = Vec::with_capacity(4);
+                    for data in &compressed[9..13] {
+                        results.push(decompress_one(data, false)?);
+                    }
+                    Ok(results)
+                },
+                || -> Result<Vec<Vec<u8>>> {
                     if use_quality_ctx {
+                        // quality_ctx: pass through raw, decompress aux
                         let qual_passthrough = Vec::new();
-                        let aux = if compressed[14].is_empty() {
-                            Vec::new()
-                        } else {
-                            bsc::decompress_parallel(&compressed[14])?
-                        };
+                        let aux = decompress_one(&compressed[14], aux_zstd)?;
                         Ok(vec![qual_passthrough, aux])
                     } else {
-                        decompress_group(&compressed[13..15])
+                        // quality (13) always BSC, aux (14) depends on config
+                        let qual = decompress_one(&compressed[13], false)?;
+                        let aux = decompress_one(&compressed[14], aux_zstd)?;
+                        Ok(vec![qual, aux])
                     }
                 },
             )
@@ -506,17 +556,4 @@ fn decompress_streams(compressed: &[Vec<u8>], use_quality_ctx: bool) -> Result<V
     }
 
     Ok(result)
-}
-
-fn decompress_group(compressed: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
-    let mut results = Vec::with_capacity(compressed.len());
-    for data in compressed {
-        let decompressed = if data.is_empty() {
-            Vec::new()
-        } else {
-            bsc::decompress_parallel(data)?
-        };
-        results.push(decompressed);
-    }
-    Ok(results)
 }

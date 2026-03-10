@@ -1,24 +1,83 @@
-use crate::cli::CompressConfig;
-use crate::compression::archive::{ArchiveHeader, ChunkHeader, FLAG_CONSENSUS_DELTA, FLAG_QUALITY_CTX};
+use crate::cli::{AdvancedOptions, CompressConfig};
+use crate::compression::archive::{ArchiveHeader, ChunkHeader, CHUNK_FLAG_QUALITY_CTX, FLAG_CONSENSUS_DELTA};
 use crate::compression::streams::{self, BamStreams, ChunkQualityData, NUM_STREAMS};
 use crate::io::bam::RawBamReader;
 use anyhow::Result;
 use qz_lib::compression::bsc;
 use qz_lib::compression::quality_ctx;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::time::Instant;
 use tracing::info;
 
-/// Number of BAM records per compression chunk.
-const CHUNK_SIZE: usize = 2_500_000;
+/// Stream categories for compressor dispatch.
+#[derive(Clone, Copy)]
+enum StreamKind {
+    /// Consensus data (index 0)
+    Consensus,
+    /// Alignment metadata: ref_id, pos, mapq, bin, flag, next_ref_id, next_pos, tlen (1-8)
+    Alignment,
+    /// Variable-length read data: read_name, cigar, seq_diff, seq_extra (9-12)
+    ReadData,
+    /// Quality scores (index 13)
+    Quality,
+    /// Auxiliary tags (index 14)
+    Aux,
+}
 
-/// Block size for quality_ctx (number of reads per block).
-const QUALITY_CTX_BLOCK_SIZE: usize = 500_000;
+/// Map stream index to its kind.
+fn stream_kind(index: usize) -> StreamKind {
+    match index {
+        0 => StreamKind::Consensus,
+        1..=8 => StreamKind::Alignment,
+        9..=12 => StreamKind::ReadData,
+        13 => StreamKind::Quality,
+        14 => StreamKind::Aux,
+        _ => StreamKind::ReadData, // shouldn't happen
+    }
+}
+
+/// Compress a single stream using the configured compressor for its kind.
+fn compress_one(data: &[u8], kind: StreamKind, opts: &AdvancedOptions) -> Result<Vec<u8>> {
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Determine which compressor to use based on stream kind and config
+    let use_zstd = match kind {
+        StreamKind::Alignment => opts.alignment_compressor == 1,
+        StreamKind::Aux => opts.aux_compressor == 1,
+        // Consensus, ReadData, Quality always use BSC
+        _ => false,
+    };
+
+    let mut compressed = if use_zstd {
+        zstd::bulk::compress(data, 3)?
+    } else {
+        // Select BSC variant based on config
+        match (opts.bsc_adaptive, opts.use_lzp) {
+            (true, true) => bsc::compress_parallel_adaptive(data)?,
+            (true, false) => bsc::compress_parallel_adaptive_no_lzp(data)?,
+            (false, true) => bsc::compress_parallel(data)?,
+            (false, false) => bsc::compress_parallel(data)?, // static, no LZP
+        }
+    };
+    compressed.shrink_to_fit();
+    Ok(compressed)
+}
 
 /// Compress a BAM file to a BZ archive.
 pub fn compress(config: &CompressConfig) -> Result<()> {
     let start_time = Instant::now();
+    let opts = &config.advanced;
+
+    info!(
+        "BZ compression config: chunk_size={}, quality_ctx_block={}, \
+         lzp={}, adaptive={}, qual_comp={}, align_comp={}, aux_comp={}",
+        opts.chunk_size, opts.quality_ctx_block_size,
+        opts.use_lzp, opts.bsc_adaptive, opts.quality_compressor,
+        opts.alignment_compressor, opts.aux_compressor,
+    );
 
     if config.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -41,19 +100,34 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
     header_payload.extend_from_slice(&reader.ref_dict_bytes);
     let sam_header_compressed = bsc::compress_parallel(&header_payload)?;
 
-    // Process chunks
+    // Write archive header with placeholder num_records/num_chunks (patched at end)
+    let output_file = std::fs::File::create(&config.output)?;
+    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, output_file);
+
+    let flags = FLAG_CONSENSUS_DELTA;
+    let header = ArchiveHeader {
+        flags,
+        num_records: 0,       // placeholder — patched after all chunks
+        num_chunks: 0,        // placeholder — patched after all chunks
+        alignment_compressor: opts.alignment_compressor,
+        aux_compressor: opts.aux_compressor,
+        sam_header_compressed,
+    };
+    header.write_to(&mut writer)?;
+
+    // Stream chunks directly to disk
     let mut total_records: u64 = 0;
-    let mut chunk_data: Vec<(u32, Vec<Vec<u8>>)> = Vec::new();
-    let mut use_quality_ctx = true;
+    let mut num_chunks: u32 = 0;
+    let use_quality_ctx = opts.quality_compressor == 0;
 
     loop {
-        let records = reader.read_chunk(CHUNK_SIZE)?;
+        let records = reader.read_chunk(opts.chunk_size)?;
         if records.is_empty() {
             break;
         }
 
         let n = records.len();
-        info!("Chunk {}: {} records", chunk_data.len(), n);
+        info!("Chunk {}: {} records", num_chunks, n);
 
         // Build columnar streams with consensus-delta encoding
         let result = streams::records_to_streams(&records);
@@ -61,24 +135,28 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
 
         let streams::StreamsResult { streams: bam_streams, quality_data } = result;
 
-        // Check if quality_ctx is usable (no 0xFF quality bytes)
-        if quality_data.has_unavailable_quality {
-            use_quality_ctx = false;
-        }
+        // Per-chunk decision: use quality_ctx only if enabled AND this chunk has no 0xFF quality
+        let chunk_uses_quality_ctx = use_quality_ctx && !quality_data.has_unavailable_quality;
 
-        let compressed = if use_quality_ctx && n > 0 {
+        let compressed = if chunk_uses_quality_ctx && n > 0 {
             // Run BSC (skip quality) and quality_ctx in parallel
+            let qctx_block_size = opts.quality_ctx_block_size;
             let (bsc_result, qctx_result) = rayon::join(
-                || compress_streams_skip_qual(&bam_streams),
-                || compress_quality_ctx_parallel(&quality_data),
+                || compress_streams_skip_qual(&bam_streams, opts),
+                || compress_quality_ctx_parallel(&quality_data, qctx_block_size),
             );
             let mut compressed = bsc_result?;
             compressed[13] = qctx_result?;
             compressed
         } else {
-            // BSC-only path
-            compress_streams(&bam_streams)?
+            // BSC-only path (includes quality)
+            compress_all_streams(&bam_streams, opts)?
         };
+
+        let mut chunk_flags = 0u8;
+        if chunk_uses_quality_ctx {
+            chunk_flags |= CHUNK_FLAG_QUALITY_CTX;
+        }
 
         // Log per-stream sizes
         let stream_names = [
@@ -97,51 +175,42 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
             );
         }
 
+        // Write chunk directly to output
+        let mut stream_sizes = [0u32; NUM_STREAMS];
+        for (i, cs) in compressed.iter().enumerate() {
+            stream_sizes[i] = cs.len() as u32;
+        }
+        let chunk_header = ChunkHeader {
+            num_records: n as u32,
+            chunk_flags,
+            stream_sizes,
+        };
+        chunk_header.write_to(&mut writer)?;
+        for cs in &compressed {
+            writer.write_all(cs)?;
+        }
+
         total_records += n as u64;
-        chunk_data.push((n as u32, compressed));
+        num_chunks += 1;
     }
 
     info!(
         "Read {} records in {} chunks",
-        total_records,
-        chunk_data.len()
+        total_records, num_chunks
     );
 
-    // Write archive
-    let output_file = std::fs::File::create(&config.output)?;
-    let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, output_file);
-
-    let mut flags = FLAG_CONSENSUS_DELTA;
-    if use_quality_ctx {
-        flags |= FLAG_QUALITY_CTX;
-    }
-
-    let header = ArchiveHeader {
-        flags,
-        num_records: total_records,
-        num_chunks: chunk_data.len() as u32,
-        sam_header_compressed,
-    };
-    header.write_to(&mut writer)?;
-
-    for (num_records, compressed_streams) in &chunk_data {
-        let mut stream_sizes = [0u32; NUM_STREAMS];
-        for (i, cs) in compressed_streams.iter().enumerate() {
-            stream_sizes[i] = cs.len() as u32;
-        }
-
-        let chunk_header = ChunkHeader {
-            num_records: *num_records,
-            stream_sizes,
-        };
-        chunk_header.write_to(&mut writer)?;
-
-        for cs in compressed_streams {
-            writer.write_all(cs)?;
-        }
-    }
+    // Patch num_records and num_chunks in the archive header.
+    // Layout: [2B magic][1B version][1B reserved][1B flags][1B align_comp][1B aux_comp][8B num_records][4B num_chunks]
+    const NUM_RECORDS_OFFSET: u64 = 2 + 1 + 1 + 1 + 1 + 1; // = 7
+    const NUM_CHUNKS_OFFSET: u64 = NUM_RECORDS_OFFSET + 8;   // = 15
 
     writer.flush()?;
+    let file = writer.get_mut();
+    file.seek(SeekFrom::Start(NUM_RECORDS_OFFSET))?;
+    file.write_all(&total_records.to_le_bytes())?;
+    file.seek(SeekFrom::Start(NUM_CHUNKS_OFFSET))?;
+    file.write_all(&num_chunks.to_le_bytes())?;
+    file.flush()?;
 
     let output_size = std::fs::metadata(&config.output)?.len();
     let elapsed = start_time.elapsed().as_secs_f64();
@@ -157,7 +226,7 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
 }
 
 /// Compress quality scores using quality_ctx with parallel block compression.
-fn compress_quality_ctx_parallel(quality_data: &ChunkQualityData) -> Result<Vec<u8>> {
+fn compress_quality_ctx_parallel(quality_data: &ChunkQualityData, block_size: usize) -> Result<Vec<u8>> {
     use rayon::prelude::*;
 
     let n = quality_data.qualities_ascii.len();
@@ -167,8 +236,8 @@ fn compress_quality_ctx_parallel(quality_data: &ChunkQualityData) -> Result<Vec<
 
     // Build block ranges
     let block_ranges: Vec<(usize, usize)> = (0..n)
-        .step_by(QUALITY_CTX_BLOCK_SIZE)
-        .map(|start| (start, (start + QUALITY_CTX_BLOCK_SIZE).min(n)))
+        .step_by(block_size)
+        .map(|start| (start, (start + block_size).min(n)))
         .collect();
 
     // Compress blocks in parallel
@@ -199,9 +268,8 @@ fn compress_quality_ctx_parallel(quality_data: &ChunkQualityData) -> Result<Vec<
     Ok(result)
 }
 
-/// Compress 14 streams with BSC (skip quality at index 13).
-/// Quality is handled separately by quality_ctx.
-fn compress_streams_skip_qual(streams: &BamStreams) -> Result<Vec<Vec<u8>>> {
+/// Compress 14 streams (skip quality at index 13, handled by quality_ctx).
+fn compress_streams_skip_qual(streams: &BamStreams, opts: &AdvancedOptions) -> Result<Vec<Vec<u8>>> {
     let slices = streams.as_slices();
 
     // Group A: consensus + ref_id + pos + mapq + bin + flag (indices 0-5)
@@ -211,14 +279,14 @@ fn compress_streams_skip_qual(streams: &BamStreams) -> Result<Vec<Vec<u8>>> {
     let ((group_a, group_b), (group_c, group_d)) = rayon::join(
         || {
             rayon::join(
-                || compress_group(&slices[0..6]),
-                || compress_group(&slices[6..9]),
+                || compress_group_indexed(&slices[0..6], 0, opts),
+                || compress_group_indexed(&slices[6..9], 6, opts),
             )
         },
         || {
             rayon::join(
-                || compress_group(&slices[9..13]),
-                || compress_group(&slices[14..15]),  // aux only
+                || compress_group_indexed(&slices[9..13], 9, opts),
+                || compress_group_indexed(&slices[14..15], 14, opts),
             )
         },
     );
@@ -242,21 +310,21 @@ fn compress_streams_skip_qual(streams: &BamStreams) -> Result<Vec<Vec<u8>>> {
     Ok(result)
 }
 
-/// Compress all 15 streams with BSC (BSC-only fallback path).
-fn compress_streams(streams: &BamStreams) -> Result<Vec<Vec<u8>>> {
+/// Compress all 15 streams (BSC-only fallback path when quality_ctx is disabled).
+fn compress_all_streams(streams: &BamStreams, opts: &AdvancedOptions) -> Result<Vec<Vec<u8>>> {
     let slices = streams.as_slices();
 
     let ((group_a, group_b), (group_c, group_d)) = rayon::join(
         || {
             rayon::join(
-                || compress_group(&slices[0..6]),
-                || compress_group(&slices[6..9]),
+                || compress_group_indexed(&slices[0..6], 0, opts),
+                || compress_group_indexed(&slices[6..9], 6, opts),
             )
         },
         || {
             rayon::join(
-                || compress_group(&slices[9..13]),
-                || compress_group(&slices[13..15]),
+                || compress_group_indexed(&slices[9..13], 9, opts),
+                || compress_group_indexed(&slices[13..15], 13, opts),
             )
         },
     );
@@ -279,15 +347,12 @@ fn compress_streams(streams: &BamStreams) -> Result<Vec<Vec<u8>>> {
 }
 
 /// Compress a group of streams sequentially (within a rayon task).
-fn compress_group(slices: &[&[u8]]) -> Result<Vec<Vec<u8>>> {
+/// `start_index` is the global stream index of the first slice.
+fn compress_group_indexed(slices: &[&[u8]], start_index: usize, opts: &AdvancedOptions) -> Result<Vec<Vec<u8>>> {
     let mut results = Vec::with_capacity(slices.len());
-    for &data in slices {
-        let mut compressed = if data.is_empty() {
-            Vec::new()
-        } else {
-            bsc::compress_parallel_adaptive_no_lzp(data)?
-        };
-        compressed.shrink_to_fit();
+    for (i, &data) in slices.iter().enumerate() {
+        let kind = stream_kind(start_index + i);
+        let compressed = compress_one(data, kind, opts)?;
         results.push(compressed);
     }
     Ok(results)

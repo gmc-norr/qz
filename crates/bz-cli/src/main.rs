@@ -37,6 +37,9 @@ struct CompressArgs {
     /// Number of threads (0 = auto-detect)
     #[arg(short = 't', long, default_value = "0")]
     threads: usize,
+    /// Advanced options JSON config file
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Parser)]
@@ -91,11 +94,22 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Compress(args) => {
             info!("Starting compression...");
+            let advanced = if let Some(ref config_path) = args.config {
+                let json_str = std::fs::read_to_string(config_path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read config file {config_path:?}: {e}"))?;
+                let opts: bz_lib::AdvancedOptions = serde_json::from_str(&json_str)
+                    .map_err(|e| anyhow::anyhow!("Failed to parse config file {config_path:?}: {e}"))?;
+                opts.validate()?;
+                opts
+            } else {
+                bz_lib::AdvancedOptions::default()
+            };
             let config = bz_lib::CompressConfig {
                 input: args.input,
                 output: args.output,
                 working_dir: args.working_dir,
                 threads: args.threads,
+                advanced,
             };
             bz_lib::compress(&config)?;
             info!("Compression complete!");

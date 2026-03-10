@@ -1,0 +1,10 @@
+Welcome to the Software Heritage scanner, a source code scanner to
+analyze code bases and compare them with source code artifacts archived
+by Software Heritage.
+
+    - The scan is done locally on your machine
+    - Only anonymous fingerprints (hashes) are sent
+    - No private data will be sent anywhere
+    - No false positives
+
+[?] Authenticate with the archive? [Y/n]: [?] Which archive URL do you wish to use? [https://archive.softwareheritage.org/api/1/]: 
