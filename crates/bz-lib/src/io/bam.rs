@@ -24,6 +24,52 @@ pub struct RawBamRecord {
 }
 
 impl RawBamRecord {
+    /// Validate that all computed offsets fit within the record data.
+    /// Must be called before using any variable-field accessors.
+    pub fn validate(&self) -> Result<()> {
+        let len = self.data.len();
+        if len < 32 {
+            anyhow::bail!(
+                "BAM record too short: {} bytes (minimum 32)",
+                len
+            );
+        }
+        let l_seq = self.l_seq();
+        if l_seq < 0 {
+            anyhow::bail!("BAM record has negative l_seq: {}", l_seq);
+        }
+        let l_seq = l_seq as usize;
+        let read_name_end = 32usize
+            .checked_add(self.l_read_name() as usize)
+            .filter(|&v| v <= len)
+            .ok_or_else(|| anyhow::anyhow!(
+                "BAM record read_name extends past end (l_read_name={}, record_len={})",
+                self.l_read_name(), len
+            ))?;
+        let cigar_end = read_name_end
+            .checked_add(4 * self.n_cigar_op() as usize)
+            .filter(|&v| v <= len)
+            .ok_or_else(|| anyhow::anyhow!(
+                "BAM record CIGAR extends past end (n_cigar_op={}, record_len={})",
+                self.n_cigar_op(), len
+            ))?;
+        let seq_end = cigar_end
+            .checked_add((l_seq + 1) / 2)
+            .filter(|&v| v <= len)
+            .ok_or_else(|| anyhow::anyhow!(
+                "BAM record seq extends past end (l_seq={}, record_len={})",
+                l_seq, len
+            ))?;
+        let _qual_end = seq_end
+            .checked_add(l_seq)
+            .filter(|&v| v <= len)
+            .ok_or_else(|| anyhow::anyhow!(
+                "BAM record qual extends past end (l_seq={}, record_len={})",
+                l_seq, len
+            ))?;
+        Ok(())
+    }
+
     pub fn ref_id(&self) -> i32 {
         i32::from_le_bytes(self.data[0..4].try_into().unwrap())
     }
@@ -77,7 +123,8 @@ impl RawBamRecord {
     }
 
     fn seq_end(&self) -> usize {
-        self.cigar_end() + ((self.l_seq() as usize + 1) / 2)
+        let l_seq = self.l_seq() as usize;
+        self.cigar_end() + ((l_seq + 1) / 2)
     }
 
     fn qual_end(&self) -> usize {
@@ -128,28 +175,28 @@ impl RawBamRecord {
 
 /// Unpack BAM 4-bit encoded sequence nibbles.
 pub fn unpack_nibbles(packed: &[u8], l_seq: usize) -> Vec<u8> {
-    let mut nibbles = Vec::with_capacity(l_seq);
-    for i in 0..l_seq {
-        let byte = packed[i / 2];
-        if i % 2 == 0 {
-            nibbles.push(byte >> 4);
-        } else {
-            nibbles.push(byte & 0x0F);
-        }
+    let mut nibbles = vec![0u8; l_seq];
+    let pairs = l_seq / 2;
+    for i in 0..pairs {
+        nibbles[i * 2] = packed[i] >> 4;
+        nibbles[i * 2 + 1] = packed[i] & 0x0F;
+    }
+    if l_seq % 2 != 0 {
+        nibbles[l_seq - 1] = packed[pairs] >> 4;
     }
     nibbles
 }
 
 /// Pack individual nibble values back into BAM 4-bit encoding (2 per byte, high first).
 pub fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
-    let mut packed = Vec::with_capacity((nibbles.len() + 1) / 2);
-    for chunk in nibbles.chunks(2) {
-        let byte = if chunk.len() == 2 {
-            (chunk[0] << 4) | chunk[1]
-        } else {
-            chunk[0] << 4
-        };
-        packed.push(byte);
+    let out_len = (nibbles.len() + 1) / 2;
+    let mut packed = vec![0u8; out_len];
+    let pairs = nibbles.len() / 2;
+    for i in 0..pairs {
+        packed[i] = (nibbles[i * 2] << 4) | nibbles[i * 2 + 1];
+    }
+    if nibbles.len() % 2 != 0 {
+        packed[pairs] = nibbles[pairs * 2] << 4;
     }
     packed
 }
@@ -169,6 +216,7 @@ impl RawBamReader<bgzf::io::Reader<std::io::BufReader<std::fs::File>>> {
         let file = std::fs::File::open(path)?;
         let buf = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
         Self::new(bgzf::io::Reader::new(buf))
+            .map_err(|e| wrap_bam_open_error(e, path))
     }
 }
 
@@ -177,7 +225,21 @@ impl RawBamReader<bgzf::io::MultithreadedReader<std::io::BufReader<std::fs::File
         let file = std::fs::File::open(path)?;
         let buf = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
         Self::new(bgzf::io::MultithreadedReader::with_worker_count(worker_count, buf))
+            .map_err(|e| wrap_bam_open_error(e, path))
     }
+}
+
+/// Wrap low-level BGZF/IO errors with a user-friendly message.
+fn wrap_bam_open_error(e: anyhow::Error, path: &std::path::Path) -> anyhow::Error {
+    // If it's already our own descriptive error, pass through
+    let msg = e.to_string();
+    if msg.starts_with("Not a BAM file") || msg.starts_with("Invalid BAM") {
+        return e;
+    }
+    anyhow::anyhow!(
+        "Failed to read {:?} as BAM: {}. Is this a valid BAM file?",
+        path, msg
+    )
 }
 
 impl<R: Read> RawBamReader<R> {
@@ -192,7 +254,11 @@ impl<R: Read> RawBamReader<R> {
         // Read SAM header text
         let mut header_len_buf = [0u8; 4];
         reader.read_exact(&mut header_len_buf)?;
-        let header_len = i32::from_le_bytes(header_len_buf) as usize;
+        let header_len_i32 = i32::from_le_bytes(header_len_buf);
+        if header_len_i32 < 0 {
+            anyhow::bail!("Invalid BAM header length: {}", header_len_i32);
+        }
+        let header_len = header_len_i32 as usize;
         let mut header_raw = vec![0u8; header_len];
         if header_len > 0 {
             reader.read_exact(&mut header_raw)?;
@@ -202,13 +268,24 @@ impl<R: Read> RawBamReader<R> {
         let mut ref_dict_bytes = Vec::new();
         let mut n_ref_buf = [0u8; 4];
         reader.read_exact(&mut n_ref_buf)?;
-        let n_ref = i32::from_le_bytes(n_ref_buf) as usize;
+        let n_ref_i32 = i32::from_le_bytes(n_ref_buf);
+        if n_ref_i32 < 0 {
+            anyhow::bail!("Invalid BAM reference count: {}", n_ref_i32);
+        }
+        let n_ref = n_ref_i32 as usize;
         ref_dict_bytes.extend_from_slice(&n_ref_buf);
 
         for _ in 0..n_ref {
             let mut name_len_buf = [0u8; 4];
             reader.read_exact(&mut name_len_buf)?;
-            let name_len = i32::from_le_bytes(name_len_buf) as usize;
+            let name_len_i32 = i32::from_le_bytes(name_len_buf);
+            if name_len_i32 < 0 || name_len_i32 > 256 {
+                anyhow::bail!(
+                    "Invalid BAM reference name length: {}",
+                    name_len_i32
+                );
+            }
+            let name_len = name_len_i32 as usize;
             let mut name = vec![0u8; name_len];
             reader.read_exact(&mut name)?;
             let mut seq_len_buf = [0u8; 4];
@@ -233,13 +310,19 @@ impl<R: Read> RawBamReader<R> {
             Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(anyhow::Error::from(e)),
         }
-        let block_size = i32::from_le_bytes(block_size_buf) as usize;
-        if block_size < 32 {
-            anyhow::bail!("Invalid BAM record: block_size {} < 32", block_size);
+        let block_size_i32 = i32::from_le_bytes(block_size_buf);
+        if block_size_i32 < 32 {
+            anyhow::bail!(
+                "Invalid BAM record: block_size {} (must be >= 32)",
+                block_size_i32
+            );
         }
+        let block_size = block_size_i32 as usize;
         let mut data = vec![0u8; block_size];
         self.reader.read_exact(&mut data)?;
-        Ok(Some(RawBamRecord { data }))
+        let record = RawBamRecord { data };
+        record.validate()?;
+        Ok(Some(record))
     }
 
     /// Read up to `limit` records into a Vec.

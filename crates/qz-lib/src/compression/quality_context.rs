@@ -337,9 +337,8 @@ pub fn compress_parallel(
                 qualities.len()
             };
             compress(&qualities[byte_start..byte_end], &read_lengths[read_start..read_end], config)
-                .unwrap_or_default()
         })
-        .collect();
+        .collect::<Result<Vec<Vec<u8>>>>()?;
 
     let mut output = Vec::new();
     output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
@@ -388,9 +387,8 @@ pub fn decompress_parallel(
             let read_start = block_idx * block_size;
             let read_end = ((block_idx + 1) * block_size).min(read_lengths.len());
             decompress(block_data[block_idx], &read_lengths[read_start..read_end], config)
-                .unwrap_or_default()
         })
-        .collect();
+        .collect::<Result<Vec<Vec<u8>>>>()?;
 
     let total_len: usize = decoded_blocks.iter().map(|b| b.len()).sum();
     let mut output = Vec::with_capacity(total_len);

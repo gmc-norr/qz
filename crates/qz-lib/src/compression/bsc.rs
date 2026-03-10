@@ -162,6 +162,9 @@ pub fn compress_with_params(
     if data.is_empty() {
         return Ok(vec![]);
     }
+    if data.len() > c_int::MAX as usize {
+        anyhow::bail!("BSC input too large: {} bytes (max {})", data.len(), c_int::MAX);
+    }
 
     // Allocate output buffer (worst case: input size + header)
     let mut output = vec![0u8; data.len() + LIBBSC_HEADER_SIZE + 1024];
@@ -221,6 +224,9 @@ fn compress_mt_inner(data: &[u8], lzp_hash_size: i32, lzp_min_len: i32) -> Resul
 
     if data.is_empty() {
         return Ok(vec![]);
+    }
+    if data.len() > c_int::MAX as usize {
+        anyhow::bail!("BSC input too large: {} bytes (max {})", data.len(), c_int::MAX);
     }
 
     let mut output = vec![0u8; data.len() + LIBBSC_HEADER_SIZE + 1024];
@@ -384,6 +390,9 @@ fn decompress_with_features(data: &[u8], features: c_int) -> Result<Vec<u8>> {
 
     if data.len() < LIBBSC_HEADER_SIZE {
         anyhow::bail!("BSC: compressed data too small (need at least {} bytes for header)", LIBBSC_HEADER_SIZE);
+    }
+    if data.len() > c_int::MAX as usize {
+        anyhow::bail!("BSC compressed block too large: {} bytes (max {})", data.len(), c_int::MAX);
     }
 
     let mut block_size: c_int = 0;

@@ -3,8 +3,9 @@ mod compress;
 mod decompress;
 mod extract;
 pub mod streams;
+mod verify;
 
-use crate::cli::{CompressConfig, DecompressConfig, ExtractConfig};
+use crate::cli::{CompressConfig, DecompressConfig, ExtractConfig, VerifyConfig, VerifyResult};
 use anyhow::Result;
 
 pub fn compress(config: &CompressConfig) -> Result<()> {
@@ -17,4 +18,8 @@ pub fn decompress(config: &DecompressConfig) -> Result<()> {
 
 pub fn extract(config: &ExtractConfig) -> Result<()> {
     extract::extract(config)
+}
+
+pub fn verify(config: &VerifyConfig) -> Result<VerifyResult> {
+    verify::verify(config)
 }

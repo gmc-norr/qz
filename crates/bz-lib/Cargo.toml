@@ -19,6 +19,7 @@ tempfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 zstd.workspace = true
+flate2.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true

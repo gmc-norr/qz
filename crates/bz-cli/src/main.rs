@@ -21,6 +21,8 @@ enum Commands {
     Decompress(DecompressArgs),
     /// Extract FASTQ from BAM and compress to QZ format
     Extract(ExtractArgs),
+    /// Verify archive integrity without decompressing to disk
+    Verify(VerifyArgs),
 }
 
 #[derive(Parser)]
@@ -63,12 +65,22 @@ struct ExtractArgs {
     /// Input BAM file
     #[arg(short, long, value_name = "FILE", required = true)]
     input: PathBuf,
-    /// Output prefix (creates {prefix}_R1.qz and {prefix}_R2.qz for paired-end, or {prefix}.qz for single-end)
+    /// Output prefix (creates {prefix}_R1.qz and {prefix}_R2.qz for paired-end, or {prefix}_SE.qz for single-end)
     #[arg(short, long, value_name = "PREFIX", required = true)]
     output: String,
     /// Working directory for temporary files
     #[arg(short, long, default_value = ".")]
     working_dir: PathBuf,
+    /// Number of threads (0 = auto-detect)
+    #[arg(short = 't', long, default_value = "0")]
+    threads: usize,
+}
+
+#[derive(Parser)]
+struct VerifyArgs {
+    /// Input BZ archive
+    #[arg(short, long, value_name = "FILE", required = true)]
+    input: PathBuf,
     /// Number of threads (0 = auto-detect)
     #[arg(short = 't', long, default_value = "0")]
     threads: usize,
@@ -135,6 +147,32 @@ fn main() -> Result<()> {
             };
             bz_lib::extract(&config)?;
             info!("Extraction complete!");
+        }
+        Commands::Verify(args) => {
+            let config = bz_lib::VerifyConfig {
+                input: args.input.clone(),
+                threads: args.threads,
+            };
+            match bz_lib::verify(&config) {
+                Ok(result) => {
+                    let comp_name = |c: u8| if c == 0 { "bsc" } else { "zstd" };
+                    eprintln!("Archive:     {:?}", args.input);
+                    eprintln!("Status:      OK");
+                    eprintln!("Records:     {}", result.num_records);
+                    eprintln!("Chunks:      {}", result.num_chunks);
+                    eprintln!("Alignment:   {}", comp_name(result.alignment_compressor));
+                    eprintln!("Aux tags:    {}", comp_name(result.aux_compressor));
+                    eprintln!("CRC32:       {:08x}", result.crc32);
+                    eprintln!("Data size:   {} bytes", result.total_bytes);
+                    eprintln!("Verified in: {:.2}s", result.elapsed_secs);
+                }
+                Err(e) => {
+                    eprintln!("Archive:     {:?}", args.input);
+                    eprintln!("Status:      FAILED");
+                    eprintln!("Error:       {:#}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

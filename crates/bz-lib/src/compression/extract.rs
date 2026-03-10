@@ -83,7 +83,8 @@ fn write_fastq_record(w: &mut impl Write, header: &[u8], seq: &[u8], qual: &[u8]
 /// Extract FASTQ from BAM and compress to QZ format.
 ///
 /// For paired-end data, produces `{prefix}_R1.qz` and `{prefix}_R2.qz` with
-/// matching read order. For single-end data, produces `{prefix}.qz`.
+/// matching read order. For single-end data, produces `{prefix}_SE.qz`.
+/// Mixed BAMs produce both paired and SE files.
 ///
 /// Reads are extracted from coordinate-sorted BAM, preserving genomic locality
 /// for better BSC compression. Secondary and supplementary alignments are skipped.
@@ -135,6 +136,10 @@ fn extract_inner(config: &ExtractConfig, threads: usize) -> Result<()> {
     let mut r2_writer = BufWriter::with_capacity(
         4 * 1024 * 1024,
         std::fs::File::create(&tmp_r2_path)?,
+    );
+    let mut se_writer = BufWriter::with_capacity(
+        4 * 1024 * 1024,
+        std::fs::File::create(&tmp_se_path)?,
     );
 
     // HashMap for pairing: read_name → (Option<(header, seq, qual)>, Option<(header, seq, qual)>)
@@ -201,6 +206,7 @@ fn extract_inner(config: &ExtractConfig, threads: usize) -> Result<()> {
             }
         } else {
             single_count += 1;
+            write_fastq_record(&mut se_writer, &header, &seq, &qual)?;
         }
 
         if total_records % 10_000_000 == 0 {
@@ -248,8 +254,10 @@ fn extract_inner(config: &ExtractConfig, threads: usize) -> Result<()> {
 
     r1_writer.flush()?;
     r2_writer.flush()?;
+    se_writer.flush()?;
     drop(r1_writer);
     drop(r2_writer);
+    drop(se_writer);
 
     let read_time = start.elapsed();
     info!(
@@ -257,15 +265,7 @@ fn extract_inner(config: &ExtractConfig, threads: usize) -> Result<()> {
         read_time.as_secs_f64(), total_records, paired_count, single_count, pairs_written, skipped_secondary
     );
 
-    if !is_paired_end && single_count > 0 {
-        // Single-end: rename R1 temp to SE, compress as single file
-        std::fs::rename(&tmp_r1_path, &tmp_se_path)?;
-        let _ = std::fs::remove_file(&tmp_r2_path);
-
-        let output_path = format!("{}.qz", config.output_prefix);
-        info!("Compressing single-end reads to {}", output_path);
-        compress_fastq_to_qz(&tmp_se_path, &output_path, &config.working_dir, threads)?;
-    } else {
+    if is_paired_end && pairs_written > 0 {
         // Paired-end: compress R1 and R2
         let r1_output = format!("{}_R1.qz", config.output_prefix);
         let r2_output = format!("{}_R2.qz", config.output_prefix);
@@ -275,11 +275,24 @@ fn extract_inner(config: &ExtractConfig, threads: usize) -> Result<()> {
             pairs_written, r1_output, r2_output
         );
 
-        // Compress R1 and R2 sequentially (each uses all threads internally)
         info!("Compressing R1...");
         compress_fastq_to_qz(&tmp_r1_path, &r1_output, &config.working_dir, threads)?;
         info!("Compressing R2...");
         compress_fastq_to_qz(&tmp_r2_path, &r2_output, &config.working_dir, threads)?;
+    }
+
+    if single_count > 0 {
+        // Single-end reads (either pure SE or mixed with paired)
+        let output_path = format!("{}_SE.qz", config.output_prefix);
+        info!(
+            "Compressing {} single-end reads to {}",
+            single_count, output_path
+        );
+        compress_fastq_to_qz(&tmp_se_path, &output_path, &config.working_dir, threads)?;
+    }
+
+    if pairs_written == 0 && single_count == 0 {
+        warn!("No reads extracted from BAM file");
     }
 
     let total_time = start.elapsed();

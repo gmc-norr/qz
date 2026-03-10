@@ -91,9 +91,31 @@ impl ArchiveHeader {
         r.read_exact(&mut buf4)?;
         let num_chunks = u32::from_le_bytes(buf4);
 
-        // SAM header compressed
+        // Validate compressor codes
+        if alignment_compressor > 1 {
+            anyhow::bail!(
+                "Unknown alignment compressor code {} (expected 0=bsc or 1=zstd)",
+                alignment_compressor
+            );
+        }
+        if aux_compressor > 1 {
+            anyhow::bail!(
+                "Unknown aux compressor code {} (expected 0=bsc or 1=zstd)",
+                aux_compressor
+            );
+        }
+
+        // SAM header compressed (with size limit to prevent OOM on malicious input)
+        const MAX_COMPRESSED_HEADER: usize = 100 * 1024 * 1024; // 100 MB
         r.read_exact(&mut buf4)?;
         let sam_len = u32::from_le_bytes(buf4) as usize;
+        if sam_len > MAX_COMPRESSED_HEADER {
+            anyhow::bail!(
+                "Compressed SAM header size {} exceeds limit ({} MB)",
+                sam_len,
+                MAX_COMPRESSED_HEADER / (1024 * 1024)
+            );
+        }
         let mut sam_header_compressed = vec![0u8; sam_len];
         if sam_len > 0 {
             r.read_exact(&mut sam_header_compressed)?;

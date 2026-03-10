@@ -134,7 +134,7 @@ impl VerifyArgs {
 }
 
 impl CompressArgs {
-    fn into_config(self) -> CompressConfig {
+    fn into_config(self) -> anyhow::Result<CompressConfig> {
         let quality_mode = match self.quality_mode {
             CliQualityMode::Lossless => LibQualityMode::Lossless,
             CliQualityMode::IlluminaBin => LibQualityMode::IlluminaBin,
@@ -143,14 +143,14 @@ impl CompressArgs {
 
         let advanced = if let Some(ref config_path) = self.config {
             let json_str = std::fs::read_to_string(config_path)
-                .unwrap_or_else(|e| panic!("Failed to read config file {config_path:?}: {e}"));
+                .map_err(|e| anyhow::anyhow!("Failed to read config file {config_path:?}: {e}"))?;
             serde_json::from_str(&json_str)
-                .unwrap_or_else(|e| panic!("Failed to parse config file {config_path:?}: {e}"))
+                .map_err(|e| anyhow::anyhow!("Failed to parse config file {config_path:?}: {e}"))?
         } else {
             qz_lib::cli::AdvancedOptions::default()
         };
 
-        CompressConfig {
+        Ok(CompressConfig {
             input: vec![self.input],
             output: self.output,
             working_dir: self.working_dir,
@@ -160,7 +160,7 @@ impl CompressArgs {
             quality_mode,
             ultra: self.ultra,
             advanced,
-        }
+        })
     }
 }
 
@@ -197,7 +197,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Compress(args) => {
             info!("Starting compression...");
-            let config = args.into_config();
+            let config = args.into_config()?;
             qz_lib::compression::compress(&config)?;
             info!("Compression complete!");
         }

@@ -100,8 +100,9 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
     header_payload.extend_from_slice(&reader.ref_dict_bytes);
     let sam_header_compressed = bsc::compress_parallel(&header_payload)?;
 
-    // Write archive header with placeholder num_records/num_chunks (patched at end)
-    let output_file = std::fs::File::create(&config.output)?;
+    // Write to a temp file, then rename atomically on success
+    let temp_output = config.output.with_extension("bz.tmp");
+    let output_file = std::fs::File::create(&temp_output)?;
     let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, output_file);
 
     let flags = FLAG_CONSENSUS_DELTA;
@@ -211,6 +212,14 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
     file.seek(SeekFrom::Start(NUM_CHUNKS_OFFSET))?;
     file.write_all(&num_chunks.to_le_bytes())?;
     file.flush()?;
+    drop(writer);
+
+    // Atomic rename: temp file -> final output
+    std::fs::rename(&temp_output, &config.output).map_err(|e| {
+        // Clean up temp file on rename failure
+        let _ = std::fs::remove_file(&temp_output);
+        anyhow::anyhow!("Failed to rename temp file to {:?}: {}", config.output, e)
+    })?;
 
     let output_size = std::fs::metadata(&config.output)?.len();
     let elapsed = start_time.elapsed().as_secs_f64();

@@ -164,54 +164,87 @@ impl<'a> RangeDecoder<'a> {
 }
 
 // ============================================================================
-// Adaptive Model with integer cumulative frequencies
+// Flat model arena — all cum_freqs in one contiguous allocation
 // ============================================================================
-struct AdaptiveModel {
-    cum_freqs: Vec<u32>, // length = n_symbols + 1, cum_freqs[0] = 0
+// Eliminates per-model heap allocations (previously each AdaptiveModel owned a
+// separate Vec<u32>). With ~4K active models, this removes ~4K pointer-chasing
+// indirections per context switch in the hot loop.
+
+struct ModelArena {
+    /// Flat storage: `data[slot * stride .. (slot+1) * stride]` = cum_freqs for model `slot`.
+    data: Vec<u32>,
+    /// Per-model cumulative total.
+    totals: Vec<u32>,
+    stride: usize, // n_symbols + 1
     n_symbols: usize,
-    total: u32,
 }
 
-impl AdaptiveModel {
+impl ModelArena {
     fn new(n_symbols: usize) -> Self {
-        // Uniform init (Laplace smoothing): each symbol has count 1
-        let cum_freqs: Vec<u32> = (0..=n_symbols).map(|i| i as u32).collect();
         Self {
-            cum_freqs,
+            data: Vec::with_capacity(4096 * (n_symbols + 1)),
+            totals: Vec::with_capacity(4096),
+            stride: n_symbols + 1,
             n_symbols,
-            total: n_symbols as u32,
         }
     }
 
+    /// Allocate a new model with uniform (Laplace) initialization. Returns slot index.
     #[inline(always)]
-    fn encode_params(&self, sym: usize) -> (u32, u32, u32) {
-        let cum = self.cum_freqs[sym];
-        let freq = self.cum_freqs[sym + 1] - cum;
-        (cum, freq, self.total)
+    fn alloc(&mut self) -> usize {
+        let slot = self.totals.len();
+        // Uniform init: cum_freqs = [0, 1, 2, ..., n_symbols]
+        let base = self.data.len();
+        self.data.resize(base + self.stride, 0);
+        for i in 0..self.stride {
+            self.data[base + i] = i as u32;
+        }
+        self.totals.push(self.n_symbols as u32);
+        slot
     }
 
     #[inline(always)]
-    fn update(&mut self, sym: usize) {
+    fn encode_params(&self, slot: usize, sym: usize) -> (u32, u32, u32) {
+        let base = slot * self.stride;
+        let cum = self.data[base + sym];
+        let freq = self.data[base + sym + 1] - cum;
+        (cum, freq, self.totals[slot])
+    }
+
+    #[inline(always)]
+    fn cum_freqs(&self, slot: usize) -> &[u32] {
+        let base = slot * self.stride;
+        &self.data[base..base + self.stride]
+    }
+
+    #[inline(always)]
+    fn total(&self, slot: usize) -> u32 {
+        self.totals[slot]
+    }
+
+    #[inline(always)]
+    fn update(&mut self, slot: usize, sym: usize) {
+        let base = slot * self.stride;
         for i in (sym + 1)..=self.n_symbols {
-            self.cum_freqs[i] += 1;
+            self.data[base + i] += 1;
         }
-        self.total += 1;
-        if self.total >= RESCALE_THRESHOLD {
-            self.rescale();
+        self.totals[slot] += 1;
+        if self.totals[slot] >= RESCALE_THRESHOLD {
+            self.rescale(slot);
         }
     }
 
-    fn rescale(&mut self) {
-        // Halve all frequencies, maintaining minimum of 1
+    fn rescale(&mut self, slot: usize) {
+        let base = slot * self.stride;
         let mut cum = 0u32;
-        self.cum_freqs[0] = 0;
+        self.data[base] = 0;
         for i in 0..self.n_symbols {
-            let freq = self.cum_freqs[i + 1] - self.cum_freqs[i];
+            let freq = self.data[base + i + 1] - self.data[base + i];
             let new_freq = (freq >> 1).max(1);
             cum += new_freq;
-            self.cum_freqs[i + 1] = cum;
+            self.data[base + i + 1] = cum;
         }
-        self.total = cum;
+        self.totals[slot] = cum;
     }
 }
 
@@ -242,9 +275,15 @@ static BASE_TO_IDX_LUT: [u8; 256] = {
     t
 };
 
-#[inline(always)]
-fn base_to_idx(b: u8) -> u8 {
-    BASE_TO_IDX_LUT[b as usize]
+/// Batch-convert an ASCII sequence to base indices. Avoids per-symbol LUT
+/// lookups in the hot encode/decode loops.
+#[inline]
+fn precompute_base_indices(seq: &[u8]) -> Vec<u8> {
+    let mut indices = vec![0u8; seq.len()];
+    for i in 0..seq.len() {
+        indices[i] = BASE_TO_IDX_LUT[seq[i] as usize];
+    }
+    indices
 }
 
 // ============================================================================
@@ -258,16 +297,28 @@ pub fn compress_qualities_ctx(qualities: &[&[u8]], sequences: &[&[u8]]) -> Resul
     if qualities.is_empty() {
         return Ok(Vec::new());
     }
+    if qualities.len() != sequences.len() {
+        anyhow::bail!(
+            "quality_ctx compress: {} quality strings but {} sequences",
+            qualities.len(), sequences.len()
+        );
+    }
 
     // Build symbol alphabet from input qualities
     let mut seen = [false; 256];
     for q in qualities {
         for &b in *q {
+            if b < 33 {
+                anyhow::bail!("quality_ctx compress: invalid quality byte {b} (< 33)");
+            }
             seen[(b - 33) as usize] = true;
         }
     }
     let symbols: Vec<u8> = (0u8..=255).filter(|&i| seen[i as usize]).collect();
     let n_symbols = symbols.len();
+    if n_symbols == 0 {
+        anyhow::bail!("quality_ctx compress: no quality symbols found in input");
+    }
     let mut sym_map = [0u8; 256];
     for (i, &s) in symbols.iter().enumerate() {
         sym_map[s as usize] = i as u8;
@@ -279,39 +330,43 @@ pub fn compress_qualities_ctx(qualities: &[&[u8]], sequences: &[&[u8]]) -> Resul
     let read_len: u16 = if variable { 0 } else { first_len as u16 };
     let num_reads = qualities.len();
 
-    // Context model lookup: flat Vec, u32::MAX = uninitialized
-    let mut ctx_slots: Vec<u32> = vec![u32::MAX; MAX_CONTEXTS];
-    let mut models: Vec<AdaptiveModel> = Vec::with_capacity(4096);
+    // Context → model slot. u16::MAX = uninitialized (supports up to 65534 active models).
+    let mut ctx_slots: Vec<u16> = vec![u16::MAX; MAX_CONTEXTS];
+    let mut models = ModelArena::new(n_symbols);
 
     let mut encoder = RangeEncoder::new();
 
     for (qual, seq) in qualities.iter().zip(sequences.iter()) {
         let qb = *qual;
         let sb = *seq;
+        if qb.len() > sb.len() {
+            anyhow::bail!("quality_ctx compress: quality length {} > sequence length {}", qb.len(), sb.len());
+        }
+        let base_idx = precompute_base_indices(sb);
         let mut prev_q: u8 = 0;
         let mut prev_q2: u8 = 0;
+        let mut prev_base: u8 = 4; // sentinel for position 0
 
         for j in 0..qb.len() {
             let phred = qb[j] - 33;
             let sym = sym_map[phred as usize] as usize;
-            let cur_base = base_to_idx(sb[j]);
-            let prev_base = if j > 0 { base_to_idx(sb[j - 1]) } else { 4 };
+            let cur_base = base_idx[j];
             let ctx = context_id(j, prev_q, prev_q2, prev_base, cur_base);
 
-            let slot = if ctx_slots[ctx] == u32::MAX {
-                let id = models.len() as u32;
-                ctx_slots[ctx] = id;
-                models.push(AdaptiveModel::new(n_symbols));
-                id as usize
+            let slot = if ctx_slots[ctx] == u16::MAX {
+                let id = models.alloc();
+                ctx_slots[ctx] = id as u16;
+                id
             } else {
                 ctx_slots[ctx] as usize
             };
 
-            let (cum, freq, total) = models[slot].encode_params(sym);
+            let (cum, freq, total) = models.encode_params(slot, sym);
             encoder.encode(cum, freq, total);
-            models[slot].update(sym);
+            models.update(slot, sym);
             prev_q2 = prev_q;
             prev_q = phred;
+            prev_base = cur_base;
         }
     }
 
@@ -340,64 +395,110 @@ pub fn decompress_qualities_ctx(
     sequences: &[&[u8]],
     num_reads: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    if data.is_empty() || num_reads == 0 {
+    if num_reads == 0 {
         return Ok(Vec::new());
     }
+    if data.is_empty() {
+        anyhow::bail!("quality_ctx decode: stream is empty but num_reads={num_reads}");
+    }
+    if num_reads > sequences.len() {
+        anyhow::bail!(
+            "quality_ctx decode: num_reads={num_reads} but only {} sequences",
+            sequences.len()
+        );
+    }
 
-    let mut pos = 0;
+    // Safe header parser with bounds checking
+    let mut pos = 0usize;
+    let mut take = |n: usize, field: &str| -> Result<&[u8]> {
+        let end = pos.checked_add(n)
+            .ok_or_else(|| anyhow::anyhow!("quality_ctx decode: {field} offset overflow"))?;
+        if end > data.len() {
+            anyhow::bail!("quality_ctx decode: truncated at {field} (need {end}, have {})", data.len());
+        }
+        let slice = &data[pos..end];
+        pos = end;
+        Ok(slice)
+    };
 
-    let n_symbols = data[pos] as usize;
-    pos += 1;
-    let symbols: Vec<u8> = data[pos..pos + n_symbols].to_vec();
-    pos += n_symbols;
+    let n_symbols = take(1, "n_symbols")?[0] as usize;
+    if n_symbols == 0 {
+        anyhow::bail!("quality_ctx decode: empty symbol alphabet");
+    }
+    let symbols: Vec<u8> = take(n_symbols, "symbols")?.to_vec();
 
-    let read_len = data[pos] as usize | ((data[pos + 1] as usize) << 8);
-    pos += 2;
-    let _stored_reads =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
-    pos += 4;
-    let compressed_len =
-        u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as usize;
-    pos += 4;
+    let rl_bytes = take(2, "read_len")?;
+    let read_len = u16::from_le_bytes([rl_bytes[0], rl_bytes[1]]) as usize;
 
-    let compressed_data = &data[pos..pos + compressed_len];
+    let nr_bytes = take(4, "num_reads")?;
+    let stored_reads = u32::from_le_bytes([nr_bytes[0], nr_bytes[1], nr_bytes[2], nr_bytes[3]]) as usize;
+    if stored_reads != num_reads {
+        anyhow::bail!(
+            "quality_ctx decode: header says {stored_reads} reads but {num_reads} requested"
+        );
+    }
+
+    let cl_bytes = take(4, "compressed_len")?;
+    let compressed_len = u32::from_le_bytes([cl_bytes[0], cl_bytes[1], cl_bytes[2], cl_bytes[3]]) as usize;
+    let compressed_data = take(compressed_len, "compressed_data")?;
+
     let mut decoder = RangeDecoder::new(compressed_data);
 
-    let mut ctx_slots: Vec<u32> = vec![u32::MAX; MAX_CONTEXTS];
-    let mut models: Vec<AdaptiveModel> = Vec::with_capacity(4096);
-    let mut result = Vec::with_capacity(num_reads);
+    // u16 ctx_slots: 320KB vs 640KB with u32, better L2 cache fit
+    let mut ctx_slots: Vec<u16> = vec![u16::MAX; MAX_CONTEXTS];
+    let mut models = ModelArena::new(n_symbols);
+
+    // Pre-allocate result; for fixed-length reads, pre-allocate inner vecs too
+    let mut result: Vec<Vec<u8>> = if read_len > 0 {
+        vec![Vec::with_capacity(read_len); num_reads]
+    } else {
+        Vec::with_capacity(num_reads)
+    };
 
     for i in 0..num_reads {
         let sb = sequences[i];
         let this_len = if read_len > 0 { read_len } else { sb.len() };
-        let mut qual_bytes = Vec::with_capacity(this_len);
+        if sb.len() < this_len {
+            anyhow::bail!(
+                "quality_ctx decode: sequence {} has length {} but quality needs {}",
+                i, sb.len(), this_len
+            );
+        }
+        let base_idx = precompute_base_indices(&sb[..this_len]);
+
+        // Get or create the output vec for this read
+        let qual_bytes = if read_len > 0 {
+            &mut result[i]
+        } else {
+            result.push(Vec::with_capacity(this_len));
+            result.last_mut().unwrap()
+        };
+
         let mut prev_q: u8 = 0;
         let mut prev_q2: u8 = 0;
+        let mut prev_base: u8 = 4; // sentinel
 
         for j in 0..this_len {
-            let cur_base = base_to_idx(sb[j]);
-            let prev_base = if j > 0 { base_to_idx(sb[j - 1]) } else { 4 };
+            let cur_base = base_idx[j];
             let ctx = context_id(j, prev_q, prev_q2, prev_base, cur_base);
 
-            let slot = if ctx_slots[ctx] == u32::MAX {
-                let id = models.len() as u32;
-                ctx_slots[ctx] = id;
-                models.push(AdaptiveModel::new(n_symbols));
-                id as usize
+            let slot = if ctx_slots[ctx] == u16::MAX {
+                let id = models.alloc();
+                ctx_slots[ctx] = id as u16;
+                id
             } else {
                 ctx_slots[ctx] as usize
             };
 
-            let sym = decoder.decode(&models[slot].cum_freqs, n_symbols, models[slot].total);
-            models[slot].update(sym);
+            let sym = decoder.decode(models.cum_freqs(slot), n_symbols, models.total(slot));
+            models.update(slot, sym);
 
             let phred = symbols[sym];
             qual_bytes.push(phred + 33);
             prev_q2 = prev_q;
             prev_q = phred;
+            prev_base = cur_base;
         }
-
-        result.push(qual_bytes);
     }
 
     Ok(result)
@@ -412,38 +513,70 @@ pub fn decompress_quality_ctx_multiblock(
     data: &[u8],
     sequences: &[Vec<u8>],
 ) -> Result<Vec<Vec<u8>>> {
-    if data.is_empty() || sequences.is_empty() {
+    if sequences.is_empty() {
         return Ok(Vec::new());
+    }
+    if data.is_empty() {
+        anyhow::bail!("quality_ctx multiblock: stream is empty but sequences are present");
     }
 
     let num_blocks = super::read_le_u32(data, 0)? as usize;
-    let mut offset = 4;
+    if num_blocks == 0 {
+        anyhow::bail!("quality_ctx multiblock: 0 blocks but {} sequences", sequences.len());
+    }
+    let mut offset: usize = 4;
 
     // Phase 1: parse block boundaries and compute sequence ranges (fast, sequential)
-    let mut block_info: Vec<(&[u8], usize, usize)> = Vec::with_capacity(num_blocks); // (blob, seq_start, num_reads)
-    let mut seq_cursor = 0;
+    let mut block_info: Vec<(&[u8], usize, usize)> = Vec::with_capacity(num_blocks);
+    let mut seq_cursor: usize = 0;
 
-    for _ in 0..num_blocks {
-        if offset + 4 > data.len() {
-            anyhow::bail!("quality_ctx multiblock: truncated block length");
+    for blk in 0..num_blocks {
+        let next_off = offset.checked_add(4)
+            .ok_or_else(|| anyhow::anyhow!("quality_ctx multiblock: block {blk} length offset overflow"))?;
+        if next_off > data.len() {
+            anyhow::bail!("quality_ctx multiblock: truncated block {blk} length");
         }
         let block_len = super::read_le_u32(data, offset)? as usize;
-        offset += 4;
+        offset = next_off;
 
-        if offset + block_len > data.len() {
-            anyhow::bail!("quality_ctx multiblock: truncated block data");
+        let blob_end = offset.checked_add(block_len)
+            .ok_or_else(|| anyhow::anyhow!("quality_ctx multiblock: block {blk} data offset overflow"))?;
+        if blob_end > data.len() {
+            anyhow::bail!("quality_ctx multiblock: truncated block {blk} data");
         }
-        let blob = &data[offset..offset + block_len];
-        offset += block_len;
+        let blob = &data[offset..blob_end];
+        offset = blob_end;
 
         // Extract num_reads from blob header:
         // [n_symbols:1B][symbols:nB][read_len:2B][num_reads:4B]
+        if blob.is_empty() {
+            anyhow::bail!("quality_ctx multiblock: block {blk} is empty");
+        }
         let n_symbols = blob[0] as usize;
         let nr_offset = 1 + n_symbols + 2;
+        if nr_offset + 4 > blob.len() {
+            anyhow::bail!("quality_ctx multiblock: block {blk} header truncated");
+        }
         let chunk_reads = super::read_le_u32(blob, nr_offset)? as usize;
 
+        let next_seq = seq_cursor.checked_add(chunk_reads)
+            .ok_or_else(|| anyhow::anyhow!("quality_ctx multiblock: sequence count overflow at block {blk}"))?;
+        if next_seq > sequences.len() {
+            anyhow::bail!(
+                "quality_ctx multiblock: block {blk} wants {} reads starting at {}, but only {} sequences total",
+                chunk_reads, seq_cursor, sequences.len()
+            );
+        }
+
         block_info.push((blob, seq_cursor, chunk_reads));
-        seq_cursor += chunk_reads;
+        seq_cursor = next_seq;
+    }
+
+    if seq_cursor != sequences.len() {
+        anyhow::bail!(
+            "quality_ctx multiblock: blocks cover {} reads but {} sequences provided",
+            seq_cursor, sequences.len()
+        );
     }
 
     // Phase 2: decode all blocks in parallel (each block is independent)
@@ -631,5 +764,28 @@ mod tests {
         let empty: Vec<&[u8]> = vec![];
         let compressed = compress_qualities_ctx(&empty, &empty).unwrap();
         assert!(compressed.is_empty());
+    }
+
+    #[test]
+    fn test_empty_data_nonzero_reads_errors() {
+        let sequences: Vec<&[u8]> = vec![b"ACGT"];
+        let result = decompress_qualities_ctx(&[], &sequences, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_length_mismatch_errors() {
+        let sequences: Vec<&[u8]> = vec![b"ACGT"];
+        let qualities: Vec<&[u8]> = vec![b"IIII", b"AAAA"]; // 2 quals, 1 seq
+        let result = compress_qualities_ctx(&qualities, &sequences);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_quality_byte_errors() {
+        let sequences: Vec<&[u8]> = vec![b"ACGT"];
+        let qualities: Vec<&[u8]> = vec![&[10, 20, 30, 40]]; // all < 33
+        let result = compress_qualities_ctx(&qualities, &sequences);
+        assert!(result.is_err());
     }
 }

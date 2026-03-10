@@ -711,8 +711,11 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
     let quality_model_opt = if quality_model_enabled {
         let model_size = read_le_u16(data, offset)? as usize;
         offset += 2;
-        let model_bytes = &data[offset..offset + model_size];
-        offset += model_size;
+        let end = offset.checked_add(model_size)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("quality model extends beyond archive data (offset={offset}, size={model_size}, archive_len={})", data.len()))?;
+        let model_bytes = &data[offset..end];
+        offset = end;
         Some(quality_model::deserialize_model(model_bytes)?)
     } else {
         None
@@ -725,8 +728,11 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         offset += 1;
         let dict_size = read_le_u32(data, offset)? as usize;
         offset += 4;
-        let dict = data[offset..offset + dict_size].to_vec();
-        offset += dict_size;
+        let end = offset.checked_add(dict_size)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("quality dict extends beyond archive data (offset={offset}, size={dict_size}, archive_len={})", data.len()))?;
+        let dict = data[offset..end].to_vec();
+        offset = end;
         Some(dict)
     } else {
         offset += 1;
@@ -735,8 +741,11 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
 
     let template_prefix_len = read_le_u16(data, offset)? as usize;
     offset += 2;
-    let template_prefix = String::from_utf8_lossy(&data[offset..offset + template_prefix_len]).to_string();
-    offset += template_prefix_len;
+    let end = offset.checked_add(template_prefix_len)
+        .filter(|&e| e <= data.len())
+        .ok_or_else(|| anyhow::anyhow!("template prefix extends beyond archive data (offset={offset}, size={template_prefix_len}, archive_len={})", data.len()))?;
+    let template_prefix = String::from_utf8_lossy(&data[offset..end]).to_string();
+    offset = end;
     let template_has_comment = data[offset] != 0;
     offset += 1;
 
@@ -744,8 +753,11 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         let cc_len = read_le_u16(data, offset)? as usize;
         offset += 2;
         if cc_len > 0 {
-            let cc = String::from_utf8_lossy(&data[offset..offset + cc_len]).to_string();
-            offset += cc_len;
+            let end = offset.checked_add(cc_len)
+                .filter(|&e| e <= data.len())
+                .ok_or_else(|| anyhow::anyhow!("common comment extends beyond archive data (offset={offset}, size={cc_len}, archive_len={})", data.len()))?;
+            let cc = String::from_utf8_lossy(&data[offset..end]).to_string();
+            offset = end;
             Some(cc)
         } else {
             None
@@ -821,13 +833,30 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
     // Parse archive header
     let hdr = parse_archive_header(&archive_data)?;
     let mut offset = hdr.data_offset;
-    let headers = &archive_data[offset..offset + hdr.headers_len];
-    offset += hdr.headers_len;
-    let sequences = &archive_data[offset..offset + hdr.sequences_len];
-    offset += hdr.sequences_len;
-    let nmasks = &archive_data[offset..offset + hdr.nmasks_len];
-    offset += hdr.nmasks_len;
-    let qualities = &archive_data[offset..offset + hdr.qualities_len];
+    let archive_len = archive_data.len();
+
+    let end = offset.checked_add(hdr.headers_len)
+        .filter(|&e| e <= archive_len)
+        .ok_or_else(|| anyhow::anyhow!("headers stream extends beyond archive (offset={offset}, len={}, archive_len={archive_len})", hdr.headers_len))?;
+    let headers = &archive_data[offset..end];
+    offset = end;
+
+    let end = offset.checked_add(hdr.sequences_len)
+        .filter(|&e| e <= archive_len)
+        .ok_or_else(|| anyhow::anyhow!("sequences stream extends beyond archive (offset={offset}, len={}, archive_len={archive_len})", hdr.sequences_len))?;
+    let sequences = &archive_data[offset..end];
+    offset = end;
+
+    let end = offset.checked_add(hdr.nmasks_len)
+        .filter(|&e| e <= archive_len)
+        .ok_or_else(|| anyhow::anyhow!("nmasks stream extends beyond archive (offset={offset}, len={}, archive_len={archive_len})", hdr.nmasks_len))?;
+    let nmasks = &archive_data[offset..end];
+    offset = end;
+
+    let end = offset.checked_add(hdr.qualities_len)
+        .filter(|&e| e <= archive_len)
+        .ok_or_else(|| anyhow::anyhow!("qualities stream extends beyond archive (offset={offset}, len={}, archive_len={archive_len})", hdr.qualities_len))?;
+    let qualities = &archive_data[offset..end];
     let num_reads = hdr.num_reads;
     let template_prefix_len = hdr.read_id_template.prefix.len();
     let encoding_type = hdr.encoding_type;

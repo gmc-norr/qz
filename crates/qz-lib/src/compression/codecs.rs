@@ -194,11 +194,6 @@ pub(crate) fn compress_headers_columnar(records: &[crate::io::FastqRecord]) -> R
     header_col::compress_headers_columnar(&header_refs)
 }
 
-/// Decompress columnar-encoded headers.
-pub(super) fn decompress_headers_columnar(compressed: &[u8], num_reads: usize) -> Result<Vec<Vec<u8>>> {
-    header_col::decompress_headers_columnar(compressed, num_reads)
-}
-
 // ── Sequences ──────────────────────────────────────────────────────────────
 
 /// Compress sequences as raw ASCII + BSC (no 2-bit encoding, no N-mask).

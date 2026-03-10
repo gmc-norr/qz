@@ -1,4 +1,5 @@
 use crate::io::bam::{RawBamRecord, pack_nibbles};
+use anyhow::Result;
 use std::collections::HashMap;
 
 // CIGAR op codes that consume query (read) bases
@@ -42,10 +43,13 @@ pub fn write_varint(buf: &mut Vec<u8>, mut value: usize) {
     }
 }
 
-pub fn read_varint(data: &[u8], offset: &mut usize) -> usize {
+pub fn read_varint(data: &[u8], offset: &mut usize) -> Result<usize> {
     let mut value: usize = 0;
     let mut shift = 0;
     loop {
+        if *offset >= data.len() {
+            anyhow::bail!("Truncated varint at offset {}", *offset);
+        }
         let byte = data[*offset];
         *offset += 1;
         value |= ((byte & 0x7F) as usize) << shift;
@@ -53,8 +57,11 @@ pub fn read_varint(data: &[u8], offset: &mut usize) -> usize {
             break;
         }
         shift += 7;
+        if shift > 63 {
+            anyhow::bail!("Varint too large at offset {}", *offset);
+        }
     }
-    value
+    Ok(value)
 }
 
 // --- Zigzag encoding for signed integers ---
@@ -71,26 +78,28 @@ pub fn zigzag_decode(v: u32) -> i32 {
 
 /// Pack nibble values (0-15) into bytes, 2 per byte (high nibble first).
 pub fn pack_nibble_pairs(nibbles: &[u8]) -> Vec<u8> {
-    let mut packed = Vec::with_capacity((nibbles.len() + 1) / 2);
-    for chunk in nibbles.chunks(2) {
-        let byte = if chunk.len() == 2 {
-            (chunk[0] << 4) | (chunk[1] & 0x0F)
-        } else {
-            chunk[0] << 4
-        };
-        packed.push(byte);
+    let out_len = (nibbles.len() + 1) / 2;
+    let mut packed = vec![0u8; out_len];
+    let pairs = nibbles.len() / 2;
+    for i in 0..pairs {
+        packed[i] = (nibbles[i * 2] << 4) | (nibbles[i * 2 + 1] & 0x0F);
+    }
+    if nibbles.len() % 2 != 0 {
+        packed[pairs] = nibbles[pairs * 2] << 4;
     }
     packed
 }
 
 /// Unpack nibble pairs back to individual values.
 pub fn unpack_nibble_pairs(packed: &[u8], count: usize) -> Vec<u8> {
-    let mut nibbles = Vec::with_capacity(count);
-    for &byte in packed {
-        nibbles.push(byte >> 4);
-        if nibbles.len() < count {
-            nibbles.push(byte & 0x0F);
-        }
+    let mut nibbles = vec![0u8; count];
+    let pairs = count / 2;
+    for i in 0..pairs {
+        nibbles[i * 2] = packed[i] >> 4;
+        nibbles[i * 2 + 1] = packed[i] & 0x0F;
+    }
+    if count % 2 != 0 {
+        nibbles[count - 1] = packed[pairs] >> 4;
     }
     nibbles
 }
@@ -105,6 +114,84 @@ const NIBBLE_TO_ASCII_TABLE: [u8; 16] = [
 /// Convert BAM 4-bit nibble to ASCII base character.
 pub fn nibble_to_ascii(n: u8) -> u8 {
     NIBBLE_TO_ASCII_TABLE[(n & 0x0F) as usize]
+}
+
+/// Scalar fallback for nibbles_to_ascii.
+#[inline]
+fn nibbles_to_ascii_scalar(nibbles: &[u8], ascii: &mut [u8]) {
+    for i in 0..nibbles.len() {
+        ascii[i] = NIBBLE_TO_ASCII_TABLE[(nibbles[i] & 0x0F) as usize];
+    }
+}
+
+/// SSSE3 pshufb: 16-byte LUT lookup, 16 bytes at a time.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn nibbles_to_ascii_ssse3(nibbles: &[u8], ascii: &mut [u8]) {
+    use std::arch::x86_64::*;
+    let table = unsafe { _mm_loadu_si128(NIBBLE_TO_ASCII_TABLE.as_ptr() as *const __m128i) };
+    let mask = _mm_set1_epi8(0x0F);
+
+    let len = nibbles.len();
+    let chunks = len / 16;
+    for i in 0..chunks {
+        unsafe {
+            let input = _mm_loadu_si128(nibbles.as_ptr().add(i * 16) as *const __m128i);
+            let masked = _mm_and_si128(input, mask);
+            let result = _mm_shuffle_epi8(table, masked);
+            _mm_storeu_si128(ascii.as_mut_ptr().add(i * 16) as *mut __m128i, result);
+        }
+    }
+    // Scalar tail
+    for i in (chunks * 16)..len {
+        ascii[i] = NIBBLE_TO_ASCII_TABLE[(nibbles[i] & 0x0F) as usize];
+    }
+}
+
+/// Batch-convert nibble array to ASCII. Uses SSSE3 pshufb when available.
+pub fn nibbles_to_ascii(nibbles: &[u8]) -> Vec<u8> {
+    let mut ascii = vec![0u8; nibbles.len()];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            unsafe { nibbles_to_ascii_ssse3(nibbles, &mut ascii) };
+            return ascii;
+        }
+    }
+    nibbles_to_ascii_scalar(nibbles, &mut ascii);
+    ascii
+}
+
+// --- BAM quality <-> ASCII Phred+33 ---
+
+/// Convert BAM quality bytes to ASCII Phred+33 in bulk.
+/// 0xFF (unavailable) maps to '!' (ASCII 33, Phred 0).
+/// Returns true if any 0xFF byte was encountered.
+#[inline]
+pub fn bam_qual_to_ascii(src: &[u8], dst: &mut [u8]) -> bool {
+    debug_assert_eq!(src.len(), dst.len());
+    // Branchless: mask q to 0 when 0xFF, then add 33.
+    // LLVM vectorizes this to vpcmpeqb + vpand + vpaddb.
+    let mut any_ff = 0u8;
+    for i in 0..src.len() {
+        let q = src[i];
+        let is_ff = (q == 0xFF) as u8;
+        any_ff |= is_ff;
+        let mask = !is_ff.wrapping_neg(); // 0xFF if q != 0xFF, 0x00 if q == 0xFF
+        dst[i] = (q & mask).wrapping_add(33);
+    }
+    any_ff != 0
+}
+
+/// Convert ASCII Phred+33 quality back to BAM phred bytes in bulk.
+/// Uses saturating subtract so values < 33 clamp to 0.
+#[inline]
+pub fn ascii_qual_to_bam(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len());
+    // Maps directly to vpsubusb (unsigned saturating subtract).
+    for i in 0..src.len() {
+        dst[i] = src[i].saturating_sub(33);
+    }
 }
 
 // --- Consensus ---
@@ -285,15 +372,21 @@ impl ChunkConsensus {
     }
 
     /// Deserialize consensus data from bytes (nibbles packed 2 per byte).
-    pub fn deserialize(data: &[u8]) -> Self {
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
+        if data.len() < 4 {
+            anyhow::bail!("Consensus data too short ({} bytes)", data.len());
+        }
         let mut offset = 0;
         let num_segments = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
-        let mut segments = Vec::with_capacity(num_segments);
+        let mut segments = Vec::with_capacity(num_segments.min(1024));
         let mut index = HashMap::new();
 
         for i in 0..num_segments {
+            if offset + 12 > data.len() {
+                anyhow::bail!("Truncated consensus segment {i} at offset {offset}");
+            }
             let ref_id = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
             offset += 4;
             let start_pos = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
@@ -301,6 +394,12 @@ impl ChunkConsensus {
             let num_bases = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
             offset += 4;
             let packed_len = (num_bases + 1) / 2;
+            if offset + packed_len > data.len() {
+                anyhow::bail!(
+                    "Truncated consensus bases: need {packed_len} bytes at offset {offset}, have {}",
+                    data.len() - offset
+                );
+            }
             let bases = unpack_nibble_pairs(&data[offset..offset + packed_len], num_bases);
             offset += packed_len;
             index.insert(ref_id, i);
@@ -311,7 +410,7 @@ impl ChunkConsensus {
             });
         }
 
-        Self { segments, index }
+        Ok(Self { segments, index })
     }
 }
 
@@ -535,19 +634,13 @@ pub fn records_to_streams(records: &[RawBamRecord]) -> StreamsResult {
 
         // Collect per-record quality (Phred+33 ASCII) and ASCII sequences for quality_ctx
         let qual_raw = rec.qual_bytes();
-        let mut qual_ascii = Vec::with_capacity(qual_raw.len());
-        for &q in qual_raw {
-            if q == 0xFF {
-                has_unavailable_quality = true;
-                qual_ascii.push(33u8); // map unavailable to Phred 0
-            } else {
-                qual_ascii.push(q + 33);
-            }
+        let mut qual_ascii = vec![0u8; qual_raw.len()];
+        if bam_qual_to_ascii(qual_raw, &mut qual_ascii) {
+            has_unavailable_quality = true;
         }
         qualities_ascii.push(qual_ascii);
 
-        let ascii_seq: Vec<u8> = nibbles.iter().map(|&n| nibble_to_ascii(n)).collect();
-        sequences_ascii.push(ascii_seq);
+        sequences_ascii.push(nibbles_to_ascii(&nibbles));
     }
 
     StreamsResult {
@@ -575,6 +668,9 @@ pub fn reconstruct_sequence_nibbles(
     let mut seq_nibbles: Vec<u8> = Vec::with_capacity(l_seq);
 
     if n_cigar_op == 0 {
+        assert!(extra_nibbles.len() >= l_seq,
+            "reconstruct_sequence_nibbles: extra_nibbles too short ({} < l_seq {})",
+            extra_nibbles.len(), l_seq);
         seq_nibbles.extend_from_slice(&extra_nibbles[..l_seq]);
     } else {
         let cigar_ops = parse_cigar_ops(cigar_bytes, n_cigar_op);
@@ -666,7 +762,12 @@ pub fn reconstruct_record(
 pub fn parse_cigar_ops(bytes: &[u8], n_ops: usize) -> Vec<(u8, u32)> {
     let mut ops = Vec::with_capacity(n_ops);
     for i in 0..n_ops {
-        let val = u32::from_le_bytes(bytes[i * 4..(i + 1) * 4].try_into().unwrap());
+        let start = i * 4;
+        // Safety: callers ensure bytes.len() >= n_ops * 4
+        if start + 4 > bytes.len() {
+            break;
+        }
+        let val = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
         ops.push(((val & 0xF) as u8, val >> 4));
     }
     ops

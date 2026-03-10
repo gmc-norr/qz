@@ -24,6 +24,29 @@ pub struct ExtractConfig {
     pub threads: usize,
 }
 
+pub struct VerifyConfig {
+    pub input: PathBuf,
+    pub threads: usize,
+}
+
+/// Result of archive verification.
+pub struct VerifyResult {
+    /// Total number of BAM records verified.
+    pub num_records: u64,
+    /// Number of chunks in the archive.
+    pub num_chunks: u32,
+    /// Alignment stream compressor (0=bsc, 1=zstd).
+    pub alignment_compressor: u8,
+    /// Aux stream compressor (0=bsc, 1=zstd).
+    pub aux_compressor: u8,
+    /// CRC32 over decompressed stream data (integrity fingerprint).
+    pub crc32: u32,
+    /// Total bytes of data hashed for the CRC.
+    pub total_bytes: u64,
+    /// Time taken in seconds.
+    pub elapsed_secs: f64,
+}
+
 /// Tunable compression parameters for BZ BAM compression.
 ///
 /// Passed via `--config config.json` on the CLI.
