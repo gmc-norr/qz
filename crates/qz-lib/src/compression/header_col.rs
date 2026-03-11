@@ -14,6 +14,7 @@
 //! Falls back to raw BSC (version 0x00) for unrecognized formats.
 
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -193,32 +194,43 @@ fn decompress_sra(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
     let stored_n = read_u32(data, &mut pos)? as usize;
     anyhow::ensure!(stored_n == num_reads, "SRA header count mismatch: stored {stored_n}, expected {num_reads}");
 
-    // Decompress 6 columns
-    let d_rn = read_and_decompress(data, &mut pos)?;
-    let d_ci = read_and_decompress(data, &mut pos)?;
-    let d_ln = read_and_decompress(data, &mut pos)?;
-    let d_ti = read_and_decompress(data, &mut pos)?;
-    let d_xs = read_and_decompress(data, &mut pos)?;
-    let d_ys = read_and_decompress(data, &mut pos)?;
+    // Read all 6 compressed column blobs (sequential I/O), then decompress in parallel
+    let s_rn = read_compressed_slice(data, &mut pos)?;
+    let s_ci = read_compressed_slice(data, &mut pos)?;
+    let s_ln = read_compressed_slice(data, &mut pos)?;
+    let s_ti = read_compressed_slice(data, &mut pos)?;
+    let s_xs = read_compressed_slice(data, &mut pos)?;
+    let s_ys = read_compressed_slice(data, &mut pos)?;
 
-    let mut headers = Vec::with_capacity(num_reads);
-    for i in 0..num_reads {
+    let col_blobs: [&[u8]; 6] = [s_rn, s_ci, s_ln, s_ti, s_xs, s_ys];
+    let col_results: Vec<Result<Vec<u8>>> = col_blobs.into_par_iter()
+        .map(|blob| bsc::decompress_parallel(blob))
+        .collect();
+    let mut col_iter = col_results.into_iter();
+    let d_rn = col_iter.next().unwrap()?;
+    let d_ci = col_iter.next().unwrap()?;
+    let d_ln = col_iter.next().unwrap()?;
+    let d_ti = col_iter.next().unwrap()?;
+    let d_xs = col_iter.next().unwrap()?;
+    let d_ys = col_iter.next().unwrap()?;
+
+    let headers: Result<Vec<String>> = (0..num_reads).into_par_iter().map(|i| {
         let rn = super::read_le_u32(&d_rn, i * 4)?;
-        let combo = &combos[d_ci[i] as usize];
-        let lane = d_ln[i];
+        let ci = *d_ci.get(i).ok_or_else(|| anyhow::anyhow!("SRA: combo index out of bounds at read {i}"))?;
+        let combo = combos.get(ci as usize).ok_or_else(|| anyhow::anyhow!("SRA: combo dict entry {} out of range at read {i}", ci))?;
+        let lane = *d_ln.get(i).ok_or_else(|| anyhow::anyhow!("SRA: lane out of bounds at read {i}"))?;
         let tile = super::read_le_u16(&d_ti, i * 2)?;
         let x = super::read_le_u16(&d_xs, i * 2)?;
         let y = super::read_le_u16(&d_ys, i * 2)?;
 
-        let header = if pair_suffix.is_empty() {
+        Ok(if pair_suffix.is_empty() {
             format!("@{}{} {}:{}:{}:{}:{}", name_prefix, rn, combo, lane, tile, x, y)
         } else {
             format!("@{}{} {}:{}:{}:{}:{}{}", name_prefix, rn, combo, lane, tile, x, y, pair_suffix)
-        };
-        headers.push(header);
-    }
+        })
+    }).collect();
 
-    Ok(headers)
+    headers
 }
 
 fn parse_sra(
@@ -437,53 +449,68 @@ fn decompress_casava(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
         None
     };
 
-    let mut headers = Vec::with_capacity(num_reads);
-    let mut comment_offset = 0;
-    let mut umi_offset = 0;
+    // Pre-scan variable-length comment offsets (sequential, needed before parallel phase)
+    let comment_offsets: Option<Vec<(usize, usize)>> = if let Some(cd) = &comment_data {
+        let mut offsets = Vec::with_capacity(num_reads);
+        let mut off = 0usize;
+        for i in 0..num_reads {
+            let len = read_varint_from_slice(cd, &mut off)?;
+            let end = off.checked_add(len)
+                .filter(|&e| e <= cd.len())
+                .ok_or_else(|| anyhow::anyhow!("header_col: truncated comment data for header {i}"))?;
+            offsets.push((off, end));
+            off = end;
+        }
+        Some(offsets)
+    } else {
+        None
+    };
 
-    for i in 0..num_reads {
-        let combo = &combos[d_ci[i] as usize];
-        let lane = d_ln[i];
+    // Pre-scan variable-length UMI offsets
+    let umi_offsets: Option<Vec<(usize, usize)>> = if let Some(ud) = &umi_data {
+        let mut offsets = Vec::with_capacity(num_reads);
+        let mut off = 0usize;
+        for i in 0..num_reads {
+            let len = read_varint_from_slice(ud, &mut off)?;
+            let end = off.checked_add(len)
+                .filter(|&e| e <= ud.len())
+                .ok_or_else(|| anyhow::anyhow!("header_col: truncated UMI data for header {i}"))?;
+            offsets.push((off, end));
+            off = end;
+        }
+        Some(offsets)
+    } else {
+        None
+    };
+
+    let headers: Result<Vec<String>> = (0..num_reads).into_par_iter().map(|i| {
+        let ci = *d_ci.get(i).ok_or_else(|| anyhow::anyhow!("Casava: combo index out of bounds at read {i}"))?;
+        let combo = combos.get(ci as usize).ok_or_else(|| anyhow::anyhow!("Casava: combo dict entry {} out of range at read {i}", ci))?;
+        let lane = *d_ln.get(i).ok_or_else(|| anyhow::anyhow!("Casava: lane out of bounds at read {i}"))?;
         let tile = super::read_le_u16(&d_ti, i * 2)?;
         let x = super::read_le_u16(&d_xs, i * 2)?;
         let y = super::read_le_u16(&d_ys, i * 2)?;
 
         let comment = match &common_comment {
-            Some(cc) => cc.as_str().to_string(),
+            Some(cc) => cc.as_str(),
             None => {
-                let cd = comment_data.as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("missing comment data for header {i}"))?;
-                let len = read_varint_from_slice(cd, &mut comment_offset)?;
-                let comment_end = comment_offset.checked_add(len)
-                    .filter(|&e| e <= cd.len())
-                    .ok_or_else(|| anyhow::anyhow!("header_col: truncated comment data for header {i}"))?;
-                let s = std::str::from_utf8(&cd[comment_offset..comment_end])
-                    .context("invalid comment UTF-8")?
-                    .to_string();
-                comment_offset = comment_end;
-                s
+                let cd = comment_data.as_ref().unwrap();
+                let (s, e) = comment_offsets.as_ref().unwrap()[i];
+                std::str::from_utf8(&cd[s..e]).context("invalid comment UTF-8")?
             }
         };
 
-        let header = if has_umi {
-            let ud = umi_data.as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing UMI data for header {i}"))?;
-            let umi_len = read_varint_from_slice(ud, &mut umi_offset)?;
-            let umi_end = umi_offset.checked_add(umi_len)
-                .filter(|&e| e <= ud.len())
-                .ok_or_else(|| anyhow::anyhow!("header_col: truncated UMI data for header {i}"))?;
-            let umi = std::str::from_utf8(&ud[umi_offset..umi_end])
-                .context("invalid UMI UTF-8")?;
-            umi_offset = umi_end;
+        Ok(if has_umi {
+            let ud = umi_data.as_ref().unwrap();
+            let (s, e) = umi_offsets.as_ref().unwrap()[i];
+            let umi = std::str::from_utf8(&ud[s..e]).context("invalid UMI UTF-8")?;
             format!("@{}:{}:{}:{}:{}:{} {}", combo, lane, tile, x, y, umi, comment)
         } else {
             format!("@{}:{}:{}:{}:{} {}", combo, lane, tile, x, y, comment)
-        };
+        })
+    }).collect();
 
-        headers.push(header);
-    }
-
-    Ok(headers)
+    headers
 }
 
 fn parse_casava(
@@ -612,13 +639,19 @@ fn write_blob(out: &mut Vec<u8>, blob: &[u8]) {
 }
 
 fn read_and_decompress(data: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+    let compressed = read_compressed_slice(data, pos)?;
+    bsc::decompress_parallel(compressed)
+}
+
+/// Read a length-prefixed BSC blob and return a slice without decompressing.
+fn read_compressed_slice<'a>(data: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> {
     let len = read_u32(data, pos)? as usize;
     if *pos + len > data.len() {
         anyhow::bail!("header_col: truncated compressed block at offset {}", *pos);
     }
-    let decompressed = bsc::decompress_parallel(&data[*pos..*pos + len])?;
+    let slice = &data[*pos..*pos + len];
     *pos += len;
-    Ok(decompressed)
+    Ok(slice)
 }
 
 fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32> {

@@ -550,6 +550,7 @@ HG002 chromosome 20, Illumina WGS (18,289,203 aligned reads, 250 bp). Byte-ident
 | Format | Size | Ratio vs BAM |
 |--------|------|-------------|
 | **BAM** (BGZF/gzip) | **2,593 MB** | **1.00x** |
+| CRAM lossless (`samtools`, 1 thread) | 2,048 MB | 1.27x |
 | **BZ** | **1,450 MB** | **1.79x** |
 
 ### Per-stream breakdown (chunk 0, 2.5M records)

@@ -227,11 +227,31 @@ pub(crate) fn compress_sequences_raw_bsc_with(records: &[crate::io::FastqRecord]
 
 /// Decompress raw ASCII BSC-compressed sequences.
 pub(super) fn decompress_sequences_raw_bsc(compressed: &[u8], num_reads: usize, encoding_type: u8, const_seq_len: usize) -> Result<Vec<Vec<u8>>> {
+    use rayon::prelude::*;
     let decompressed = bsc::decompress_parallel(compressed)?;
-    let mut sequences = Vec::with_capacity(num_reads);
-    let mut offset = 0;
+
     let skip_hints = encoding_type == 4;
     let decode_delta = encoding_type == 5;
+
+    // Fast path: constant-length reads with no per-record flags
+    if const_seq_len > 0 && !decode_delta && !skip_hints {
+        let expected = num_reads * const_seq_len;
+        if decompressed.len() < expected {
+            anyhow::bail!(
+                "Truncated sequence data: expected {} bytes for {} reads at {} bp, got {}",
+                expected, num_reads, const_seq_len, decompressed.len()
+            );
+        }
+        let sequences: Vec<Vec<u8>> = (0..num_reads)
+            .into_par_iter()
+            .map(|i| decompressed[i * const_seq_len..(i + 1) * const_seq_len].to_vec())
+            .collect();
+        return Ok(sequences);
+    }
+
+    // General path: variable-length or flagged reads (sequential)
+    let mut sequences = Vec::with_capacity(num_reads);
+    let mut offset = 0;
 
     // Delta decoding needs a cache of all previously decoded sequences
     let mut delta_reads: Vec<Vec<u8>> = if decode_delta { Vec::with_capacity(num_reads) } else { Vec::new() };

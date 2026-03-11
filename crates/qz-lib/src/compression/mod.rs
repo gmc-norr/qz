@@ -622,6 +622,7 @@ fn decompress_headers_dispatch(
             }
         }
         HeaderCompressor::Columnar => {
+            use rayon::prelude::*;
             // Columnar data is stored in block format:
             // [num_blocks: u32][block_len: u32][num_reads: u32][columnar_blob]...
             if headers.len() < 4 {
@@ -629,7 +630,8 @@ fn decompress_headers_dispatch(
             }
             let num_blocks = read_le_u32(headers, 0)? as usize;
             let mut offset = 4;
-            let mut all_headers = Vec::with_capacity(num_reads);
+            // Collect (blob, chunk_reads) pairs sequentially (pointer arithmetic only)
+            let mut blocks: Vec<(&[u8], usize)> = Vec::with_capacity(num_blocks);
             for _ in 0..num_blocks {
                 let block_len = read_le_u32(headers, offset)? as usize;
                 offset += 4;
@@ -644,9 +646,16 @@ fn decompress_headers_dispatch(
                 let chunk_reads = u32::from_le_bytes(
                     [block_data[0], block_data[1], block_data[2], block_data[3]]
                 ) as usize;
-                let blob = &block_data[4..];
-                let chunk_headers = header_col::decompress_headers_columnar(blob, chunk_reads)?;
-                all_headers.extend(chunk_headers);
+                blocks.push((&block_data[4..], chunk_reads));
+            }
+            // Decompress all blocks in parallel, preserving order
+            let block_results: Vec<Result<Vec<Vec<u8>>>> = blocks
+                .into_par_iter()
+                .map(|(blob, chunk_reads)| header_col::decompress_headers_columnar(blob, chunk_reads))
+                .collect();
+            let mut all_headers = Vec::with_capacity(num_reads);
+            for result in block_results {
+                all_headers.extend(result?);
             }
             Ok(all_headers)
         }

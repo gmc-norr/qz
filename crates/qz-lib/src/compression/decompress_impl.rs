@@ -57,12 +57,12 @@ pub struct VerifyResult {
 ///
 /// Reads compressed BSC blocks from a stream region of the archive file,
 /// decompresses them in parallel batches (using rayon), and sends
-/// decompressed blocks through a bounded channel to the consumer thread.
+/// decompressed blocks through a channel to the consumer thread.
 fn stream_decompressor(
     path: &std::path::Path,
     offset: u64,
     stream_len: usize,
-    tx: std::sync::mpsc::SyncSender<std::result::Result<Vec<u8>, String>>,
+    tx: std::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
 ) {
     if let Err(e) = stream_decompressor_inner(path, offset, stream_len, &tx) {
         let _ = tx.send(Err(e.to_string()));
@@ -73,7 +73,7 @@ fn stream_decompressor_inner(
     path: &std::path::Path,
     offset: u64,
     stream_len: usize,
-    tx: &std::sync::mpsc::SyncSender<std::result::Result<Vec<u8>, String>>,
+    tx: &std::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
 ) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
     use rayon::prelude::*;
@@ -136,12 +136,12 @@ fn stream_decompressor_inner(
 /// Streaming decompressor for columnar-encoded header blocks.
 /// Each block in the archive is: [num_reads: u32][columnar_blob].
 /// Decompresses to individual headers, re-encodes as varint-prefixed stream
-/// for compatibility with ChannelStreamBuffer.
+/// for compatibility with scan_header_offsets.
 fn stream_decompressor_columnar(
     path: &std::path::Path,
     offset: u64,
     stream_len: usize,
-    tx: std::sync::mpsc::SyncSender<std::result::Result<Vec<u8>, String>>,
+    tx: std::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
 ) {
     if let Err(e) = stream_decompressor_columnar_inner(path, offset, stream_len, &tx) {
         let _ = tx.send(Err(e.to_string()));
@@ -152,7 +152,7 @@ fn stream_decompressor_columnar_inner(
     path: &std::path::Path,
     offset: u64,
     stream_len: usize,
-    tx: &std::sync::mpsc::SyncSender<std::result::Result<Vec<u8>, String>>,
+    tx: &std::sync::mpsc::Sender<std::result::Result<Vec<u8>, String>>,
 ) -> Result<()> {
     use std::io::{Read, Seek, SeekFrom};
 
@@ -194,7 +194,7 @@ fn stream_decompressor_columnar_inner(
         // Decompress columnar blob to individual headers
         let headers = header_col::decompress_headers_columnar(blob, chunk_reads)?;
 
-        // Re-encode as varint-prefixed stream for ChannelStreamBuffer compatibility
+        // Re-encode as varint-prefixed stream for scan_header_offsets compatibility
         let mut stream = Vec::new();
         for h in &headers {
             let mut v = h.len();
@@ -214,81 +214,6 @@ fn stream_decompressor_columnar_inner(
     Ok(())
 }
 
-/// Buffer that receives decompressed blocks from a background decompressor
-/// thread via a bounded channel. Provides varint/bytes reading interface
-/// for streaming record reconstruction.
-struct ChannelStreamBuffer {
-    rx: std::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>,
-    buf: Vec<u8>,
-    pos: usize,
-}
-
-impl ChannelStreamBuffer {
-    fn new(rx: std::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>) -> Self {
-        Self {
-            rx,
-            buf: Vec::new(),
-            pos: 0,
-        }
-    }
-
-    /// Ensure at least `min` unread bytes are available.
-    /// Receives decompressed blocks from the channel as needed.
-    fn fill(&mut self, min: usize) -> Result<bool> {
-        while self.buf.len() - self.pos < min {
-            // Compact consumed data: copy_within + truncate avoids drain's iterator overhead
-            if self.pos > 0 {
-                let remaining = self.buf.len() - self.pos;
-                if remaining > 0 {
-                    self.buf.copy_within(self.pos.., 0);
-                }
-                self.buf.truncate(remaining);
-                self.pos = 0;
-            }
-            match self.rx.recv() {
-                Ok(Ok(block)) => self.buf.extend_from_slice(&block),
-                Ok(Err(e)) => anyhow::bail!("Stream decompressor error: {}", e),
-                Err(_) => return Ok(self.buf.len() - self.pos >= min),
-            }
-        }
-        Ok(true)
-    }
-
-    fn read_varint(&mut self) -> Result<usize> {
-        let mut value = 0usize;
-        let mut shift = 0;
-        let mut bytes_read = 0;
-        loop {
-            if !self.fill(1)? {
-                anyhow::bail!("Unexpected end of stream reading varint");
-            }
-            let byte = self.buf[self.pos];
-            self.pos += 1;
-            bytes_read += 1;
-            value |= ((byte & 0x7F) as usize) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-            shift += 7;
-            if bytes_read >= MAX_VARINT_BYTES {
-                anyhow::bail!("Malformed varint: too many continuation bytes");
-            }
-        }
-    }
-
-    fn read_bytes(&mut self, n: usize) -> Result<&[u8]> {
-        if !self.fill(n)? {
-            anyhow::bail!(
-                "Unexpected end of stream: needed {} bytes, have {}",
-                n,
-                self.buf.len() - self.pos
-            );
-        }
-        let start = self.pos;
-        self.pos += n;
-        Ok(&self.buf[start..start + n])
-    }
-}
 
 /// Check if archive can use the streaming BSC decompression path.
 /// Reads the v2 header prefix + body to check all flags.
@@ -500,6 +425,214 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
 /// Stream decompressed records to an output writer.
 ///
 /// Extracted from decompress_streaming_bsc to allow different writer types
+/// Drain a decompressor channel into a single contiguous buffer.
+fn drain_channel(
+    rx: std::sync::mpsc::Receiver<std::result::Result<Vec<u8>, String>>,
+) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    for block in rx {
+        match block {
+            Ok(b) => data.extend_from_slice(&b),
+            Err(e) => anyhow::bail!("Stream decompressor error: {}", e),
+        }
+    }
+    Ok(data)
+}
+
+/// Scan a varint-prefixed header stream.
+/// Returns `(data_start, data_len)` for each of `count` records.
+fn scan_header_offsets(data: &[u8], count: usize) -> Result<Vec<(usize, usize)>> {
+    let mut offsets = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    for i in 0..count {
+        let len = read_varint(data, &mut pos)
+            .ok_or_else(|| anyhow::anyhow!("truncated header stream at record {}", i))?;
+        offsets.push((pos, len));
+        pos += len;
+    }
+    Ok(offsets)
+}
+
+/// Scan a variable-length sequence stream (`[varint(len)] [hint?] [seq]` per record).
+/// Returns `(seq_start, seq_len)` for each record.
+fn scan_seq_offsets(data: &[u8], count: usize, has_hints: bool) -> Result<Vec<(usize, usize)>> {
+    let mut offsets = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    for i in 0..count {
+        let len = read_varint(data, &mut pos)
+            .ok_or_else(|| anyhow::anyhow!("truncated sequence stream at record {}", i))?;
+        if has_hints {
+            pos += 1; // skip hint byte
+        }
+        offsets.push((pos, len));
+        pos += len;
+    }
+    Ok(offsets)
+}
+
+/// Scan a variable-length quality stream (`[varint(l_seq)] [packed_bytes]` per record).
+/// Returns `(packed_start, l_seq)` for each record.
+fn scan_qual_offsets(
+    data: &[u8],
+    count: usize,
+    bits_per_qual: usize,
+) -> Result<Vec<(usize, usize)>> {
+    let mut offsets = Vec::with_capacity(count);
+    let mut pos = 0usize;
+    for i in 0..count {
+        let l_seq = read_varint(data, &mut pos)
+            .ok_or_else(|| anyhow::anyhow!("truncated quality stream at record {}", i))?;
+        let packed_len = l_seq.checked_mul(bits_per_qual)
+            .and_then(|n| n.checked_add(7))
+            .map(|n| n / 8)
+            .ok_or_else(|| anyhow::anyhow!(
+                "quality length overflow at record {}: l_seq={} bits_per_qual={}",
+                i, l_seq, bits_per_qual
+            ))?;
+        offsets.push((pos, l_seq));
+        pos += packed_len;
+    }
+    Ok(offsets)
+}
+
+/// Reconstruct FASTQ records in parallel from decompressed stream buffers,
+/// writing chunks to `output` in order.
+///
+/// Each rayon worker reconstructs its slice of records into a local `Vec<u8>`,
+/// then all chunks are written sequentially. Peak additional memory is
+/// ~(uncompressed FASTQ size) across all chunks.
+fn reconstruct_records_parallel(
+    output: &mut dyn std::io::Write,
+    num_reads: usize,
+    h_data: &[u8],
+    s_data: &[u8],
+    q_data: Option<&[u8]>,
+    rc_data: Option<&[u8]>,
+    const_seq_len: usize,
+    const_qual_len: usize,
+    has_sequence_hints: bool,
+    bits_per_qual: usize,
+    quality_binning: QualityBinning,
+) -> Result<()> {
+    use rayon::prelude::*;
+
+    if num_reads == 0 {
+        return output.flush().map_err(Into::into);
+    }
+
+    // Pre-scan header stream (always varint-prefixed, always variable-length)
+    let h_offsets = scan_header_offsets(h_data, num_reads)?;
+
+    // Pre-scan sequence stream for variable-length records
+    let s_offsets: Option<Vec<(usize, usize)>> = if const_seq_len == 0 {
+        Some(scan_seq_offsets(s_data, num_reads, has_sequence_hints)?)
+    } else {
+        None
+    };
+    // For const-length: stride = seq_len + optional hint byte
+    let s_stride = if const_seq_len > 0 {
+        const_seq_len + if has_sequence_hints { 1 } else { 0 }
+    } else {
+        0
+    };
+    let s_data_skip = if has_sequence_hints && const_seq_len > 0 { 1 } else { 0 };
+
+    // Pre-scan quality stream for variable-length records
+    let q_offsets: Option<Vec<(usize, usize)>> = match (q_data, const_qual_len) {
+        (Some(q), 0) => Some(scan_qual_offsets(q, num_reads, bits_per_qual)?),
+        _ => None,
+    };
+    let packed_qual_len = if const_qual_len > 0 {
+        (const_qual_len * bits_per_qual + 7) / 8
+    } else {
+        0
+    };
+
+    // Estimate output bytes per record for buffer pre-allocation
+    let est_seq = if const_seq_len > 0 { const_seq_len } else { 150 };
+    let est_per_record = 80 + est_seq + 4 + est_seq + 1;
+
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = (num_reads + num_threads - 1) / num_threads;
+
+    let chunks: Vec<Result<Vec<u8>>> = (0..num_threads)
+        .into_par_iter()
+        .map(|t| {
+            let start = t * chunk_size;
+            let end = (start + chunk_size).min(num_reads);
+            if start >= num_reads {
+                return Ok(Vec::new());
+            }
+            let mut buf = Vec::with_capacity((end - start) * est_per_record);
+
+            for i in start..end {
+                // Header (already includes '@' from original record.id)
+                let (h_start, h_len) = h_offsets[i];
+                buf.extend_from_slice(&h_data[h_start..h_start + h_len]);
+                buf.push(b'\n');
+
+                // Sequence
+                let seq_bytes = if let Some(ref so) = s_offsets {
+                    let (s_start, s_len) = so[i];
+                    &s_data[s_start..s_start + s_len]
+                } else {
+                    let s_start = i * s_stride + s_data_skip;
+                    &s_data[s_start..s_start + const_seq_len]
+                };
+                if let Some(rc) = rc_data {
+                    if rc[i] != 0 {
+                        buf.extend_from_slice(&dna_utils::reverse_complement(seq_bytes));
+                    } else {
+                        buf.extend_from_slice(seq_bytes);
+                    }
+                } else {
+                    buf.extend_from_slice(seq_bytes);
+                }
+                buf.extend_from_slice(b"\n+\n");
+
+                // Quality
+                if let Some(q) = q_data {
+                    if let Some(ref qo) = q_offsets {
+                        let (q_start, l_seq) = qo[i];
+                        let packed_len = l_seq.checked_mul(bits_per_qual)
+                            .and_then(|n| n.checked_add(7))
+                            .map(|n| n / 8)
+                            .ok_or_else(|| anyhow::anyhow!(
+                                "quality length overflow at record {}: l_seq={} bits_per_qual={}",
+                                i, l_seq, bits_per_qual
+                            ))?;
+                        columnar::unpack_qualities_to_writer(
+                            &q[q_start..q_start + packed_len],
+                            l_seq,
+                            quality_binning,
+                            &mut buf,
+                        )
+                        .map_err(|e| anyhow::anyhow!("quality unpack at record {}: {}", i, e))?;
+                    } else {
+                        let q_start = i * packed_qual_len;
+                        columnar::unpack_qualities_to_writer(
+                            &q[q_start..q_start + packed_qual_len],
+                            const_qual_len,
+                            quality_binning,
+                            &mut buf,
+                        )
+                        .map_err(|e| anyhow::anyhow!("quality unpack at record {}: {}", i, e))?;
+                    }
+                }
+                buf.push(b'\n');
+            }
+
+            Ok(buf)
+        })
+        .collect();
+
+    for chunk in chunks {
+        output.write_all(&chunk?)?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 /// (plain buffered vs parallel gzip) without duplicating the decompression logic.
 fn stream_records_to_writer(
     output: &mut dyn std::io::Write,
@@ -523,14 +656,14 @@ fn stream_records_to_writer(
     header_compressor_code: u8,
 ) -> Result<()> {
     std::thread::scope(|scope| -> Result<()> {
-        // Bounded channels: capacity 2 = max 2 pre-decompressed blocks buffered per stream
-        let (h_tx, h_rx) = std::sync::mpsc::sync_channel(2);
-        let (s_tx, s_rx) = std::sync::mpsc::sync_channel(2);
+        // Unbounded channels: decompressor threads push all blocks without backpressure,
+        // allowing all three streams to decompress fully in parallel before reconstruction.
+        let (h_tx, h_rx) = std::sync::mpsc::channel();
+        let (s_tx, s_rx) = std::sync::mpsc::channel();
         let h_path = archive_path.to_path_buf();
         let s_path = archive_path.to_path_buf();
 
         if header_compressor_code == 3 {
-            // Columnar: read columnar blobs, decompress to headers, re-encode as varint stream
             scope.spawn(move || stream_decompressor_columnar(&h_path, h_offset, headers_len, h_tx));
         } else {
             scope.spawn(move || stream_decompressor(&h_path, h_offset, headers_len, h_tx));
@@ -538,7 +671,7 @@ fn stream_records_to_writer(
         scope.spawn(move || stream_decompressor(&s_path, s_offset, sequences_len, s_tx));
 
         let q_rx = if has_quality {
-            let (q_tx, q_rx) = std::sync::mpsc::sync_channel(2);
+            let (q_tx, q_rx) = std::sync::mpsc::channel();
             let q_path = archive_path.to_path_buf();
             scope.spawn(move || stream_decompressor(&q_path, q_offset, qualities_len, q_tx));
             Some(q_rx)
@@ -546,9 +679,8 @@ fn stream_records_to_writer(
             None
         };
 
-        // RC flags stream (encoding_type=6)
         let rc_rx = if has_rc_canon && rc_flags_len > 0 {
-            let (rc_tx, rc_rx) = std::sync::mpsc::sync_channel(2);
+            let (rc_tx, rc_rx) = std::sync::mpsc::channel();
             let rc_path = archive_path.to_path_buf();
             scope.spawn(move || stream_decompressor(&rc_path, rc_flags_offset, rc_flags_len, rc_tx));
             Some(rc_rx)
@@ -556,57 +688,38 @@ fn stream_records_to_writer(
             None
         };
 
-        let mut h_buf = ChannelStreamBuffer::new(h_rx);
-        let mut s_buf = ChannelStreamBuffer::new(s_rx);
-        let mut q_buf = q_rx.map(ChannelStreamBuffer::new);
-        let mut rc_buf = rc_rx.map(ChannelStreamBuffer::new);
+        // Drain all channels concurrently: s, q, rc drain in their own threads while
+        // we drain h on the current thread. All decompressor threads run in parallel.
+        let s_drain = scope.spawn(|| drain_channel(s_rx));
+        let q_drain = q_rx.map(|rx| scope.spawn(|| drain_channel(rx)));
+        let rc_drain = rc_rx.map(|rx| scope.spawn(|| drain_channel(rx)));
 
-        for i in 0..num_reads {
-            // Header: varint(len) + raw bytes
-            let h_len = h_buf.read_varint()?;
-            output.write_all(h_buf.read_bytes(h_len)?)?;
-            output.write_all(b"\n")?;
+        let h_data = drain_channel(h_rx)?;
+        let s_data = s_drain.join()
+            .map_err(|_| anyhow::anyhow!("sequence drain thread panicked"))??;
+        let q_data = q_drain
+            .map(|t| t.join().map_err(|_| anyhow::anyhow!("quality drain thread panicked"))?)
+            .transpose()?;
+        let rc_data = rc_drain
+            .map(|t| t.join().map_err(|_| anyhow::anyhow!("rc-flags drain thread panicked"))?)
+            .transpose()?;
 
-            // Sequence: [varint(len)] [+ hint byte] + raw bytes
-            let s_len = if const_seq_len > 0 { const_seq_len } else { s_buf.read_varint()? };
-            if has_sequence_hints {
-                s_buf.read_bytes(1)?; // skip hint byte
-            }
-            let seq_bytes = s_buf.read_bytes(s_len)?;
+        info!("Decompressed {} streams, reconstructing {} records in parallel...",
+            2 + q_data.is_some() as usize + rc_data.is_some() as usize, num_reads);
 
-            // If RC-canonicalized, check flag and reverse-complement if needed
-            if let Some(ref mut rc) = rc_buf {
-                let flag = rc.read_bytes(1)?[0];
-                if flag != 0 {
-                    let revcomp = dna_utils::reverse_complement(seq_bytes);
-                    output.write_all(&revcomp)?;
-                } else {
-                    output.write_all(seq_bytes)?;
-                }
-            } else {
-                output.write_all(seq_bytes)?;
-            }
-            output.write_all(b"\n+\n")?;
-
-            // Quality: [varint(orig_len)] + packed bytes
-            if let Some(ref mut q) = q_buf {
-                let q_len = if const_qual_len > 0 { const_qual_len } else { q.read_varint()? };
-                let packed_len = q_len.checked_mul(bits_per_qual)
-                    .and_then(|n| n.checked_add(7))
-                    .map(|n| n / 8)
-                    .ok_or_else(|| anyhow::anyhow!("Quality length overflow: q_len={} bits_per_qual={}", q_len, bits_per_qual))?;
-                let packed = q.read_bytes(packed_len)?;
-                columnar::unpack_qualities_to_writer(packed, q_len, quality_binning, output)?;
-            }
-            output.write_all(b"\n")?;
-
-            if (i + 1) % 10_000_000 == 0 {
-                info!("  {} million records written...", (i + 1) / 1_000_000);
-            }
-        }
-
-        output.flush()?;
-        Ok(())
+        reconstruct_records_parallel(
+            output,
+            num_reads,
+            &h_data,
+            &s_data,
+            q_data.as_deref(),
+            rc_data.as_deref(),
+            const_seq_len,
+            const_qual_len,
+            has_sequence_hints,
+            bits_per_qual,
+            quality_binning,
+        )
     })
 }
 

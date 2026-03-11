@@ -31,6 +31,10 @@
 - **Dead experimental encodings** — Encoding types 1 (delta), 2 (RLE), 3 (de Bruijn), 5 (paired-end), 7 (factorized), and 8 (local-reorder-delta) removed. Only types 0, 4, 6, 8, 9 remain.
 - **Experimental bench-only config fields** — `CompressConfig` no longer carries fields that were only used by benchmark binaries (e.g., `sequence_delta`, `sort_chunks`, `local_reorder`). These moved to benchmark-local config.
 
+### Performance
+
+- **2.5x faster decompression (10M reads: 33s → 13s on 72 cores)** — Three serial bottlenecks in the in-memory decompression path were parallelized: (1) columnar header block decomposition now processes all 4 chunks via rayon::par_iter instead of sequentially; (2) the 6 BSC column arrays within each header chunk now decompress in parallel; (3) constant-length sequence parsing uses rayon::par_iter instead of a serial memcpy loop. The dominant bottleneck was the 10M serial `format!` calls reconstructing SRA/Illumina read IDs, which took 24s and now takes ~4.5s.
+
 ### Changed
 
 - **`CompressConfig` simplified** — Production-only fields remain in `cli.rs`; experimental flags live in `AdvancedConfig` or benchmark code.

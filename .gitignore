@@ -44,3 +44,6 @@ scripts/bz_optimizer/__pycache__/fitness.cpython-312.pyc
 scripts/bz_optimizer/__pycache__/config.cpython-312.pyc
 scripts/bz_optimizer/__pycache__/checkpoint.cpython-312.pyc
 scripts/bz_optimizer/__pycache__/__init__.cpython-312.pyc
+perf.data.old
+perf.data
+flamegraph.svg
