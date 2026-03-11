@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::io::{Read, Write};
 
 pub const ARCHIVE_MAGIC: [u8; 2] = *b"BZ";
-pub const ARCHIVE_VERSION: u8 = 4;
+pub const ARCHIVE_VERSION: u8 = 5;
 
 /// Flags for the archive header.
 pub const FLAG_CONSENSUS_DELTA: u8 = 0x01;

@@ -249,17 +249,23 @@ impl ConsensusSegment {
 
 /// Consensus data for a chunk, potentially spanning multiple chromosomes.
 pub struct ChunkConsensus {
-    /// Segments keyed by ref_id, in order.
+    /// Segments ordered by (ref_id, start_pos). Multiple segments may share a ref_id
+    /// when reads on that chromosome are separated by a large gap.
     pub segments: Vec<ConsensusSegment>,
-    /// Fast lookup: ref_id -> index in segments.
-    index: HashMap<i32, usize>,
+    /// Fast lookup: ref_id -> sorted list of segment indices (by start_pos).
+    index: HashMap<i32, Vec<usize>>,
 }
 
 impl ChunkConsensus {
     /// Build consensus from a chunk of records.
+    ///
+    /// Reads on the same chromosome that are separated by more than GAP_THRESHOLD
+    /// reference bases get separate consensus segments, avoiding huge sparse arrays
+    /// for chromosomes with only a few scattered reads (e.g. supplementary alignments).
     pub fn build(records: &[RawBamRecord]) -> Self {
-        // Accumulate per-position base counts. Key: ref_id, Value: (start_pos, Vec<BaseCounts>).
-        let mut accum: HashMap<i32, (i32, Vec<BaseCounts>)> = HashMap::new();
+        // For each ref_id: an ordered list of (start_pos, Vec<BaseCounts>) sub-segments.
+        const GAP_THRESHOLD: i32 = 50_000;
+        let mut accum: HashMap<i32, Vec<(i32, Vec<BaseCounts>)>> = HashMap::new();
 
         for rec in records {
             let ref_id = rec.ref_id();
@@ -275,9 +281,23 @@ impl ChunkConsensus {
             let nibbles = rec.unpack_seq_nibbles();
             let cigar_ops = rec.cigar_ops();
 
-            let entry = accum.entry(ref_id).or_insert_with(|| (pos, Vec::new()));
+            let sub_segs = accum.entry(ref_id).or_default();
 
-            // Ensure the range covers this read's start
+            // Decide whether to extend the last sub-segment or start a new one.
+            // BAM is coordinate-sorted so pos >= all previous positions on this ref_id.
+            if sub_segs.is_empty() {
+                sub_segs.push((pos, Vec::new()));
+            } else {
+                let last = sub_segs.last().unwrap();
+                let last_end = last.0 + last.1.len() as i32;
+                if pos > last_end + GAP_THRESHOLD {
+                    sub_segs.push((pos, Vec::new()));
+                }
+            }
+
+            let entry = sub_segs.last_mut().unwrap();
+
+            // Handle rare case where this read starts before segment start.
             if pos < entry.0 {
                 let prepend = (entry.0 - pos) as usize;
                 let mut new_counts = vec![BaseCounts::new(); prepend];
@@ -296,7 +316,6 @@ impl ChunkConsensus {
                     CIGAR_M | CIGAR_EQ | CIGAR_X => {
                         for _ in 0..len {
                             let idx = (ref_pos - start) as usize;
-                            // Extend if needed
                             if idx >= entry.1.len() {
                                 entry.1.resize_with(idx + 1, BaseCounts::new);
                             }
@@ -324,21 +343,21 @@ impl ChunkConsensus {
             }
         }
 
-        // Convert counts to consensus bases
+        // Convert accumulated counts to ConsensusSegments.
         let mut segments: Vec<ConsensusSegment> = Vec::new();
+        let mut index: HashMap<i32, Vec<usize>> = HashMap::new();
         let mut sorted_refs: Vec<i32> = accum.keys().copied().collect();
         sorted_refs.sort();
 
-        let mut index = HashMap::new();
         for ref_id in sorted_refs {
-            let (start_pos, counts) = accum.remove(&ref_id).unwrap();
-            let bases: Vec<u8> = counts.iter().map(|c| c.consensus()).collect();
-            index.insert(ref_id, segments.len());
-            segments.push(ConsensusSegment {
-                ref_id,
-                start_pos,
-                bases,
-            });
+            let sub_segs = accum.remove(&ref_id).unwrap();
+            let mut seg_indices = Vec::with_capacity(sub_segs.len());
+            for (start_pos, counts) in sub_segs {
+                let bases: Vec<u8> = counts.iter().map(|c| c.consensus()).collect();
+                seg_indices.push(segments.len());
+                segments.push(ConsensusSegment { ref_id, start_pos, bases });
+            }
+            index.insert(ref_id, seg_indices);
         }
 
         Self { segments, index }
@@ -346,16 +365,28 @@ impl ChunkConsensus {
 
     /// Get consensus nibble at (ref_id, ref_pos). Returns 0 if not covered.
     pub fn get(&self, ref_id: i32, ref_pos: i32) -> u8 {
-        if let Some(&idx) = self.index.get(&ref_id) {
-            self.segments[idx].get(ref_pos)
-        } else {
-            0
-        }
+        self.get_segment_for_pos(ref_id, ref_pos)
+            .map_or(0, |seg| seg.get(ref_pos))
     }
 
-    /// Look up the consensus segment for a ref_id (one HashMap lookup per record).
-    pub fn get_segment(&self, ref_id: i32) -> Option<&ConsensusSegment> {
-        self.index.get(&ref_id).map(|&idx| &self.segments[idx])
+    /// Look up the consensus segment that covers (ref_id, pos).
+    /// Performs one HashMap lookup + binary search among segments for that ref_id.
+    /// Returns None if no segment covers pos (reads there XOR with 0 = no consensus help).
+    pub fn get_segment_for_pos(&self, ref_id: i32, pos: i32) -> Option<&ConsensusSegment> {
+        let indices = self.index.get(&ref_id)?;
+        // Segments for a ref_id are in ascending start_pos order (BAM is sorted).
+        // Find the last segment with start_pos <= pos.
+        let idx = indices.partition_point(|&i| self.segments[i].start_pos <= pos);
+        if idx == 0 {
+            return None;
+        }
+        let seg = &self.segments[indices[idx - 1]];
+        // Only return the segment if pos falls within its covered range.
+        if pos < seg.start_pos + seg.bases.len() as i32 {
+            Some(seg)
+        } else {
+            None
+        }
     }
 
     /// Serialize consensus data to bytes for archival (nibbles packed 2 per byte).
@@ -381,7 +412,7 @@ impl ChunkConsensus {
         offset += 4;
 
         let mut segments = Vec::with_capacity(num_segments.min(1024));
-        let mut index = HashMap::new();
+        let mut index: HashMap<i32, Vec<usize>> = HashMap::new();
 
         for i in 0..num_segments {
             if offset + 12 > data.len() {
@@ -402,7 +433,7 @@ impl ChunkConsensus {
             }
             let bases = unpack_nibble_pairs(&data[offset..offset + packed_len], num_bases);
             offset += packed_len;
-            index.insert(ref_id, i);
+            index.entry(ref_id).or_default().push(i);
             segments.push(ConsensusSegment {
                 ref_id,
                 start_pos,
@@ -587,6 +618,8 @@ pub fn records_to_streams(records: &[RawBamRecord]) -> StreamsResult {
             // Unmapped / no CIGAR: all bases go to extra
             extra_nibbles.extend_from_slice(&nibbles);
         } else {
+            // One segment lookup per record instead of one HashMap lookup per base.
+            let consensus_seg = consensus.get_segment_for_pos(ref_id, pos);
             let mut ref_pos = pos;
             let mut query_pos = 0usize;
 
@@ -596,7 +629,7 @@ pub fn records_to_streams(records: &[RawBamRecord]) -> StreamsResult {
                     // M/=/X: XOR with consensus
                     for _ in 0..len {
                         if query_pos < nibbles.len() {
-                            let cons_base = consensus.get(ref_id, ref_pos);
+                            let cons_base = consensus_seg.map_or(0, |seg| seg.get(ref_pos));
                             diff_nibbles.push(nibbles[query_pos] ^ cons_base);
                         }
                         ref_pos += 1;
@@ -678,8 +711,8 @@ pub fn reconstruct_sequence_nibbles(
         let mut extra_pos = 0usize;
         let mut ref_pos = pos;
 
-        // Cache segment lookup: 1 HashMap lookup per record instead of per base
-        let segment = consensus.get_segment(ref_id);
+        // One segment lookup per record instead of per base.
+        let segment = consensus.get_segment_for_pos(ref_id, pos);
 
         for (op, len) in cigar_ops {
             let len = len as usize;

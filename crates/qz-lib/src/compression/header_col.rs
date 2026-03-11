@@ -29,15 +29,25 @@ enum HeaderFormat {
     Casava,
 }
 
-/// Parsed header fields
-struct ParsedFields {
-    read_num: u32,     // only used for SRA format
-    combo_idx: u8,
+/// Parsed SRA header fields (borrows from original header — zero allocation)
+struct SraRow<'h> {
+    combo: &'h str,
+    read_num: u32,
     lane: u8,
     tile: u16,
     x: u16,
     y: u16,
-    umi: Option<String>, // DRAGEN BCL Convert: optional 8th field in name
+}
+
+/// Parsed Casava header fields (borrows from original header — zero allocation)
+struct CasavaRow<'h> {
+    combo: &'h str,
+    lane: u8,
+    tile: u16,
+    x: u16,
+    y: u16,
+    umi: Option<&'h str>,
+    comment: &'h str,
 }
 
 /// Compress headers using columnar encoding + BSC.
@@ -111,15 +121,39 @@ fn detect_format(header: &str) -> Option<HeaderFormat> {
 // SRA format: @PREFIX.READ_NUM COMBO:LANE:TILE:X:Y[/PAIR]
 // ========================================================================
 
+fn parse_sra_row(header: &str) -> Option<SraRow<'_>> {
+    let without_at = header.strip_prefix('@').unwrap_or(header);
+    let (name_part, comment_part) = without_at.split_once(' ')?;
+    let read_num: u32 = name_part.rsplit('.').next()?.parse().ok()?;
+    let comment_base = comment_part.split('/').next().unwrap_or(comment_part);
+    let fields: Vec<&str> = comment_base.split(':').collect();
+    if fields.len() < 7 {
+        return None;
+    }
+    // Zero-copy combo slice: fields[0]:fields[1]:fields[2] (no allocation)
+    let combo_len = fields[0].len() + 1 + fields[1].len() + 1 + fields[2].len();
+    let combo = &comment_base[..combo_len];
+    Some(SraRow {
+        combo,
+        read_num,
+        lane: fields[3].parse().ok()?,
+        tile: fields[4].parse().ok()?,
+        x: fields[5].parse().ok()?,
+        y: fields[6].parse().ok()?,
+    })
+}
+
 fn compress_sra(headers: &[&str]) -> Result<Vec<u8>> {
-    let mut combos: Vec<String> = Vec::new();
-    let mut combo_map: HashMap<String, u8> = HashMap::new();
-
-    // Detect template strings from first header
     let (name_prefix, pair_suffix) = detect_sra_template(headers[0]);
-
-    // Parse all headers
     let n = headers.len();
+
+    // Phase 1 (parallel): parse all headers into Row structs.
+    // combo is a zero-copy &str slice into the original header — no allocation per read.
+    let rows: Vec<Option<SraRow<'_>>> = headers.par_iter().map(|h| parse_sra_row(h)).collect();
+
+    // Phase 2 (sequential): build combo dict via HashMap (no string parsing, just equality checks).
+    let mut combos: Vec<&str> = Vec::new();
+    let mut combo_map: HashMap<&str, u8> = HashMap::new();
     let mut read_nums = Vec::with_capacity(n * 4);
     let mut combo_idxs = Vec::with_capacity(n);
     let mut lanes = Vec::with_capacity(n);
@@ -127,24 +161,46 @@ fn compress_sra(headers: &[&str]) -> Result<Vec<u8>> {
     let mut xs = Vec::with_capacity(n * 2);
     let mut ys = Vec::with_capacity(n * 2);
 
-    for &h in headers {
-        match parse_sra(h, &mut combos, &mut combo_map) {
-            Some(f) => {
-                read_nums.extend_from_slice(&f.read_num.to_le_bytes());
-                combo_idxs.push(f.combo_idx);
-                lanes.push(f.lane);
-                tiles.extend_from_slice(&f.tile.to_le_bytes());
-                xs.extend_from_slice(&f.x.to_le_bytes());
-                ys.extend_from_slice(&f.y.to_le_bytes());
-            }
+    for row_opt in &rows {
+        let row = match row_opt {
+            Some(r) => r,
             None => return compress_raw_fallback(headers),
-        }
+        };
+        let idx = if let Some(&i) = combo_map.get(row.combo) {
+            i
+        } else {
+            if combos.len() >= 255 {
+                return compress_raw_fallback(headers);
+            }
+            let i = combos.len() as u8;
+            combos.push(row.combo);
+            combo_map.insert(row.combo, i);
+            i
+        };
+        read_nums.extend_from_slice(&row.read_num.to_le_bytes());
+        combo_idxs.push(idx);
+        lanes.push(row.lane);
+        tiles.extend_from_slice(&row.tile.to_le_bytes());
+        xs.extend_from_slice(&row.x.to_le_bytes());
+        ys.extend_from_slice(&row.y.to_le_bytes());
     }
 
-    if combos.len() > 255 {
-        return compress_raw_fallback(headers);
-    }
+    let combos_owned: Vec<String> = combos.iter().map(|s| s.to_string()).collect();
+    compress_sra_columns(&name_prefix, &pair_suffix, combos_owned, combo_idxs, read_nums, lanes, tiles, xs, ys, n)
+}
 
+fn compress_sra_columns(
+    name_prefix: &str,
+    pair_suffix: &str,
+    combos: Vec<String>,
+    combo_idxs: Vec<u8>,
+    read_nums: Vec<u8>,
+    lanes: Vec<u8>,
+    tiles: Vec<u8>,
+    xs: Vec<u8>,
+    ys: Vec<u8>,
+    n: usize,
+) -> Result<Vec<u8>> {
     // BSC-compress all 6 columns in parallel using rayon
     let (c_rn, (c_ci, (c_ln, (c_ti, (c_xs, c_ys))))) = rayon::join(
         || bsc::compress_parallel_adaptive(&read_nums),
@@ -169,19 +225,15 @@ fn compress_sra(headers: &[&str]) -> Result<Vec<u8>> {
     let c_xs = c_xs?;
     let c_ys = c_ys?;
 
-    // Build output
     let mut out = Vec::new();
     out.push(0x01); // version = SRA columnar
-
-    write_string(&mut out, &name_prefix);
-    write_string(&mut out, &pair_suffix);
+    write_string(&mut out, name_prefix);
+    write_string(&mut out, pair_suffix);
     write_combo_dict(&mut out, &combos);
     out.extend_from_slice(&(n as u32).to_le_bytes());
-
     for col in [&c_rn, &c_ci, &c_ln, &c_ti, &c_xs, &c_ys] as [&Vec<u8>; 6] {
         write_blob(&mut out, col);
     }
-
     Ok(out)
 }
 
@@ -233,36 +285,6 @@ fn decompress_sra(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
     headers
 }
 
-fn parse_sra(
-    header: &str,
-    combos: &mut Vec<String>,
-    combo_map: &mut HashMap<String, u8>,
-) -> Option<ParsedFields> {
-    let without_at = header.strip_prefix('@').unwrap_or(header);
-    let (name_part, comment_part) = without_at.split_once(' ')?;
-
-    let read_num: u32 = name_part.rsplit('.').next()?.parse().ok()?;
-
-    let comment_base = comment_part.split('/').next().unwrap_or(comment_part);
-    let fields: Vec<&str> = comment_base.split(':').collect();
-    if fields.len() < 7 {
-        return None;
-    }
-
-    let combo_key = format!("{}:{}:{}", fields[0], fields[1], fields[2]);
-    let combo_idx = get_or_insert_combo(combo_key, combos, combo_map)?;
-
-    Some(ParsedFields {
-        read_num,
-        combo_idx,
-        lane: fields[3].parse().ok()?,
-        tile: fields[4].parse().ok()?,
-        x: fields[5].parse().ok()?,
-        y: fields[6].parse().ok()?,
-        umi: None, // SRA format doesn't have UMI in comment
-    })
-}
-
 fn detect_sra_template(header: &str) -> (String, String) {
     let without_at = header.strip_prefix('@').unwrap_or(header);
     let name_part = without_at.split(' ').next().unwrap_or(without_at);
@@ -287,56 +309,99 @@ fn detect_sra_template(header: &str) -> (String, String) {
 // Casava 1.8 format: @INSTRUMENT:RUN:FLOWCELL:LANE:TILE:X:Y COMMENT
 // ========================================================================
 
-fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
-    let mut combos: Vec<String> = Vec::new();
-    let mut combo_map: HashMap<String, u8> = HashMap::new();
-
-    // Detect common comment (if all reads share same comment)
-    let first_comment = extract_casava_comment(headers[0]);
-    let common_comment = if headers.iter().all(|h| extract_casava_comment(h) == first_comment) {
-        Some(first_comment.to_string())
+fn parse_casava_row(header: &str) -> Option<CasavaRow<'_>> {
+    let without_at = header.strip_prefix('@').unwrap_or(header);
+    let (name_part, comment) = without_at.split_once(' ')?;
+    let fields: Vec<&str> = name_part.split(':').collect();
+    if fields.len() < 7 {
+        return None;
+    }
+    // Zero-copy combo slice: fields[0]:fields[1]:fields[2] (no allocation)
+    let combo_len = fields[0].len() + 1 + fields[1].len() + 1 + fields[2].len();
+    let combo = &name_part[..combo_len];
+    let lane: u8 = fields[3].parse().ok()?;
+    let tile: u16 = fields[4].parse().ok()?;
+    let x: u16 = fields[5].parse().ok()?;
+    let y: u16 = fields[6].parse().ok()?;
+    // UMI: everything after field[6] (may be multi-part with ':')
+    let umi = if fields.len() >= 8 {
+        let no_umi_len = combo_len
+            + 1 + fields[3].len()
+            + 1 + fields[4].len()
+            + 1 + fields[5].len()
+            + 1 + fields[6].len();
+        Some(&name_part[no_umi_len + 1..])
     } else {
         None
     };
+    Some(CasavaRow { combo, lane, tile, x, y, umi, comment })
+}
 
-    // Parse all headers
+fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
     let n = headers.len();
+
+    // Phase 1 (parallel): parse all headers into Row structs.
+    // combo, umi, and comment are zero-copy &str slices into the original headers.
+    let rows: Vec<Option<CasavaRow<'_>>> = headers.par_iter().map(|h| parse_casava_row(h)).collect();
+
+    // Phase 2 (sequential): build combo dict, detect common comment, fill columns.
+    let first_comment = rows[0].as_ref().map_or("", |r| r.comment);
+    let mut all_same_comment = true;
+    let mut has_umi = false;
+    let mut combos: Vec<&str> = Vec::new();
+    let mut combo_map: HashMap<&str, u8> = HashMap::new();
     let mut combo_idxs = Vec::with_capacity(n);
     let mut lanes = Vec::with_capacity(n);
     let mut tiles = Vec::with_capacity(n * 2);
     let mut xs = Vec::with_capacity(n * 2);
     let mut ys = Vec::with_capacity(n * 2);
-    let mut comments: Vec<u8> = Vec::new();
-    let mut umis: Vec<u8> = Vec::new();
-    let mut has_umi = false;
 
-    for &h in headers {
-        match parse_casava(h, &mut combos, &mut combo_map) {
-            Some(f) => {
-                combo_idxs.push(f.combo_idx);
-                lanes.push(f.lane);
-                tiles.extend_from_slice(&f.tile.to_le_bytes());
-                xs.extend_from_slice(&f.x.to_le_bytes());
-                ys.extend_from_slice(&f.y.to_le_bytes());
-
-                if common_comment.is_none() {
-                    let comment = extract_casava_comment(h);
-                    write_varint(&mut comments, comment.len());
-                    comments.extend_from_slice(comment.as_bytes());
-                }
-
-                if let Some(ref umi) = f.umi {
-                    has_umi = true;
-                    write_varint(&mut umis, umi.len());
-                    umis.extend_from_slice(umi.as_bytes());
-                }
-            }
+    for row_opt in &rows {
+        let row = match row_opt {
+            Some(r) => r,
             None => return compress_raw_fallback(headers),
+        };
+        if row.comment != first_comment {
+            all_same_comment = false;
         }
+        if row.umi.is_some() {
+            has_umi = true;
+        }
+        let idx = if let Some(&i) = combo_map.get(row.combo) {
+            i
+        } else {
+            if combos.len() >= 255 {
+                return compress_raw_fallback(headers);
+            }
+            let i = combos.len() as u8;
+            combos.push(row.combo);
+            combo_map.insert(row.combo, i);
+            i
+        };
+        combo_idxs.push(idx);
+        lanes.push(row.lane);
+        tiles.extend_from_slice(&row.tile.to_le_bytes());
+        xs.extend_from_slice(&row.x.to_le_bytes());
+        ys.extend_from_slice(&row.y.to_le_bytes());
     }
 
-    if combos.len() > 255 {
-        return compress_raw_fallback(headers);
+    // Build per-read comment and UMI byte columns using already-parsed slices.
+    let mut comments: Vec<u8> = Vec::new();
+    let mut umis: Vec<u8> = Vec::new();
+    if !all_same_comment {
+        for row_opt in &rows {
+            let row = row_opt.as_ref().unwrap();
+            write_varint(&mut comments, row.comment.len());
+            comments.extend_from_slice(row.comment.as_bytes());
+        }
+    }
+    if has_umi {
+        for row_opt in &rows {
+            let row = row_opt.as_ref().unwrap();
+            let umi = row.umi.unwrap_or("");
+            write_varint(&mut umis, umi.len());
+            umis.extend_from_slice(umi.as_bytes());
+        }
     }
 
     // BSC-compress all 5 spatial columns in parallel
@@ -362,18 +427,15 @@ fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
     // Build output
     let mut out = Vec::new();
     out.push(0x02); // version = Casava columnar
-
-    write_combo_dict(&mut out, &combos);
+    let combos_owned: Vec<String> = combos.iter().map(|s| s.to_string()).collect();
+    write_combo_dict(&mut out, &combos_owned);
 
     // Common comment flag + data
-    match &common_comment {
-        Some(cc) => {
-            out.push(0x01); // has common comment
-            write_string(&mut out, cc);
-        }
-        None => {
-            out.push(0x00); // per-read comments
-        }
+    if all_same_comment {
+        out.push(0x01);
+        write_string(&mut out, first_comment);
+    } else {
+        out.push(0x00);
     }
 
     // UMI flag
@@ -387,7 +449,7 @@ fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
     }
 
     // Comment column (only if not common)
-    if common_comment.is_none() {
+    if !all_same_comment {
         let c_comments = bsc::compress_parallel_adaptive(&comments)?;
         write_blob(&mut out, &c_comments);
     }
@@ -513,66 +575,9 @@ fn decompress_casava(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
     headers
 }
 
-fn parse_casava(
-    header: &str,
-    combos: &mut Vec<String>,
-    combo_map: &mut HashMap<String, u8>,
-) -> Option<ParsedFields> {
-    let without_at = header.strip_prefix('@').unwrap_or(header);
-    let name_part = without_at.split(' ').next()?;
-
-    let fields: Vec<&str> = name_part.split(':').collect();
-    if fields.len() < 7 {
-        return None;
-    }
-
-    let combo_key = format!("{}:{}:{}", fields[0], fields[1], fields[2]);
-    let combo_idx = get_or_insert_combo(combo_key, combos, combo_map)?;
-
-    // DRAGEN BCL Convert adds UMI as 8th field
-    let umi = if fields.len() >= 8 {
-        Some(fields[7..].join(":"))
-    } else {
-        None
-    };
-
-    Some(ParsedFields {
-        read_num: 0,
-        combo_idx,
-        lane: fields[3].parse().ok()?,
-        tile: fields[4].parse().ok()?,
-        x: fields[5].parse().ok()?,
-        y: fields[6].parse().ok()?,
-        umi,
-    })
-}
-
-fn extract_casava_comment(header: &str) -> &str {
-    let without_at = header.strip_prefix('@').unwrap_or(header);
-    without_at.split_once(' ').map_or("", |(_, c)| c)
-}
-
 // ========================================================================
 // Shared helpers
 // ========================================================================
-
-fn get_or_insert_combo(
-    key: String,
-    combos: &mut Vec<String>,
-    combo_map: &mut HashMap<String, u8>,
-) -> Option<u8> {
-    if let Some(&idx) = combo_map.get(&key) {
-        Some(idx)
-    } else {
-        if combos.len() >= 255 {
-            return None;
-        }
-        let idx = combos.len() as u8;
-        combos.push(key.clone());
-        combo_map.insert(key, idx);
-        Some(idx)
-    }
-}
 
 fn write_string(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(&(s.len() as u16).to_le_bytes());
