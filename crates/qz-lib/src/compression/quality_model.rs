@@ -116,19 +116,24 @@ pub fn decode_with_model(deltas: &[i8], model: &QualityModel) -> Vec<u8> {
 }
 
 /// Serialize quality model to bytes
-pub fn serialize_model(model: &QualityModel) -> Vec<u8> {
+pub fn serialize_model(model: &QualityModel) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::new();
 
+    let read_length_u16 = u16::try_from(model.read_length)
+        .map_err(|_| anyhow::anyhow!("quality model read_length {} exceeds u16::MAX — reads too long for quality modeling", model.read_length))?;
+    let medians_len_u16 = u16::try_from(model.positional_medians.len())
+        .map_err(|_| anyhow::anyhow!("quality model positional_medians length {} exceeds u16::MAX", model.positional_medians.len()))?;
+
     // Write read length (2 bytes)
-    bytes.extend_from_slice(&(model.read_length as u16).to_le_bytes());
+    bytes.extend_from_slice(&read_length_u16.to_le_bytes());
 
     // Write model length (2 bytes, should match read_length but stored separately)
-    bytes.extend_from_slice(&(model.positional_medians.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&medians_len_u16.to_le_bytes());
 
     // Write median quality values (1 byte each)
     bytes.extend_from_slice(&model.positional_medians);
 
-    bytes
+    Ok(bytes)
 }
 
 /// Deserialize quality model from bytes
@@ -209,7 +214,7 @@ mod tests {
             read_length: 7,
         };
 
-        let bytes = serialize_model(&model);
+        let bytes = serialize_model(&model).unwrap();
         let restored = deserialize_model(&bytes).unwrap();
 
         assert_eq!(model.read_length, restored.read_length);

@@ -7,6 +7,140 @@ use crate::cli::{CompressConfig, QualityCompressor, QualityMode};
 use super::*;
 use super::codecs;
 
+// ---------------------------------------------------------------------------
+// Per-chunk compression helpers
+// ---------------------------------------------------------------------------
+
+/// All compression parameters that a chunk worker thread needs.
+/// Every field is Copy/Clone so this can be freely moved into spawned threads.
+#[derive(Clone, Copy)]
+struct ChunkParams {
+    use_columnar_headers: bool,
+    bsc_static: bool,
+    bsc_block_mb: usize,
+    quality_mode: QualityMode,
+    stream_quality_binning: QualityBinning,
+    skip_quality_in_stream: bool,
+    sequence_hints: bool,
+    sequence_delta: bool,
+    rc_canon: bool,
+    global_const_seq_len: usize,
+    global_const_qual_len: usize,
+    use_fqzcomp: bool,
+    use_quality_ctx: bool,
+    no_quality: bool,
+    quality_ctx_block_size: usize,
+}
+
+/// Compressed output from a single chunk.
+struct ChunkCompressResult {
+    h_blocks: Vec<Vec<u8>>,
+    s_blocks: Vec<Vec<u8>>,
+    q_blocks: Vec<Vec<u8>>,
+    rc_blocks: Vec<Vec<u8>>,
+}
+
+/// Compress one chunk of records.  Runs entirely on the calling thread (or a
+/// spawned thread) and uses the global rayon pool for block-level parallelism.
+fn compress_one_chunk(
+    records: Vec<crate::io::FastqRecord>,
+    p: &ChunkParams,
+    chunk_idx: usize,
+) -> Result<ChunkCompressResult> {
+    let chunk_t0 = Instant::now();
+
+    // Build the three byte streams from records (serial, ~75–200 ms per 2.5 M reads)
+    let (h_data, s_data, q_data, rc_data) = records_to_streams(
+        &records, p.quality_mode, p.stream_quality_binning, p.skip_quality_in_stream,
+        p.sequence_hints, p.sequence_delta, p.rc_canon,
+        p.global_const_seq_len, p.global_const_qual_len,
+    )?;
+
+    // Parallel compress: headers ‖ (sequences ‖ qualities)
+    let (h_result, (s_result, q_result)) = rayon::join(
+        || -> Result<Vec<Vec<u8>>> {
+            let t = Instant::now();
+            let r = if p.use_columnar_headers {
+                let header_strs: Vec<String> = records.iter()
+                    .map(|r| String::from_utf8_lossy(&r.id).into_owned())
+                    .collect();
+                let header_refs: Vec<&str> = header_strs.iter().map(|s| s.as_str()).collect();
+                let blob = header_col::compress_headers_columnar(&header_refs)?;
+                let mut prefixed = Vec::with_capacity(4 + blob.len());
+                prefixed.extend_from_slice(&(header_refs.len() as u32).to_le_bytes());
+                prefixed.extend_from_slice(&blob);
+                info!("  [chunk {}] Columnar headers: {:.2}s", chunk_idx, t.elapsed().as_secs_f64());
+                Ok(vec![prefixed])
+            } else {
+                let r = compress_stream_to_bsc_blocks(&h_data, p.bsc_static, p.bsc_block_mb);
+                info!("  [chunk {}] BSC headers: {:.2}s", chunk_idx, t.elapsed().as_secs_f64());
+                r
+            };
+            r
+        },
+        || rayon::join(
+            || -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+                let t = Instant::now();
+                let s_blocks = compress_stream_to_bsc_blocks(&s_data, p.bsc_static, p.bsc_block_mb)?;
+                info!("  [chunk {}] BSC sequences: {:.2}s", chunk_idx, t.elapsed().as_secs_f64());
+                let rc_blocks = if rc_data.is_empty() {
+                    Vec::new()
+                } else {
+                    compress_stream_to_bsc_blocks(&rc_data, p.bsc_static, p.bsc_block_mb)?
+                };
+                Ok((s_blocks, rc_blocks))
+            },
+            || -> Result<Vec<Vec<u8>>> {
+                let qt = Instant::now();
+                let qr = if p.no_quality || (q_data.is_empty() && !p.use_fqzcomp && !p.use_quality_ctx) {
+                    Ok(Vec::new())
+                } else if p.use_fqzcomp {
+                    let q_blob = codecs::compress_qualities_fqzcomp(&records)?;
+                    Ok(vec![q_blob])
+                } else if p.use_quality_ctx {
+                    use rayon::prelude::*;
+                    let qual_refs: Vec<&[u8]> = records.iter()
+                        .map(|r| r.quality.as_deref().unwrap_or(&[]))
+                        .collect();
+                    let seq_refs: Vec<&[u8]> = records.iter()
+                        .map(|r| r.sequence.as_slice())
+                        .collect();
+                    let n = qual_refs.len();
+                    let sub = p.quality_ctx_block_size;
+                    if n <= sub {
+                        let blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
+                        Ok(vec![blob])
+                    } else {
+                        let num_sub = (n + sub - 1) / sub;
+                        let blobs: Vec<Vec<u8>> = (0..num_sub)
+                            .into_par_iter()
+                            .map(|i| {
+                                let start = i * sub;
+                                let end = (start + sub).min(n);
+                                quality_ctx::compress_qualities_ctx(
+                                    &qual_refs[start..end], &seq_refs[start..end],
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(blobs)
+                    }
+                } else {
+                    compress_stream_to_bsc_blocks(&q_data, p.bsc_static, p.bsc_block_mb)
+                };
+                info!("  [chunk {}] Quality: {:.2}s", chunk_idx, qt.elapsed().as_secs_f64());
+                qr
+            },
+        ),
+    );
+
+    let h_blocks = h_result?;
+    let (s_blocks, rc_blocks) = s_result?;
+    let q_blocks = q_result?;
+
+    info!("  [chunk {}] Total compress: {:.2}s", chunk_idx, chunk_t0.elapsed().as_secs_f64());
+    Ok(ChunkCompressResult { h_blocks, s_blocks, q_blocks, rc_blocks })
+}
+
 /// Unified chunked compression pipeline.
 ///
 /// Replaces the former compress_chunked_bsc, compress_chunked_bsc_reorder_local,
@@ -142,141 +276,58 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
     let mut original_size: usize = 0;
     let mut chunk_idx: usize = 0;
 
-    while !cur_records.is_empty() {
-        let cur_reads = cur_records.len();
+    // Build the per-chunk params bundle (all Copy, safe to move into spawned threads)
+    let params = ChunkParams {
+        use_columnar_headers: args.advanced.header_compressor == HeaderCompressor::Columnar,
+        bsc_static,
+        bsc_block_mb,
+        quality_mode,
+        stream_quality_binning,
+        skip_quality_in_stream,
+        sequence_hints,
+        sequence_delta,
+        rc_canon,
+        global_const_seq_len,
+        global_const_qual_len,
+        use_fqzcomp,
+        use_quality_ctx,
+        no_quality,
+        quality_ctx_block_size: args.advanced.quality_ctx_block_size,
+    };
 
-        // Optional sort
-        if sort_chunks {
+    if sort_chunks {
+        // ── SORT PATH ─────────────────────────────────────────────────────────
+        // Keep the original single-chunk pipeline: the sort step itself uses
+        // rayon internally, and concurrent sorts would fight over the pool.
+        while !cur_records.is_empty() {
+            let cur_reads = cur_records.len();
             info!("Chunk {}: {} reads, sorting...", chunk_idx, cur_reads);
             let sort_start = Instant::now();
             cur_records = sort_records_by_key(cur_records);
             info!("  Sorted in {:.2}s", sort_start.elapsed().as_secs_f64());
-        } else {
-            info!("Chunk {}: {} reads", chunk_idx, cur_reads);
-        }
 
-        // Pipeline: compress current chunk + read next chunk
-        let (next_result, compress_result) = std::thread::scope(|scope| {
-            let records = std::mem::take(&mut cur_records);
+            let (next_result, compress_result) = std::thread::scope(|scope| {
+                let records = std::mem::take(&mut cur_records);
+                let p = params;
+                let idx = chunk_idx;
+                let compress_handle = scope.spawn(move || compress_one_chunk(records, &p, idx));
 
-            let compress_handle = scope.spawn(move || -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>)> {
-                let chunk_t0 = Instant::now();
+                let io_t = Instant::now();
+                let next = read_chunk_records(&mut reader, chunk_size);
+                info!("  I/O read: {:.2}s", io_t.elapsed().as_secs_f64());
 
-                // Build streams from records
-                let (h_data, s_data, q_data, rc_data) = records_to_streams(
-                    &records, quality_mode, stream_quality_binning, skip_quality_in_stream,
-                    sequence_hints, sequence_delta, rc_canon,
-                    global_const_seq_len, global_const_qual_len,
-                )?;
-
-                // Parallel compress: headers ‖ (sequences ‖ quality)
-                let use_columnar_headers = args.advanced.header_compressor == HeaderCompressor::Columnar;
-                let (h_result, (s_result, q_result)) = rayon::join(
-                    || -> Result<Vec<Vec<u8>>> {
-                        let t = Instant::now();
-                        let r = if use_columnar_headers {
-                            // Columnar: compress headers from records directly
-                            let header_strs: Vec<String> = records.iter()
-                                .map(|r| String::from_utf8_lossy(&r.id).into_owned())
-                                .collect();
-                            let header_refs: Vec<&str> = header_strs.iter().map(|s| s.as_str()).collect();
-                            let blob = header_col::compress_headers_columnar(&header_refs)?;
-                            // Prepend num_reads so decompressor knows how many headers per block
-                            let mut prefixed = Vec::with_capacity(4 + blob.len());
-                            prefixed.extend_from_slice(&(header_refs.len() as u32).to_le_bytes());
-                            prefixed.extend_from_slice(&blob);
-                            info!("  Columnar headers: {:.2}s", t.elapsed().as_secs_f64());
-                            Ok(vec![prefixed])
-                        } else {
-                            let r = compress_stream_to_bsc_blocks(&h_data, bsc_static, bsc_block_mb);
-                            info!("  BSC headers: {:.2}s", t.elapsed().as_secs_f64());
-                            r
-                        };
-                        r
-                    },
-                    || rayon::join(
-                    || -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
-                        let t = Instant::now();
-                        let s_blocks = compress_stream_to_bsc_blocks(&s_data, bsc_static, bsc_block_mb)?;
-                        info!("  BSC sequences: {:.2}s", t.elapsed().as_secs_f64());
-                        let rc_blocks = if rc_data.is_empty() {
-                            Vec::new()
-                        } else {
-                            compress_stream_to_bsc_blocks(&rc_data, bsc_static, bsc_block_mb)?
-                        };
-                        Ok((s_blocks, rc_blocks))
-                    },
-                    || -> Result<Vec<Vec<u8>>> {
-                        let qt = Instant::now();
-                        let qr = if no_quality || (q_data.is_empty() && !use_fqzcomp && !use_quality_ctx) {
-                            Ok(Vec::new())
-                        } else if use_fqzcomp {
-                            let q_blob = codecs::compress_qualities_fqzcomp(&records)?;
-                            Ok(vec![q_blob])
-                        } else if use_quality_ctx {
-                            use rayon::prelude::*;
-                            let qual_refs: Vec<&[u8]> = records.iter()
-                                .map(|r| r.quality.as_deref().unwrap_or(&[]))
-                                .collect();
-                            let seq_refs: Vec<&[u8]> = records.iter()
-                                .map(|r| r.sequence.as_slice())
-                                .collect();
-                            let sub_block_reads: usize = args.advanced.quality_ctx_block_size;
-                            let n = qual_refs.len();
-                            if n <= sub_block_reads {
-                                let blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
-                                Ok(vec![blob])
-                            } else {
-                                let num_sub = (n + sub_block_reads - 1) / sub_block_reads;
-                                let blobs: Vec<Vec<u8>> = (0..num_sub)
-                                    .into_par_iter()
-                                    .map(|i| {
-                                        let start = i * sub_block_reads;
-                                        let end = (start + sub_block_reads).min(n);
-                                        quality_ctx::compress_qualities_ctx(
-                                            &qual_refs[start..end], &seq_refs[start..end],
-                                        )
-                                    })
-                                    .collect::<Result<Vec<_>>>()?;
-                                Ok(blobs)
-                            }
-                        } else {
-                            compress_stream_to_bsc_blocks(&q_data, bsc_static, bsc_block_mb)
-                        };
-                        info!("  Quality: {:.2}s", qt.elapsed().as_secs_f64());
-                        qr
-                    },
-                    ),
-                );
-
-                let h_blocks = h_result?;
-                let (s_blocks, rc_blocks) = s_result?;
-                let q_blocks = q_result?;
-
-                info!("  Chunk compress total: {:.2}s", chunk_t0.elapsed().as_secs_f64());
-                Ok((h_blocks, s_blocks, q_blocks, rc_blocks))
+                let compressed = match compress_handle.join() {
+                    Ok(v) => v,
+                    Err(e) => std::panic::resume_unwind(e),
+                };
+                (next, compressed)
             });
 
-            // Read next chunk on main thread (overlaps with compression)
-            let io_t = Instant::now();
-            let next = read_chunk_records(&mut reader, chunk_size);
-            info!("  I/O read: {:.2}s", io_t.elapsed().as_secs_f64());
-
-            let compressed = match compress_handle.join() {
-                Ok(v) => v,
-                Err(e) => std::panic::resume_unwind(e),
-            };
-            (next, compressed)
-        });
-
-        let (h_blk, s_blk, q_blk, rc_blk) = compress_result?;
-
-        // Accumulate blocks
-        if sort_chunks {
-            h_num_blocks += write_blocks_to_tmp(h_blk, h_tmp.as_mut().unwrap())?;
-            s_num_blocks += write_blocks_to_tmp(s_blk, s_tmp.as_mut().unwrap())?;
+            let result = compress_result?;
+            h_num_blocks += write_blocks_to_tmp(result.h_blocks, h_tmp.as_mut().unwrap())?;
+            s_num_blocks += write_blocks_to_tmp(result.s_blocks, s_tmp.as_mut().unwrap())?;
             if use_fqzcomp {
-                for q_blob in q_blk {
+                for q_blob in result.q_blocks {
                     if !q_blob.is_empty() {
                         let qt = q_tmp.as_mut().unwrap();
                         qt.write_all(&(q_blob.len() as u32).to_le_bytes())?;
@@ -285,38 +336,116 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
                     }
                 }
             } else {
-                q_num_blocks += write_blocks_to_tmp(q_blk, q_tmp.as_mut().unwrap())?;
+                q_num_blocks += write_blocks_to_tmp(result.q_blocks, q_tmp.as_mut().unwrap())?;
             }
             if let Some(ref mut rc_file) = rc_tmp {
-                rc_num_blocks += write_blocks_to_tmp(rc_blk, rc_file)?;
+                rc_num_blocks += write_blocks_to_tmp(result.rc_blocks, rc_file)?;
             }
-        } else {
-            all_h_blocks.extend(h_blk);
-            all_s_blocks.extend(s_blk);
-            all_q_blocks.extend(q_blk);
-            if rc_canon { all_rc_blocks.extend(rc_blk); }
+
+            num_reads += cur_reads;
+            total_bases += cur_bases;
+            original_size += cur_orig;
+            chunk_idx += 1;
+
+            let (nr, nb, no) = next_result?;
+            cur_records = nr;
+            cur_bases = nb;
+            cur_orig = no;
+        }
+    } else {
+        // ── NON-SORT PATH: sliding-window parallel chunk pipeline ──────────────
+        //
+        // Keep `pipeline_window` chunks compressing simultaneously via separate
+        // OS threads sharing the global rayon pool.  With 2.5 M reads × 150 bp:
+        //   window=1 → ~35 BSC tasks on 72 cores = 49 % utilisation
+        //   window=2 → ~70 BSC tasks on 72 cores = 97 % utilisation → ~1.9× speedup
+        //
+        // Results are collected in FIFO order, so archive byte order is preserved.
+        let pipeline_window = args.advanced.compress_window.max(1);
+        if pipeline_window > 1 {
+            info!("Parallel chunk pipeline: window={} chunks compressing simultaneously", pipeline_window);
         }
 
-        num_reads += cur_reads;
-        total_bases += cur_bases;
-        original_size += cur_orig;
+        // Each entry: (JoinHandle, reads_in_chunk, bases_in_chunk, orig_bytes)
+        type Handle = std::thread::JoinHandle<Result<ChunkCompressResult>>;
+        let mut pending: std::collections::VecDeque<(Handle, usize, usize, usize)> =
+            std::collections::VecDeque::new();
+
+        // Spawn one compression thread and push into pending.
+        // Takes ownership of cur_records, leaving it empty.
+        let spawn_cur = |cur_records: &mut Vec<_>,
+                              cur_bases: usize,
+                              cur_orig: usize,
+                              chunk_idx: usize,
+                              pending: &mut std::collections::VecDeque<(Handle, usize, usize, usize)>| {
+            let reads = cur_records.len();
+            info!("Chunk {}: {} reads (dispatched)", chunk_idx, reads);
+            let records = std::mem::take(cur_records);
+            let p = params;
+            let handle: Handle = std::thread::spawn(move || compress_one_chunk(records, &p, chunk_idx));
+            pending.push_back((handle, reads, cur_bases, cur_orig));
+        };
+
+        // ── Prime the pipeline ──
+        // Dispatch the first chunk immediately, then read + dispatch up to
+        // (pipeline_window - 1) more before entering the steady-state loop.
+        spawn_cur(&mut cur_records, cur_bases, cur_orig, chunk_idx, &mut pending);
         chunk_idx += 1;
 
-        let (nr, nb, no) = next_result?;
-        cur_records = nr;
-        cur_bases = nb;
-        cur_orig = no;
+        for _ in 1..pipeline_window {
+            let (nr, nb, no) = read_chunk_records(&mut reader, chunk_size)?;
+            cur_records = nr;
+            cur_bases = nb;
+            cur_orig = no;
+            if cur_records.is_empty() { break; }
+            spawn_cur(&mut cur_records, cur_bases, cur_orig, chunk_idx, &mut pending);
+            chunk_idx += 1;
+        }
 
-        // Validate constant-length consistency across chunks
-        if !cur_records.is_empty() && !sort_chunks {
-            let (chunk_const_seq, chunk_const_qual) = detect_const_lengths(&cur_records, no_quality);
-            if global_const_seq_len > 0 && chunk_const_seq != global_const_seq_len {
-                anyhow::bail!("Constant sequence length mismatch: chunk 0 had {} but chunk {} has {} (or variable). \
-                    This shouldn't happen with well-formed Illumina data.", global_const_seq_len, chunk_idx, chunk_const_seq);
-            }
-            if global_const_qual_len > 0 && chunk_const_qual != global_const_qual_len {
-                anyhow::bail!("Constant quality length mismatch: chunk 0 had {} but chunk {} has {} (or variable). \
-                    This shouldn't happen with well-formed Illumina data.", global_const_qual_len, chunk_idx, chunk_const_qual);
+        // ── Steady-state: drain head, read next, dispatch next ──
+        while let Some((handle, reads, bases, orig)) = pending.pop_front() {
+            // Read the next chunk on the main thread.  This I/O overlaps with
+            // all remaining compression threads in `pending`.
+            let io_t = Instant::now();
+            let (nr, nb, no) = read_chunk_records(&mut reader, chunk_size)?;
+            info!("  I/O read: {:.2}s", io_t.elapsed().as_secs_f64());
+
+            // Block until the oldest chunk finishes.
+            let result = match handle.join() {
+                Ok(v) => v?,
+                Err(e) => std::panic::resume_unwind(e),
+            };
+
+            // Accumulate
+            all_h_blocks.extend(result.h_blocks);
+            all_s_blocks.extend(result.s_blocks);
+            all_q_blocks.extend(result.q_blocks);
+            if rc_canon { all_rc_blocks.extend(result.rc_blocks); }
+            num_reads += reads;
+            total_bases += bases;
+            original_size += orig;
+
+            // Validate const-length consistency and dispatch next chunk
+            cur_records = nr;
+            cur_bases = nb;
+            cur_orig = no;
+            if !cur_records.is_empty() {
+                let (chunk_const_seq, chunk_const_qual) =
+                    detect_const_lengths(&cur_records, no_quality);
+                if global_const_seq_len > 0 && chunk_const_seq != global_const_seq_len {
+                    anyhow::bail!(
+                        "Constant sequence length mismatch: chunk 0 had {} but chunk {} has {} (or variable).",
+                        global_const_seq_len, chunk_idx, chunk_const_seq
+                    );
+                }
+                if global_const_qual_len > 0 && chunk_const_qual != global_const_qual_len {
+                    anyhow::bail!(
+                        "Constant quality length mismatch: chunk 0 had {} but chunk {} has {} (or variable).",
+                        global_const_qual_len, chunk_idx, chunk_const_qual
+                    );
+                }
+                spawn_cur(&mut cur_records, cur_bases, cur_orig, chunk_idx, &mut pending);
+                chunk_idx += 1;
             }
         }
     }
@@ -1012,8 +1141,10 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
     // Quality modeling flag and model
     if let Some((_, ref model)) = quality_model_opt {
         hdr.push(1); // modeling enabled
-        let model_bytes = quality_model::serialize_model(model);
-        hdr.extend_from_slice(&(model_bytes.len() as u16).to_le_bytes());
+        let model_bytes = quality_model::serialize_model(model)?;
+        let model_len_u16 = u16::try_from(model_bytes.len())
+            .map_err(|_| anyhow::anyhow!("serialized quality model too large ({} bytes)", model_bytes.len()))?;
+        hdr.extend_from_slice(&model_len_u16.to_le_bytes());
         hdr.extend_from_slice(&model_bytes);
     } else {
         hdr.push(0); // modeling disabled

@@ -102,6 +102,11 @@ pub struct AdvancedOptions {
     pub bsc_block_size_mb: usize,
     /// Records per chunk for chunked compression (default 2_500_000)
     pub chunk_records: usize,
+    /// Number of chunks to compress simultaneously (default 2).
+    /// Each concurrent chunk submits its BSC blocks to the shared rayon pool,
+    /// keeping more threads busy. window=2 raises utilisation from ~49% to ~97%
+    /// on 72 cores (35 blocks/chunk × 2 = 70 concurrent tasks).
+    pub compress_window: usize,
 }
 
 impl Default for AdvancedOptions {
@@ -127,6 +132,7 @@ impl Default for AdvancedOptions {
             quality_ctx_block_size: 500_000,
             bsc_block_size_mb: 25,
             chunk_records: 2_500_000,
+            compress_window: 4,
         }
     }
 }

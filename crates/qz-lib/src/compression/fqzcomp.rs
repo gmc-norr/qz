@@ -55,6 +55,9 @@ pub fn compress(qualities: &[&[u8]], strat: i32) -> Result<Vec<u8>> {
         lengths.push(q.len() as u32);
     }
 
+    if qualities.len() > libc::c_int::MAX as usize {
+        anyhow::bail!("fqz_compress: too many reads ({})", qualities.len());
+    }
     let slice = FqzSlice {
         num_records: qualities.len() as libc::c_int,
         len: lengths.as_ptr(),
@@ -102,6 +105,9 @@ pub fn decompress(compressed: &[u8], num_reads: usize) -> Result<(Vec<u8>, Vec<i
     }
 
     let mut out_size: libc::size_t = 0;
+    if num_reads > libc::c_int::MAX as usize {
+        anyhow::bail!("fqz_decompress: too many reads ({})", num_reads);
+    }
     let mut lengths: Vec<libc::c_int> = vec![0; num_reads];
 
     let decompressed_ptr = unsafe {

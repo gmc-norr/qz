@@ -454,13 +454,13 @@ fn decompress_casava(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
                 let cd = comment_data.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("missing comment data for header {i}"))?;
                 let len = read_varint_from_slice(cd, &mut comment_offset)?;
-                if comment_offset + len > cd.len() {
-                    anyhow::bail!("header_col: truncated comment data for header {i}");
-                }
-                let s = std::str::from_utf8(&cd[comment_offset..comment_offset + len])
+                let comment_end = comment_offset.checked_add(len)
+                    .filter(|&e| e <= cd.len())
+                    .ok_or_else(|| anyhow::anyhow!("header_col: truncated comment data for header {i}"))?;
+                let s = std::str::from_utf8(&cd[comment_offset..comment_end])
                     .context("invalid comment UTF-8")?
                     .to_string();
-                comment_offset += len;
+                comment_offset = comment_end;
                 s
             }
         };
@@ -469,12 +469,12 @@ fn decompress_casava(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
             let ud = umi_data.as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing UMI data for header {i}"))?;
             let umi_len = read_varint_from_slice(ud, &mut umi_offset)?;
-            if umi_offset + umi_len > ud.len() {
-                anyhow::bail!("header_col: truncated UMI data for header {i}");
-            }
-            let umi = std::str::from_utf8(&ud[umi_offset..umi_offset + umi_len])
+            let umi_end = umi_offset.checked_add(umi_len)
+                .filter(|&e| e <= ud.len())
+                .ok_or_else(|| anyhow::anyhow!("header_col: truncated UMI data for header {i}"))?;
+            let umi = std::str::from_utf8(&ud[umi_offset..umi_end])
                 .context("invalid UMI UTF-8")?;
-            umi_offset += umi_len;
+            umi_offset = umi_end;
             format!("@{}:{}:{}:{}:{}:{} {}", combo, lane, tile, x, y, umi, comment)
         } else {
             format!("@{}:{}:{}:{}:{} {}", combo, lane, tile, x, y, comment)
@@ -675,13 +675,13 @@ fn decompress_raw_fallback(data: &[u8], num_reads: usize) -> Result<Vec<String>>
 
     for i in 0..num_reads {
         let len = read_varint_from_slice(&decompressed, &mut offset)?;
-        if offset + len > decompressed.len() {
-            anyhow::bail!("header_col: truncated header data for read {i}");
-        }
-        let header = std::str::from_utf8(&decompressed[offset..offset + len])
+        let end = offset.checked_add(len)
+            .filter(|&e| e <= decompressed.len())
+            .ok_or_else(|| anyhow::anyhow!("header_col: truncated header data for read {i}"))?;
+        let header = std::str::from_utf8(&decompressed[offset..end])
             .context("invalid header UTF-8")?
             .to_string();
-        offset += len;
+        offset = end;
         headers.push(header);
     }
 

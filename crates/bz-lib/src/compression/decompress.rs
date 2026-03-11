@@ -163,14 +163,18 @@ fn decompress_chunk_quality_ctx<W: Write>(
 
         let diff_count = streams::read_varint(&decompressed[11], &mut seq_diff_off)?;
         let diff_start = seq_diff_off;
-        let diff_packed_len = (diff_count + 1) / 2;
+        let diff_packed_len = diff_count.checked_add(1)
+            .map(|n| n / 2)
+            .ok_or_else(|| anyhow::anyhow!("diff_count overflow at record {rec_i}: {diff_count}"))?;
         seq_diff_off = seq_diff_off.checked_add(diff_packed_len)
             .filter(|&e| e <= decompressed[11].len())
             .ok_or_else(|| anyhow::anyhow!("seq_diff overflow at record {rec_i}"))?;
 
         let extra_count = streams::read_varint(&decompressed[12], &mut seq_extra_off)?;
         let extra_start = seq_extra_off;
-        let extra_packed_len = (extra_count + 1) / 2;
+        let extra_packed_len = extra_count.checked_add(1)
+            .map(|n| n / 2)
+            .ok_or_else(|| anyhow::anyhow!("extra_count overflow at record {rec_i}: {extra_count}"))?;
         seq_extra_off = seq_extra_off.checked_add(extra_packed_len)
             .filter(|&e| e <= decompressed[12].len())
             .ok_or_else(|| anyhow::anyhow!("seq_extra overflow at record {rec_i}"))?;
@@ -181,7 +185,8 @@ fn decompress_chunk_quality_ctx<W: Write>(
             .filter(|&e| e <= decompressed[14].len())
             .ok_or_else(|| anyhow::anyhow!("aux stream overflow at record {rec_i}"))?;
 
-        let l_seq = diff_count + extra_count;
+        let l_seq = diff_count.checked_add(extra_count)
+            .ok_or_else(|| anyhow::anyhow!("l_seq overflow at record {rec_i}: diff={diff_count} extra={extra_count}"))?;
 
         records.push(RecordInfo {
             ref_id, pos, mapq, bin_val, flag, next_ref_id, next_pos, tlen,
@@ -232,6 +237,16 @@ fn decompress_chunk_quality_ctx<W: Write>(
         data_buf.clear();
         data_buf.reserve(record_len);
 
+        // BAM format limits: QNAME ≤ 254 bytes, n_cigar_op fits in u16, l_seq fits in i32
+        if read_name.len() > 254 {
+            anyhow::bail!("record {rec_idx}: read name too long ({} bytes, BAM max 254)", read_name.len());
+        }
+        if rec.n_cigar_op > u16::MAX as usize {
+            anyhow::bail!("record {rec_idx}: n_cigar_op {} exceeds BAM u16 limit", rec.n_cigar_op);
+        }
+        if rec.l_seq > i32::MAX as usize {
+            anyhow::bail!("record {rec_idx}: l_seq {} exceeds BAM i32 limit", rec.l_seq);
+        }
         data_buf.extend_from_slice(&rec.ref_id.to_le_bytes());
         data_buf.extend_from_slice(&rec.pos.to_le_bytes());
         data_buf.push(read_name.len() as u8);

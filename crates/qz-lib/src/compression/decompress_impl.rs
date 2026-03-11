@@ -591,7 +591,10 @@ fn stream_records_to_writer(
             // Quality: [varint(orig_len)] + packed bytes
             if let Some(ref mut q) = q_buf {
                 let q_len = if const_qual_len > 0 { const_qual_len } else { q.read_varint()? };
-                let packed_len = (q_len * bits_per_qual + 7) / 8;
+                let packed_len = q_len.checked_mul(bits_per_qual)
+                    .and_then(|n| n.checked_add(7))
+                    .map(|n| n / 8)
+                    .ok_or_else(|| anyhow::anyhow!("Quality length overflow: q_len={} bits_per_qual={}", q_len, bits_per_qual))?;
                 let packed = q.read_bytes(packed_len)?;
                 columnar::unpack_qualities_to_writer(packed, q_len, quality_binning, output)?;
             }
@@ -945,7 +948,10 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
                                 .ok_or_else(|| anyhow::anyhow!("Failed to read quality length at read {}", i))?
                         };
                         let bits_per_qual = quality_binning.bits_per_quality();
-                        let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
+                        let q_encoded_len = q_len.checked_mul(bits_per_qual)
+                            .and_then(|n| n.checked_add(7))
+                            .map(|n| n / 8)
+                            .ok_or_else(|| anyhow::anyhow!("Quality length overflow at read {}: q_len={}", i, q_len))?;
                         if qual_offset + q_encoded_len <= qualities_data.len() {
                             let quality_str = columnar::unpack_qualities(
                                 &qualities_data[qual_offset..qual_offset + q_encoded_len],
@@ -1016,13 +1022,17 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
                             for _ in 0..num_reads {
                                 let seq_len = read_varint(&sequences_data, &mut seq_offset)
                                     .ok_or_else(|| anyhow::anyhow!("Failed to read sequence length"))?;
-                                let seq_2bit_len = (seq_len + 3) / 4;
+                                let seq_2bit_len = seq_len.checked_add(3)
+                                    .map(|n| n / 4)
+                                    .ok_or_else(|| anyhow::anyhow!("Sequence length overflow: seq_len={}", seq_len))?;
                                 if seq_offset + seq_2bit_len > sequences_data.len() {
                                     anyhow::bail!("Truncated sequence data");
                                 }
                                 let sequence_2bit = &sequences_data[seq_offset..seq_offset + seq_2bit_len];
                                 seq_offset += seq_2bit_len;
-                                let nmask_len = (seq_len + 7) / 8;
+                                let nmask_len = seq_len.checked_add(7)
+                                    .map(|n| n / 8)
+                                    .ok_or_else(|| anyhow::anyhow!("Sequence length overflow in nmask: seq_len={}", seq_len))?;
                                 let n_mask = if nmask_offset + nmask_len <= nmasks_data.len() {
                                     let mask = &nmasks_data[nmask_offset..nmask_offset + nmask_len];
                                     nmask_offset += nmask_len;
@@ -1124,7 +1134,10 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
                     let data_len = if quality_compressor == QualityCompressor::Fqzcomp || quality_model_opt.is_some() {
                         q_len
                     } else {
-                        (q_len * bits_per_qual + 7) / 8
+                        q_len.checked_mul(bits_per_qual)
+                            .and_then(|n| n.checked_add(7))
+                            .map(|n| n / 8)
+                            .ok_or_else(|| anyhow::anyhow!("Quality length overflow at read {}: q_len={}", rec_i, q_len))?
                     };
                     if qual_offset + data_len > qualities_data.len() {
                         anyhow::bail!(
@@ -1144,7 +1157,7 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
                         let deltas = quality_model::unpack_deltas(&qualities_data[data_off..data_off + q_len]);
                         quality_model::decode_with_model(&deltas, model)
                     } else {
-                        let q_encoded_len = (q_len * bits_per_qual + 7) / 8;
+                        let q_encoded_len = (q_len * bits_per_qual + 7) / 8; // already validated above
                         columnar::unpack_qualities(&qualities_data[data_off..data_off + q_encoded_len], q_len, quality_binning)
                     }
                 }).collect();

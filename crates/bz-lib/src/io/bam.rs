@@ -6,6 +6,10 @@ use std::num::NonZeroUsize;
 /// A raw BAM record stored as its uncompressed byte representation.
 /// Fields are extracted by slicing into `data` at BAM-specified offsets.
 ///
+/// **Invariant**: `data.len() >= 32` and all variable-length fields fit within
+/// `data`. This is enforced at construction via [`RawBamRecord::new`]; field
+/// accessors may therefore use direct indexing without re-checking bounds.
+///
 /// BAM record layout (all little-endian, excluding the 4-byte block_size prefix):
 ///   bytes 0..4:    refID (i32)
 ///   bytes 4..8:    pos (i32)
@@ -20,19 +24,27 @@ use std::num::NonZeroUsize;
 ///   bytes 28..32:  tlen (i32)
 ///   bytes 32..:    read_name, cigar, seq, qual, aux (variable)
 pub struct RawBamRecord {
-    pub data: Vec<u8>,
+    data: Vec<u8>,
 }
 
 impl RawBamRecord {
-    /// Validate that all computed offsets fit within the record data.
-    /// Must be called before using any variable-field accessors.
-    pub fn validate(&self) -> Result<()> {
+    /// Construct a validated record. Returns an error if `data` is structurally
+    /// invalid (too short, negative l_seq, or any field extends past the end).
+    pub fn new(data: Vec<u8>) -> Result<Self> {
+        let record = Self { data };
+        record.validate()?;
+        Ok(record)
+    }
+
+    /// Return the raw record bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    fn validate(&self) -> Result<()> {
         let len = self.data.len();
         if len < 32 {
-            anyhow::bail!(
-                "BAM record too short: {} bytes (minimum 32)",
-                len
-            );
+            anyhow::bail!("BAM record too short: {} bytes (minimum 32)", len);
         }
         let l_seq = self.l_seq();
         if l_seq < 0 {
@@ -320,9 +332,7 @@ impl<R: Read> RawBamReader<R> {
         let block_size = block_size_i32 as usize;
         let mut data = vec![0u8; block_size];
         self.reader.read_exact(&mut data)?;
-        let record = RawBamRecord { data };
-        record.validate()?;
-        Ok(Some(record))
+        Ok(Some(RawBamRecord::new(data)?))
     }
 
     /// Read up to `limit` records into a Vec.
