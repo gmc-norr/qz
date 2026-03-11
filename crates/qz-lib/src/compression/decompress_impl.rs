@@ -102,6 +102,12 @@ fn stream_decompressor_inner(
         for _ in 0..batch_size {
             file.read_exact(&mut buf4)?;
             let block_len = u32::from_le_bytes(buf4) as usize;
+            if block_len > 64 * 1024 * 1024 {
+                anyhow::bail!(
+                    "BSC block claims {} bytes (max 64 MB) — archive may be corrupt",
+                    block_len
+                );
+            }
             let mut data = vec![0u8; block_len];
             file.read_exact(&mut data)?;
             compressed_blocks.push(data);
@@ -169,6 +175,12 @@ fn stream_decompressor_columnar_inner(
         // Read block: [block_len: u32][data]
         file.read_exact(&mut buf4)?;
         let block_len = u32::from_le_bytes(buf4) as usize;
+        if block_len > 64 * 1024 * 1024 {
+            anyhow::bail!(
+                "Columnar header block claims {} bytes (max 64 MB) — archive may be corrupt",
+                block_len
+            );
+        }
         let mut data = vec![0u8; block_len];
         file.read_exact(&mut data)?;
 
@@ -942,7 +954,10 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
                             qual_offset += q_encoded_len;
                             qual_strings[i] = Some(quality_str);
                         } else {
-                            break;
+                            anyhow::bail!(
+                                "Truncated quality data at read {}: need {} bytes at offset {}, but only {} available",
+                                i, q_encoded_len, qual_offset, qualities_data.len() - qual_offset
+                            );
                         }
                     }
                 }
@@ -1073,7 +1088,10 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
                         read_varint(&qualities_data, &mut qual_offset).ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?
                     };
                     if qual_offset + q_len > qualities_data.len() {
-                        break;
+                        anyhow::bail!(
+                            "Truncated quality delta data: need {} bytes at offset {}, but only {} available",
+                            q_len, qual_offset, qualities_data.len() - qual_offset
+                        );
                     }
                     let deltas = quality_delta::unpack_deltas(&qualities_data[qual_offset..qual_offset + q_len]);
                     qual_offset += q_len;
@@ -1090,20 +1108,30 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
                 let bits_per_qual = quality_binning.bits_per_quality();
                 let mut qual_entries: Vec<(usize, usize)> = Vec::with_capacity(records.len());
                 let mut qual_offset = 0;
-                for _ in 0..records.len() {
-                    if qual_offset >= qualities_data.len() { break; }
+                for rec_i in 0..records.len() {
+                    if qual_offset >= qualities_data.len() {
+                        anyhow::bail!(
+                            "Truncated quality stream at read {}: offset {} >= data length {}",
+                            rec_i, qual_offset, qualities_data.len()
+                        );
+                    }
                     let q_len = if const_qual_len > 0 {
                         const_qual_len
                     } else {
                         read_varint(&qualities_data, &mut qual_offset)
-                            .ok_or_else(|| anyhow::anyhow!("Failed to read quality length"))?
+                            .ok_or_else(|| anyhow::anyhow!("Failed to read quality length at read {}", rec_i))?
                     };
                     let data_len = if quality_compressor == QualityCompressor::Fqzcomp || quality_model_opt.is_some() {
                         q_len
                     } else {
                         (q_len * bits_per_qual + 7) / 8
                     };
-                    if qual_offset + data_len > qualities_data.len() { break; }
+                    if qual_offset + data_len > qualities_data.len() {
+                        anyhow::bail!(
+                            "Truncated quality data at read {}: need {} bytes at offset {}, but only {} available",
+                            rec_i, data_len, qual_offset, qualities_data.len() - qual_offset
+                        );
+                    }
                     qual_entries.push((qual_offset, q_len));
                     qual_offset += data_len;
                 }

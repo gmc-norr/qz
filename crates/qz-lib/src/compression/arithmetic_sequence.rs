@@ -100,6 +100,8 @@ fn u32_to_u8(data: &[u32]) -> Vec<u8> {
 
 /// Convert Vec<u8> back to Vec<u32>
 fn u8_to_u32(data: &[u8]) -> Vec<u32> {
+    assert!(data.len() % 4 == 0,
+        "u8_to_u32: input length {} is not a multiple of 4", data.len());
     data.chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()

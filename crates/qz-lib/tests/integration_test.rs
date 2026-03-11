@@ -194,10 +194,18 @@ fn test_empty_file() {
         ..CompressConfig::default()
     };
 
-    // Should handle empty file gracefully (either error or create empty archive)
+    // Empty file should either compress successfully to an empty archive,
+    // or return a clear error — both are acceptable.
     let result = qz_lib::compression::compress(&compress_args);
-    if result.is_ok() {
-        assert!(archive_path.exists());
+    match result {
+        Ok(()) => {
+            assert!(archive_path.exists(), "Empty archive should exist after successful compress");
+        }
+        Err(e) => {
+            let msg = e.to_string().to_lowercase();
+            assert!(msg.contains("empty") || msg.contains("no reads") || msg.contains("0 reads"),
+                "Empty file error should mention emptiness, got: {}", msg);
+        }
     }
 }
 
@@ -319,7 +327,15 @@ fn test_illumina_binning_roundtrip() {
 
     assert!(output_fastq.exists());
     let content = fs::read_to_string(&output_fastq).unwrap();
-    assert!(content.contains("ACGTACGT"));
+    // Sequence must survive intact
+    assert!(content.contains("ACGTACGT"), "sequence missing from illumina-binned output");
+    // Header must survive
+    assert!(content.contains("@read1"), "header missing from illumina-binned output");
+    // Quality must be present (binned, not identical, but same length as sequence)
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 4, "expected 4 lines in output FASTQ");
+    assert_eq!(lines[1].len(), lines[3].len(),
+        "quality length ({}) must match sequence length ({})", lines[3].len(), lines[1].len());
 }
 
 #[test]
@@ -348,6 +364,15 @@ fn test_binary_quality_roundtrip() {
     qz_lib::compression::decompress(&decompress_args(archive_path, output_fastq.clone(), temp_path)).unwrap();
 
     assert!(output_fastq.exists());
+    let content = fs::read_to_string(&output_fastq).unwrap();
+    // Sequence and header must survive intact
+    assert!(content.contains("ACGTACGT"), "sequence missing from binary quality output");
+    assert!(content.contains("@read1"), "header missing from binary quality output");
+    // Quality must be present and same length as sequence
+    let lines: Vec<&str> = content.lines().collect();
+    assert_eq!(lines.len(), 4, "expected 4 lines in output FASTQ");
+    assert_eq!(lines[1].len(), lines[3].len(),
+        "quality length ({}) must match sequence length ({})", lines[3].len(), lines[1].len());
 }
 
 // ========================================

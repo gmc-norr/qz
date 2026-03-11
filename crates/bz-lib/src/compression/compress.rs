@@ -179,6 +179,11 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
         // Write chunk directly to output
         let mut stream_sizes = [0u32; NUM_STREAMS];
         for (i, cs) in compressed.iter().enumerate() {
+            if cs.len() > u32::MAX as usize {
+                anyhow::bail!(
+                    "Compressed stream {} exceeds 4GB ({} bytes)", i, cs.len()
+                );
+            }
             stream_sizes[i] = cs.len() as u32;
         }
         let chunk_header = ChunkHeader {

@@ -759,14 +759,13 @@ pub fn reconstruct_record(
 }
 
 /// Parse CIGAR bytes into (op, len) pairs.
+/// Callers must ensure `bytes.len() >= n_ops * 4`.
 pub fn parse_cigar_ops(bytes: &[u8], n_ops: usize) -> Vec<(u8, u32)> {
+    debug_assert!(bytes.len() >= n_ops * 4,
+        "parse_cigar_ops: bytes.len()={} < n_ops*4={}", bytes.len(), n_ops * 4);
     let mut ops = Vec::with_capacity(n_ops);
     for i in 0..n_ops {
         let start = i * 4;
-        // Safety: callers ensure bytes.len() >= n_ops * 4
-        if start + 4 > bytes.len() {
-            break;
-        }
         let val = u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap());
         ops.push(((val & 0xF) as u8, val >> 4));
     }
