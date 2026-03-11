@@ -74,6 +74,14 @@ pub struct AdvancedOptions {
 
     /// Compressor for aux tags stream: 0=bsc (default), 1=zstd.
     pub aux_compressor: u8,
+
+    /// Number of chunks to compress simultaneously (default 2).
+    /// Each concurrent chunk submits its BSC tasks to the shared rayon pool,
+    /// keeping more threads busy. window=2 raises utilisation from ~21% to ~42%
+    /// on 72 cores (15 streams/chunk × 2 = 30 concurrent tasks).
+    /// Peak memory scales linearly: each in-flight chunk holds ~500 MB of raw +
+    /// compressed data at chunk_size=2.5M, so window=4 uses ~2 GB peak.
+    pub compress_window: usize,
 }
 
 impl AdvancedOptions {
@@ -94,6 +102,9 @@ impl AdvancedOptions {
         if self.aux_compressor > 1 {
             bail!("aux_compressor must be 0 (bsc) or 1 (zstd)");
         }
+        if self.compress_window == 0 {
+            bail!("compress_window must be >= 1");
+        }
         Ok(())
     }
 }
@@ -108,6 +119,7 @@ impl Default for AdvancedOptions {
             quality_compressor: 0,
             alignment_compressor: 0,
             aux_compressor: 0,
+            compress_window: 2,
         }
     }
 }
