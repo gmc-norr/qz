@@ -143,13 +143,6 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
         opts.alignment_compressor, opts.aux_compressor, opts.compress_window,
     );
 
-    if config.threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(config.threads)
-            .build_global()
-            .ok(); // ignore if already initialized
-    }
-
     // Use multi-threaded BGZF reader for parallel inflate
     let bgzf_workers = std::thread::available_parallelism()
         .unwrap_or(NonZeroUsize::new(1).unwrap())

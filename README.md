@@ -750,8 +750,9 @@ When quality data contains unavailable scores (0xFF bytes), BZ falls back to BSC
 ### Parallelism
 
 - **BGZF I/O:** Multi-threaded BGZF reader (compression) and writer (decompression) via noodles, up to 4 worker threads for parallel inflate/deflate.
-- **BSC compression:** 14 non-quality streams compressed in 4 parallel groups via nested `rayon::join`. Each stream uses 25 MB parallel blocks.
-- **quality_ctx:** Runs in parallel with BSC via `rayon::join`. Quality data split into 500K-read blocks compressed via `rayon::par_iter`.
+- **Windowed chunk pipeline:** Up to `compress_window` chunks (default 2) compress simultaneously via `std::thread::spawn` + the shared rayon pool. Results are drained in FIFO order for deterministic output. Increasing the window improves rayon utilisation from ~21% (1 chunk) to ~42% (2 chunks) on 72 cores (15 streams/chunk × window = concurrent rayon tasks).
+- **BSC compression:** All 15 streams within a chunk are compressed concurrently using rayon. Each stream uses 25 MB parallel blocks (BWT + adaptive QLFC).
+- **quality_ctx:** Runs in parallel with BSC streams via rayon. Quality data split into 500K-read blocks compressed via `rayon::par_iter`.
 - **Decompression:** Parallel BSC decompression in groups, parallel sequence reconstruction across records, multi-threaded BGZF output.
 
 ### BZ file format
@@ -763,13 +764,13 @@ The BZ archive is a chunk-based binary format. All integers are little-endian. E
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │  Global Header                                                   │
-│    ├── Fixed fields (17 bytes)                                   │
+│    ├── Fixed fields (19 bytes)                                   │
 │    └── SAM header payload (variable, BSC-compressed)             │
 │  Chunk 0                                                         │
-│    ├── Chunk header (64 bytes)                                   │
+│    ├── Chunk header (69 bytes)                                   │
 │    └── 15 compressed streams                                     │
 │  Chunk 1                                                         │
-│    ├── Chunk header (64 bytes)                                   │
+│    ├── Chunk header (69 bytes)                                   │
 │    └── 15 compressed streams                                     │
 │  ...                                                             │
 └─────────────────────────────────────────────────────────────────┘
@@ -781,14 +782,15 @@ The BZ archive is a chunk-based binary format. All integers are little-endian. E
 Offset  Size  Type    Field                  Description
 ------  ----  ------  ---------------------  -----------
 0       2     u8[2]   magic                  "BZ" (0x42 0x5A)
-2       1     u8      version                2
+2       1     u8      version                4
 3       1     u8      reserved               0
 4       1     u8      flags                  Bit 0: consensus-delta encoding
-                                             Bit 1: quality_ctx compression
-5       8     u64     num_records            Total records across all chunks
-13      4     u32     num_chunks             Number of chunks
-17      4     u32     sam_header_len         Compressed SAM header size (bytes)
-21      N     bytes   sam_header_data        BSC-compressed payload:
+5       1     u8      alignment_compressor   Alignment stream compressor: 0=BSC, 1=zstd
+6       1     u8      aux_compressor         Aux tags stream compressor: 0=BSC, 1=zstd
+7       8     u64     num_records            Total records across all chunks
+15      4     u32     num_chunks             Number of chunks
+19      4     u32     sam_header_len         Compressed SAM header size (bytes)
+23      N     bytes   sam_header_data        BSC-compressed payload:
                                                [header_raw_len: u32]
                                                [header_raw: SAM header text]
                                                [ref_dict_bytes: BAM ref dict]
@@ -796,7 +798,7 @@ Offset  Size  Type    Field                  Description
 
 The SAM header payload contains both the raw SAM header text and the BAM reference dictionary (n_ref count + per-reference name/length entries), compressed together as a single BSC block.
 
-#### Chunk header (64 bytes)
+#### Chunk header (69 bytes)
 
 Each chunk begins with a fixed-size header:
 
@@ -804,7 +806,10 @@ Each chunk begins with a fixed-size header:
 Offset  Size  Type      Field            Description
 ------  ----  --------  ---------------  -----------
 0       4     u32       num_records      Records in this chunk
-4       60    u32[15]   stream_sizes     Compressed size of each stream (bytes)
+4       1     u8        chunk_flags      Per-chunk flags (bit 0: quality_ctx encoding used)
+5       4     u32       crc32            CRC32 (IEEE) over concatenated compressed stream payloads;
+                                         verified before BSC decompression
+9       60    u32[15]   stream_sizes     Compressed size of each stream (bytes)
 ```
 
 The 15 stream size entries correspond to streams 0–14. The compressed stream data follows immediately, concatenated in order.
@@ -829,7 +834,7 @@ The 15 stream size entries correspond to streams 0–14. The compressed stream d
 | 13 | qual | quality_ctx or BSC | Quality scores |
 | 14 | aux | Varint + bytes | Auxiliary tags |
 
-All streams except quality (index 13) are compressed with BSC (BWT + adaptive QLFC, 25 MB blocks). Quality uses `quality_ctx` context-adaptive range coding when `flags & 0x02` is set, otherwise BSC.
+All streams except quality (index 13) are compressed with BSC (BWT + adaptive QLFC, 25 MB blocks). Quality uses `quality_ctx` context-adaptive range coding when `chunk_flags & 0x01` is set, otherwise BSC.
 
 #### Consensus stream format (stream 0, after BSC decompression)
 
@@ -853,7 +858,7 @@ Per record:
 
 #### Quality stream format (stream 13)
 
-When using `quality_ctx` (`flags & 0x02`):
+When using `quality_ctx` (`chunk_flags & 0x01`):
 
 ```
 +0      4     u32     num_blocks       Number of quality_ctx sub-blocks
@@ -862,7 +867,7 @@ Per block:
   +4    N     bytes   block_data       quality_ctx compressed payload
 ```
 
-Each block contains up to 500K reads. When falling back to BSC (no `flags & 0x02`), the quality stream is a single BSC-compressed blob of varint-framed quality bytes.
+Each block contains up to 500K reads. When falling back to BSC (no `chunk_flags & 0x01`), the quality stream is a single BSC-compressed blob of varint-framed quality bytes.
 
 #### Fixed-width stream formats (streams 1–8, after BSC decompression)
 
@@ -894,6 +899,35 @@ bz compress -i aligned.bam -o aligned.bz -t 8    # limit to 8 threads
 bz decompress -i aligned.bz -o restored.bam
 ```
 
+### Verify
+
+Verify archive integrity without decompressing to disk. Reports archive metadata and a CRC32 fingerprint of the reconstructed record data. Exits with code 1 on failure.
+
+```bash
+bz verify -i aligned.bz
+```
+
+Example output:
+```
+Archive:     aligned.bz
+Status:      OK
+Records:     3245545
+Chunks:      2
+Alignment:   bsc
+Aux tags:    bsc
+CRC32:       a1b2c3d4
+Data size:   1187348992 bytes
+Verified in: 19.6s
+```
+
+### Extract
+
+Extract FASTQ from a coordinate-sorted BAM file and compress to QZ format. Reads are paired by name; secondary and supplementary alignments are skipped.
+
+```bash
+bz extract -i aligned.bam -o sample          # creates sample_R1.qz and sample_R2.qz
+```
+
 ### Verify roundtrip
 
 ```bash
@@ -905,6 +939,12 @@ diff <(samtools view input.bam) <(samtools view roundtrip.bam)
 
 ### CLI reference
 
+**Global flag (all subcommands):**
+
+| Flag | Description |
+|------|-------------|
+| `--debug` | Verbose logging, full backtraces, and system diagnostics on crash |
+
 **Compress:**
 
 | Flag | Description | Default |
@@ -913,6 +953,7 @@ diff <(samtools view input.bam) <(samtools view roundtrip.bam)
 | `-o, --output FILE` | Output BZ archive | required |
 | `-w, --working-dir PATH` | Working directory | `.` |
 | `-t, --threads N` | Thread count (0 = auto) | auto |
+| `--config FILE` | JSON file overriding advanced compression options | none |
 
 **Decompress:**
 
@@ -920,6 +961,22 @@ diff <(samtools view input.bam) <(samtools view roundtrip.bam)
 |------|-------------|---------|
 | `-i, --input FILE` | Input BZ archive | required |
 | `-o, --output FILE` | Output BAM file | required |
+| `-w, --working-dir PATH` | Working directory | `.` |
+| `-t, --threads N` | Thread count (0 = auto) | auto |
+
+**Verify:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i, --input FILE` | Input BZ archive | required |
+| `-t, --threads N` | Thread count (0 = auto) | auto |
+
+**Extract:**
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i, --input FILE` | Input BAM file | required |
+| `-o, --output PREFIX` | Output prefix (creates `{prefix}_R1.qz` / `{prefix}_R2.qz`) | required |
 | `-w, --working-dir PATH` | Working directory | `.` |
 | `-t, --threads N` | Thread count (0 = auto) | auto |
 

@@ -294,13 +294,6 @@ fn decompress_chunk_quality_ctx<W: Write>(
 pub fn decompress(config: &DecompressConfig) -> Result<()> {
     let start_time = Instant::now();
 
-    if config.threads > 0 {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(config.threads)
-            .build_global()
-            .ok();
-    }
-
     let file = std::fs::File::open(&config.input)?;
     let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
 

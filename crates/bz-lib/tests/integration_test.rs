@@ -313,7 +313,6 @@ fn roundtrip(
         input: input_bam.clone(),
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: bz_lib::AdvancedOptions::default(),
     })
     .unwrap();
@@ -325,7 +324,6 @@ fn roundtrip(
         input: archive_path,
         output: output_bam.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
     })
     .unwrap();
 
@@ -512,7 +510,6 @@ fn test_roundtrip_bsc_quality_compressor() {
         input: input_bam.clone(),
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: opts,
     })
     .unwrap();
@@ -521,7 +518,6 @@ fn test_roundtrip_bsc_quality_compressor() {
         input: archive_path,
         output: output_bam.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
     })
     .unwrap();
 
@@ -549,7 +545,6 @@ fn test_roundtrip_zstd_compressors() {
         input: input_bam.clone(),
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: opts,
     })
     .unwrap();
@@ -558,7 +553,6 @@ fn test_roundtrip_zstd_compressors() {
         input: archive_path,
         output: output_bam.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
     })
     .unwrap();
 
@@ -581,7 +575,6 @@ fn test_corrupt_archive_magic() {
         input: input_bam,
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: AdvancedOptions::default(),
     })
     .unwrap();
@@ -595,7 +588,6 @@ fn test_corrupt_archive_magic() {
         input: archive_path,
         output: output_bam,
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
     });
 
     assert!(result.is_err(), "Should fail on corrupt magic");
@@ -617,7 +609,6 @@ fn test_truncated_archive() {
         input: input_bam,
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: AdvancedOptions::default(),
     })
     .unwrap();
@@ -630,7 +621,6 @@ fn test_truncated_archive() {
         input: archive_path,
         output: output_bam,
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
     });
 
     assert!(result.is_err(), "Should fail on truncated archive");
@@ -678,14 +668,12 @@ fn test_verify_valid_archive() {
         input: input_bam,
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: AdvancedOptions::default(),
     })
     .unwrap();
 
     let result = bz_lib::verify(&VerifyConfig {
         input: archive_path,
-        threads: 1,
     })
     .unwrap();
 
@@ -709,20 +697,17 @@ fn test_verify_consistent_crc() {
         input: input_bam,
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: AdvancedOptions::default(),
     })
     .unwrap();
 
     let result1 = bz_lib::verify(&VerifyConfig {
         input: archive_path.clone(),
-        threads: 1,
     })
     .unwrap();
 
     let result2 = bz_lib::verify(&VerifyConfig {
         input: archive_path,
-        threads: 1,
     })
     .unwrap();
 
@@ -744,7 +729,6 @@ fn test_verify_corrupted_archive() {
         input: input_bam,
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: AdvancedOptions::default(),
     })
     .unwrap();
@@ -759,7 +743,6 @@ fn test_verify_corrupted_archive() {
 
     let result = bz_lib::verify(&VerifyConfig {
         input: archive_path,
-        threads: 1,
     });
 
     assert!(result.is_err(), "Verify should fail on corrupted archive");
@@ -778,7 +761,6 @@ fn test_verify_truncated_archive() {
         input: input_bam,
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: AdvancedOptions::default(),
     })
     .unwrap();
@@ -789,7 +771,6 @@ fn test_verify_truncated_archive() {
 
     let result = bz_lib::verify(&VerifyConfig {
         input: archive_path,
-        threads: 1,
     });
 
     assert!(result.is_err(), "Verify should fail on truncated archive");
@@ -808,14 +789,12 @@ fn test_verify_empty_archive() {
         input: input_bam,
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: AdvancedOptions::default(),
     })
     .unwrap();
 
     let result = bz_lib::verify(&VerifyConfig {
         input: archive_path,
-        threads: 1,
     })
     .unwrap();
 
@@ -839,14 +818,12 @@ fn test_verify_bsc_quality_compressor() {
         input: input_bam,
         output: archive_path.clone(),
         working_dir: temp_path.to_path_buf(),
-        threads: 1,
         advanced: opts,
     })
     .unwrap();
 
     let result = bz_lib::verify(&VerifyConfig {
         input: archive_path,
-        threads: 1,
     })
     .unwrap();
 

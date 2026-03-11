@@ -152,6 +152,22 @@ fn run(cli: Cli) -> Result<()> {
         eprintln!();
     }
 
+    // Initialise the rayon global thread pool once here, in the binary.
+    // Library code must not call build_global() — that mutates global state
+    // and silently fails when called more than once, which is wrong for a lib.
+    let threads: usize = match &cli.command {
+        Commands::Compress(a) => a.threads,
+        Commands::Decompress(a) => a.threads,
+        Commands::Extract(a) => a.threads,
+        Commands::Verify(a) => a.threads,
+    };
+    if threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .map_err(|e| anyhow::anyhow!("Failed to initialise thread pool: {e}"))?;
+    }
+
     match cli.command {
         Commands::Compress(args) => {
             info!("Starting compression...");
@@ -169,7 +185,6 @@ fn run(cli: Cli) -> Result<()> {
                 input: args.input,
                 output: args.output,
                 working_dir: args.working_dir,
-                threads: args.threads,
                 advanced,
             };
             bz_lib::compress(&config)?;
@@ -181,7 +196,6 @@ fn run(cli: Cli) -> Result<()> {
                 input: args.input,
                 output: args.output,
                 working_dir: args.working_dir,
-                threads: args.threads,
             };
             bz_lib::decompress(&config)?;
             info!("Decompression complete!");
@@ -192,7 +206,6 @@ fn run(cli: Cli) -> Result<()> {
                 input: args.input,
                 output_prefix: args.output,
                 working_dir: args.working_dir,
-                threads: args.threads,
             };
             bz_lib::extract(&config)?;
             info!("Extraction complete!");
@@ -200,7 +213,6 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Verify(args) => {
             let config = bz_lib::VerifyConfig {
                 input: args.input.clone(),
-                threads: args.threads,
             };
             match bz_lib::verify(&config) {
                 Ok(result) => {

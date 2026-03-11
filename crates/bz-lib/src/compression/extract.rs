@@ -89,20 +89,10 @@ fn write_fastq_record(w: &mut impl Write, header: &[u8], seq: &[u8], qual: &[u8]
 /// Reads are extracted from coordinate-sorted BAM, preserving genomic locality
 /// for better BSC compression. Secondary and supplementary alignments are skipped.
 pub fn extract(config: &ExtractConfig) -> Result<()> {
-    let threads = if config.threads == 0 {
-        qz_lib::cli::num_cpus()
-    } else {
-        config.threads
-    };
-
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()?;
-
-    pool.install(|| extract_inner(config, threads))
+    extract_inner(config)
 }
 
-fn extract_inner(config: &ExtractConfig, threads: usize) -> Result<()> {
+fn extract_inner(config: &ExtractConfig) -> Result<()> {
     let start = std::time::Instant::now();
 
     // Open BAM
@@ -276,9 +266,9 @@ fn extract_inner(config: &ExtractConfig, threads: usize) -> Result<()> {
         );
 
         info!("Compressing R1...");
-        compress_fastq_to_qz(&tmp_r1_path, &r1_output, &config.working_dir, threads)?;
+        compress_fastq_to_qz(&tmp_r1_path, &r1_output, &config.working_dir)?;
         info!("Compressing R2...");
-        compress_fastq_to_qz(&tmp_r2_path, &r2_output, &config.working_dir, threads)?;
+        compress_fastq_to_qz(&tmp_r2_path, &r2_output, &config.working_dir)?;
     }
 
     if single_count > 0 {
@@ -288,7 +278,7 @@ fn extract_inner(config: &ExtractConfig, threads: usize) -> Result<()> {
             "Compressing {} single-end reads to {}",
             single_count, output_path
         );
-        compress_fastq_to_qz(&tmp_se_path, &output_path, &config.working_dir, threads)?;
+        compress_fastq_to_qz(&tmp_se_path, &output_path, &config.working_dir)?;
     }
 
     if pairs_written == 0 && single_count == 0 {
@@ -306,13 +296,11 @@ fn compress_fastq_to_qz(
     input: &std::path::Path,
     output: &str,
     working_dir: &std::path::Path,
-    threads: usize,
 ) -> Result<()> {
     let config = qz_lib::cli::CompressConfig {
         input: vec![input.to_path_buf()],
         output: PathBuf::from(output),
         working_dir: working_dir.to_path_buf(),
-        threads,
         ..Default::default()
     };
     qz_lib::compression::compress(&config)?;
