@@ -1,7 +1,7 @@
 # QZ · BZ
 
 > **Pre-release software — validate before use in production workflows.**
-> We welcome bug reports, especially with compressed archives (`.qz` or `.bz` files) that produce incorrect or unexpected output, to help identify and fix any outstanding issues. Please open an issue on GitHub and attach the failing archive if possible.
+> We welcome bug reports, especially with compressed archives (`.qz` or `.bz` files) that produce incorrect or unexpected output, to help identify and fix any outstanding issues. Please open an issue on GitHub and include the failing archive if possible, along with the output from re-running the failing command with `--debug` (e.g. `qz decompress --debug -i archive.qz -o out.fastq`), which enables verbose logging, full backtraces, and system diagnostics.
 
 **QZ** compresses FASTQ files. **BZ** compresses coordinate-sorted BAM files. Both are lossless, read-order-preserving, and built on the same columnar-stream decomposition and BSC/BWT block-sorting foundation, sharing a context-adaptive quality range coder.
 
