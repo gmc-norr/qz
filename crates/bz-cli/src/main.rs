@@ -11,6 +11,10 @@ use tracing::info;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+
+    /// Enable debug mode: verbose logging, full backtraces, and system diagnostics on crash
+    #[arg(long, global = true)]
+    debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -86,22 +90,67 @@ struct VerifyArgs {
     threads: usize,
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+fn install_panic_hook(debug: bool) {
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = match info.payload().downcast_ref::<&str>() {
+            Some(s) => *s,
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => s.as_str(),
+                None => "(unknown panic payload)",
+            },
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "(unknown location)".to_string());
 
-    let cli = Cli::parse();
+        eprintln!();
+        eprintln!("BZ crashed with an internal error. This is a bug.");
+        eprintln!("  Panic: {msg}");
+        eprintln!("  At:    {location}");
+        if debug {
+            eprintln!();
+            eprintln!("--- System diagnostics ---");
+            print_system_info();
+        } else {
+            eprintln!();
+            eprintln!("Tip: re-run with --debug for system diagnostics and a full backtrace.");
+        }
+        eprintln!();
+        eprintln!("Please report this at: https://github.com/your-org/qz/issues");
+        eprintln!("Include the above information and the command you ran.");
+    }));
+}
 
+fn print_system_info() {
+    eprintln!("  Version:  bz {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("  OS:       {}", std::env::consts::OS);
+    eprintln!("  Arch:     {}", std::env::consts::ARCH);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    eprintln!("  CPUs:     {}", cpus);
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines().take(3) {
+            eprintln!("  {}", line);
+        }
+    }
+    let args: Vec<String> = std::env::args().collect();
+    eprintln!("  Command:  {}", args.join(" "));
+}
+
+fn run(cli: Cli) -> Result<()> {
     eprintln!(
         "BZ v{} - Columnar BAM compression with consensus-delta encoding",
         env!("CARGO_PKG_VERSION")
     );
     eprintln!();
+
+    if cli.debug {
+        eprintln!("--- Debug mode ---");
+        print_system_info();
+        eprintln!();
+    }
 
     match cli.command {
         Commands::Compress(args) => {
@@ -177,4 +226,43 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn main() {
+    let cli = Cli::parse();
+    let debug = cli.debug;
+
+    // Enable full backtraces when --debug is set (anyhow captures these at error creation)
+    if debug {
+        // SAFETY: only called at startup before any threads are spawned
+        unsafe { std::env::set_var("RUST_BACKTRACE", "full") };
+    }
+
+    let log_filter = if debug {
+        tracing_subscriber::EnvFilter::new("debug")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(log_filter)
+        .init();
+
+    install_panic_hook(debug);
+
+    if let Err(e) = run(cli) {
+        eprintln!();
+        eprintln!("Error: {:#}", e);
+        if debug {
+            eprintln!();
+            eprintln!("--- System diagnostics ---");
+            print_system_info();
+        } else {
+            eprintln!();
+            eprintln!("Tip: re-run with --debug for verbose logging and system diagnostics.");
+        }
+        std::process::exit(1);
+    }
 }
