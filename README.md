@@ -786,6 +786,11 @@ Streams 1–8 contain one value per record, concatenated with no framing:
 
 ### Compress
 
+> **Note:** BZ requires a coordinate-sorted BAM file. If your BAM is not already sorted, sort it first:
+> ```bash
+> samtools sort -o sorted.bam input.bam
+> ```
+
 ```bash
 bz compress -i aligned.bam -o aligned.bz
 bz compress -i aligned.bam -o aligned.bz -t 8    # limit to 8 threads

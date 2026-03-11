@@ -1,7 +1,7 @@
 use crate::cli::{AdvancedOptions, CompressConfig};
 use crate::compression::archive::{ArchiveHeader, ChunkHeader, CHUNK_FLAG_QUALITY_CTX, FLAG_CONSENSUS_DELTA};
 use crate::compression::streams::{self, BamStreams, ChunkQualityData, NUM_STREAMS};
-use crate::io::bam::{RawBamReader, RawBamRecord};
+use crate::io::bam::{RawBamReader, RawBamRecord, SortOrder};
 use anyhow::Result;
 use flate2::Crc;
 use qz_lib::compression::bsc;
@@ -148,6 +148,28 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
         .unwrap_or(NonZeroUsize::new(1).unwrap())
         .min(NonZeroUsize::new(4).unwrap());
     let mut reader = RawBamReader::from_path_mt(&config.input, bgzf_workers)?;
+
+    // Verify the BAM is coordinate-sorted — required for consensus-delta encoding.
+    match crate::io::bam::parse_sort_order(&reader.header_raw) {
+        SortOrder::Coordinate => {}
+        SortOrder::Other(so) => {
+            anyhow::bail!(
+                "BZ requires a coordinate-sorted BAM file, but this file declares SO:{}. \
+                 Sort it first with: samtools sort -o sorted.bam {}",
+                so,
+                config.input.display(),
+            );
+        }
+        SortOrder::Unknown => {
+            tracing::warn!(
+                "BAM file does not declare a sort order (no @HD SO: tag). \
+                 BZ requires coordinate-sorted input — compression may produce \
+                 incorrect results if the file is not sorted. \
+                 Sort with: samtools sort -o sorted.bam {}",
+                config.input.display(),
+            );
+        }
+    }
 
     // Compress SAM header + ref dict together
     let mut header_payload = Vec::new();

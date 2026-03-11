@@ -213,6 +213,42 @@ pub fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
     packed
 }
 
+/// Sort order as declared in the `@HD SO:` field of the SAM header.
+#[derive(Debug, PartialEq)]
+pub enum SortOrder {
+    Coordinate,
+    Other(String),
+    /// No `@HD` line or no `SO:` field present.
+    Unknown,
+}
+
+/// Parse the sort order from raw SAM header text bytes.
+///
+/// Returns `SortOrder::Coordinate` only when `SO:coordinate` is explicitly
+/// declared on the `@HD` line.  Returns `SortOrder::Other` for any other
+/// explicit value (e.g. `queryname`, `unsorted`), and `SortOrder::Unknown`
+/// when the header has no `@HD` line or no `SO:` tag.
+pub fn parse_sort_order(header_raw: &[u8]) -> SortOrder {
+    let text = std::str::from_utf8(header_raw).unwrap_or("");
+    for line in text.lines() {
+        if !line.starts_with("@HD") {
+            continue;
+        }
+        for field in line.split('\t').skip(1) {
+            if let Some(value) = field.strip_prefix("SO:") {
+                return if value == "coordinate" {
+                    SortOrder::Coordinate
+                } else {
+                    SortOrder::Other(value.to_string())
+                };
+            }
+        }
+        // @HD line found but no SO: tag
+        return SortOrder::Unknown;
+    }
+    SortOrder::Unknown
+}
+
 /// Reads raw BAM records from a BGZF-compressed BAM file.
 /// Generic over the BGZF reader type (single-threaded or multi-threaded).
 pub struct RawBamReader<R: Read> {
