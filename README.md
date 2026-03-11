@@ -1,4 +1,21 @@
-# QZ
+# QZ · BZ
+
+> **Pre-release software — validate before use in production workflows.**
+> We welcome bug reports, especially with compressed archives (`.qz` or `.bz` files) that produce incorrect or unexpected output, to help identify and fix any outstanding issues. Please open an issue on GitHub and attach the failing archive if possible.
+
+**QZ** compresses FASTQ files. **BZ** compresses coordinate-sorted BAM files. Both are lossless, read-order-preserving, and built on the same columnar-stream decomposition and BSC/BWT block-sorting foundation, sharing a context-adaptive quality range coder.
+
+| | QZ | BZ |
+|---|---|---|
+| Input | FASTQ / FASTA (file, gzipped, or stdin) | Coordinate-sorted BAM |
+| Output | `.qz` archive | `.bz` archive |
+| Compression | 8.17x vs raw FASTQ (150 bp WGS) | 1.79x vs BAM (250 bp WGS) |
+| Key technique | Columnar streams + BSC/BWT | Consensus-delta encoding + columnar streams |
+| Binary | `qz` | `bz` |
+
+---
+
+# QZ — FASTQ Compression
 
 Order-preserving FASTQ compression using columnar stream separation and block-sorting transforms.
 
@@ -16,30 +33,15 @@ All streams are split into blocks (25 MB for BSC, 500K reads for quality_ctx) an
 
 | Component | Specification |
 |-----------|--------------|
-| CPU | 72 cores, 128 GB RAM |
-| GPU | NVIDIA RTX 2080 Ti (11 GB VRAM) |
-
-### With CUDA GPU acceleration
-
-QZ built with `--features cuda`. GPU accelerates the BWT suffix array construction. Warns at startup if GPU VRAM is insufficient for the configured block size.
+| CPU | Intel Xeon Gold 6254 (2× 18 cores, 72 threads) |
+| RAM | 376 GB |
 
 | Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
 |------|-----------|-------|----------|----------|------------|---------|
-| **QZ default** | 427 | **8.17x** | 18.2 s | 4.3 GB | 31.6 s | 6.6 GB |
-| **QZ ultra 1** | 418 | **8.35x** | 19.9 s | 6.2 GB | 34.1 s | 6.9 GB |
-| **QZ ultra 3** | 408 | **8.55x** | 44.4 s | 14.9 GB | 30.6 s | 6.6 GB |
-| **QZ ultra 5** | 408 | **8.56x** | 43.7 s | 14.8 GB | 49.7 s | 6.6 GB |
-
-Note: Ultra 3 and 5 compress paths exceed GPU VRAM (750 MB sequence blocks need ~15.8 GB; RTX 2080 Ti has 11 GB). BWT falls back to CPU for these blocks. Decompress still benefits from GPU (inverse BWT needs less VRAM).
-
-### CPU only
-
-| Tool | Size (MB) | Ratio | Compress | Comp RAM | Decompress | Dec RAM |
-|------|-----------|-------|----------|----------|------------|---------|
-| **QZ default** | 427 | **8.17x** | 22.7 s | 5.4 GB | 33.5 s | 7.5 GB |
-| **QZ ultra 1** | 418 | **8.35x** | 30.4 s | 7.9 GB | 33.5 s | 8.0 GB |
-| **QZ ultra 3** | 408 | **8.55x** | 42.9 s | 14.9 GB | 40.1 s | 7.7 GB |
-| **QZ ultra 5** | 408 | **8.56x** | 44.5 s | 14.7 GB | 66.7 s | 9.0 GB |
+| **QZ default** | 427 | **8.17x** | 15.6 s | 10.8 GB | 35.1 s | 7.4 GB |
+| **QZ ultra 1** | 418 | **8.35x** | 26.6 s | 8.1 GB | 44.0 s | 7.7 GB |
+| **QZ ultra 3** | 408 | **8.55x** | 41.2 s | 14.5 GB | 32.8 s | 7.5 GB |
+| **QZ ultra 5** | 408 | **8.56x** | 46.0 s | 14.4 GB | 1:02.6 | 8.8 GB |
 | SPRING | 431 | 8.10x | 1:01.4 | 11.9 GB | 15.4 s | 10.0 GB |
 | bzip2 -9 | 542 | 6.44x | 2:47.8 | 7.3 MB | 1:26.6 | 4.5 MB |
 | pigz -9 | 695 | 5.02x | 9.7 s | 20.8 MB | 7.9 s | 1.7 MB |
@@ -318,7 +320,7 @@ Memory is the primary constraint for high-throughput genomic compression. QZ use
 - **Temp file accumulation.** For large inputs, compressed blocks are streamed to disk rather than held in memory. A RAII drop guard ensures cleanup on success, error, or panic.
 - **Bounded decompression channels.** Decompressor threads send blocks through channels with capacity 2, preventing unbounded memory growth when the writer is slower than decompression.
 
-## QZ File Format
+## File Format
 
 The QZ archive is a self-describing binary format. All integers are little-endian. The archive consists of a fixed-size prefix, a variable-length header body, and concatenated compressed stream data.
 
@@ -417,41 +419,6 @@ Within the decompressed payload of each stream, records are framed with unsigned
 | Qualities | `[varint(len)] [bit-packed quals]` — packed to minimum bits per binning mode |
 
 For `quality_ctx` compression, the quality stream is compressed as a whole (one or more sub-blocks for 500K reads each) without per-record framing — the context model implicitly tracks record boundaries.
-
-## Installation
-
-### Requirements
-
-- Rust nightly (edition 2024)
-- C++ compiler with OpenMP support (for libbsc)
-
-### Build
-
-```bash
-git clone <repo-url> qz && cd qz
-git clone https://github.com/IlyaGrebnov/libbsc.git third_party/libbsc
-rustup install nightly
-rustup run nightly cargo build --release
-# Binary: target/release/qz
-```
-
-### Build with CUDA GPU acceleration (optional)
-
-CUDA accelerates the BWT suffix array construction via [libcubwt](https://github.com/IlyaGrebnov/libcubwt). Requires NVIDIA GPU with CUDA toolkit installed.
-
-```bash
-rustup run nightly cargo build --release --features cuda
-```
-
-Falls back to CPU gracefully when GPU is unavailable at runtime. Warns at startup if GPU VRAM is insufficient for the configured block size.
-
-### Python bindings
-
-```bash
-cd crates/qz-python
-pip install maturin
-maturin develop --release
-```
 
 ## Usage
 
@@ -562,77 +529,9 @@ let config = CompressConfig {
 compression::compress(&config)?;
 ```
 
-## Project Structure
-
-```
-qz/
-├── Cargo.toml                     workspace root
-├── third_party/
-│   ├── libbsc/                    libbsc (BWT + QLFC), compiled via build.rs
-│   └── htscodecs/                 htscodecs (fqzcomp quality codec), unmodified
-├── crates/
-│   ├── qz-lib/                    core library (all algorithms, no CLI deps)
-│   │   ├── src/
-│   │   │   ├── compression/
-│   │   │   │   ├── mod.rs             archive format, I/O helpers, public API
-│   │   │   │   ├── compress_impl.rs   chunked compression orchestrator
-│   │   │   │   ├── decompress_impl.rs streaming decompression + header parsing
-│   │   │   │   ├── codecs.rs          per-stream compress/decompress dispatch
-│   │   │   │   ├── bsc.rs             libbsc FFI, block-parallel BSC, threading
-│   │   │   │   ├── quality_ctx.rs     context-adaptive range coder (160K contexts)
-│   │   │   │   ├── ultra.rs           ultra mode (reorder + quality_ctx)
-│   │   │   │   ├── columnar.rs        quality binning + bit-packing
-│   │   │   │   ├── fqzcomp.rs         htscodecs FFI for fqzcomp quality codec
-│   │   │   │   ├── header_col.rs      columnar header compression
-│   │   │   │   ├── n_mask.rs          2-bit DNA encoding + N-bitmap
-│   │   │   │   ├── dna_utils.rs       k-mer hashing, reverse complement
-│   │   │   │   └── ...                additional codec modules
-│   │   │   ├── io/fastq.rs        FASTQ/FASTA reader (buffered, gzip, stdin)
-│   │   │   └── cli.rs             CompressConfig, DecompressConfig (no Clap)
-│   │   ├── build.rs               compiles libbsc + htscodecs as static C/C++ libs
-│   │   └── tests/                 38 roundtrip integration tests
-│   ├── qz-cli/                    CLI binary (Clap) → produces `qz` executable
-│   ├── qz-python/                 Python bindings (PyO3/maturin)
-│   └── qz-bench/                  development benchmark binaries
-├── benchmarks/                    benchmark scripts and results
-└── real_data/                     test data (not tracked)
-```
-
-### C/C++ dependencies
-
-`build.rs` compiles two C/C++ libraries as static archives linked into the final binary:
-
-**libbsc** — Block-sorting compressor. All source files are compiled with `-O3 -march=native -std=c++11 -fopenmp`. The `LIBBSC_OPENMP_SUPPORT` and `LIBSAIS_OPENMP` defines enable OpenMP-parallel BWT/suffix-array construction. No modifications to upstream source.
-
-**htscodecs** — Only `fqzcomp_qual.c` and `utils.c` are compiled (not the full library). These provide the fqzcomp quality compression algorithm, available as an alternative quality backend. No modifications to upstream source.
-
-## Testing
-
-```bash
-rustup run nightly cargo test --release
-```
-
-123 tests covering lossless and lossy quality modes, ultra mode, FASTA, verify, piping, error handling on corrupt archives, and edge cases.
-
-## Environment Variables
-
-| Variable | Effect |
-|----------|--------|
-| `QZ_NO_BANNER=1` | Suppress version banner on stderr |
-| `RUST_LOG=debug` | Enable debug logging (tracing) |
-
-## Acknowledgments
-
-- [libbsc](https://github.com/IlyaGrebnov/libbsc) by Ilya Grebnov — block-sorting compression (BWT + LZP + QLFC). Apache 2.0.
-- [libsais](https://github.com/IlyaGrebnov/libsais) by Ilya Grebnov — suffix array construction used by libbsc's BWT. Apache 2.0.
-- [fqzcomp](https://github.com/jkbonfield/fqzcomp) by James Bonfield — context-modeled quality compression; quality codec in CRAM 3.1. Integrated via [htscodecs](https://github.com/samtools/htscodecs). BSD.
-  - Bonfield, J.K. and Mahoney, M.V. (2013). Compression of FASTQ and SAM format sequencing data. *PLoS ONE*, 8(3):e59190.
-- [ENANO](https://github.com/guilledufort/EnanoFASTQ) by Guillermo Dufort y Álvarez et al. — sequence-aware quality modeling with stability tracking.
-  - Dufort y Álvarez, G. et al. (2020). ENANO: encoder for nanopore FASTQ files. *Bioinformatics*, 36(16):4506–4507.
-
 ---
 
-# BZ
+# BZ — BAM Compression
 
 Lossless BAM compressor using columnar stream separation, alignment-aware consensus-delta sequence encoding, and context-adaptive quality coding.
 
@@ -644,52 +543,51 @@ BZ extends QZ's columnar-decomposition + BSC/BWT approach to BAM files. BAM uses
 
 ## Results
 
-NA12878 chromosome 20, Illumina low-coverage WGS (3,245,545 aligned reads, 100 bp). Byte-identical roundtrip verified via MD5 on BGZF-decompressed BAM content.
+HG002 chromosome 20, Illumina WGS (18,289,203 aligned reads, 250 bp). Byte-identical roundtrip verified via MD5 on BGZF-decompressed BAM content.
 
 ### Compression ratio
 
 | Format | Size | Ratio vs BAM |
 |--------|------|-------------|
-| Uncompressed BAM content | 1,133 MB | — |
-| **BAM** (BGZF/gzip) | **298 MB** | **1.00x** |
-| **BZ** | **135 MB** | **2.20x** |
+| **BAM** (BGZF/gzip) | **2,593 MB** | **1.00x** |
+| **BZ** | **1,450 MB** | **1.79x** |
 
 ### Per-stream breakdown (chunk 0, 2.5M records)
 
 | Stream | Raw | Compressed | Ratio | Notes |
 |--------|-----|-----------|-------|-------|
-| consensus | 24.3 MB | 10.1 MB | 2.4x | Local consensus, packed nibbles |
+| consensus | 4.3 MB | 1.9 MB | 2.2x | Local consensus, packed nibbles |
 | ref_id | 10.0 MB | 364 B | 27,473x | Delta-encoded, single chromosome |
-| pos | 10.0 MB | 1.8 MB | 5.5x | Delta-encoded positions |
-| mapq | 2.5 MB | 242 KB | 10.3x | Mapping quality |
-| bin | 5.0 MB | 20 KB | 244x | BAM bin values |
-| flag | 5.0 MB | 770 KB | 6.5x | SAM flags |
-| next_ref_id | 10.0 MB | 29 KB | 348x | Delta vs ref_id (mate pairs) |
-| next_pos | 10.0 MB | 2.7 MB | 3.7x | Delta vs pos (mate pairs) |
-| tlen | 10.0 MB | 2.5 MB | 4.0x | Zigzag-encoded template length |
-| read_name | 50.0 MB | 2.2 MB | 23.1x | Varint-framed read names |
-| cigar | 15.2 MB | 805 KB | 18.9x | Varint-framed CIGAR ops |
-| **seq_diff** | **119.4 MB** | **1.9 MB** | **62.5x** | **XOR vs consensus (>99% zeros)** |
-| seq_extra | 13.1 MB | 6.0 MB | 2.2x | Insertion/softclip bases |
-| **qual** | **255.0 MB** | **73.3 MB** | **3.5x** | **quality_ctx range coder** |
-| aux | 389.9 MB | 6.2 MB | 63.2x | Auxiliary tags |
+| pos | 10.0 MB | 1.0 MB | 9.2x | Delta-encoded positions |
+| mapq | 2.5 MB | 34 KB | 71x | Mapping quality |
+| bin | 5.0 MB | 6 KB | 780x | BAM bin values |
+| flag | 5.0 MB | 645 KB | 7.6x | SAM flags |
+| next_ref_id | 10.0 MB | 6 KB | 1,608x | Delta vs ref_id (mate pairs) |
+| next_pos | 10.0 MB | 2.7 MB | 3.5x | Delta vs pos (mate pairs) |
+| tlen | 10.0 MB | 2.8 MB | 3.4x | Zigzag-encoded template length |
+| read_name | 98.7 MB | 10.4 MB | 9.5x | Varint-framed read names |
+| cigar | 15.1 MB | 1.1 MB | 12.8x | Varint-framed CIGAR ops |
+| **seq_diff** | **309.9 MB** | **5.1 MB** | **60.8x** | **XOR vs consensus (>99% zeros)** |
+| seq_extra | 9.0 MB | 3.0 MB | 2.8x | Insertion/softclip bases |
+| **qual** | **626.6 MB** | **167.2 MB** | **3.7x** | **quality_ctx range coder** |
+| aux | 120.4 MB | 9.2 MB | 13.1x | Auxiliary tags |
 
-Quality scores dominate the compressed output (54% of archive size), followed by consensus data (7.4%) and seq_extra (4.4%). The consensus-delta encoding reduces the 119 MB aligned sequence stream to just 1.9 MB.
+Quality scores dominate the compressed output (57% of archive size per chunk), followed by read names (3.6%) and seq_extra (1.1%). The consensus-delta encoding reduces the 310 MB aligned sequence stream to just 5.1 MB.
 
 ### Speed
 
-| Operation | Time | Throughput |
-|-----------|------|-----------|
-| Compress | 22.4 s | 13.3 MB/s (from BAM) |
-| Decompress | 19.6 s | 6.9 MB/s (to BAM) |
+| Operation | Time | RAM | Throughput |
+|-----------|------|-----|-----------|
+| Compress | 1:03.3 | 11.1 GB | 43.0 MB/s (from BAM) |
+| Decompress | 2:11.9 | 6.6 GB | 20.6 MB/s (to BAM) |
 
 ### Benchmark hardware
 
 | Component | Specification |
 |-----------|--------------|
-| CPU | Intel Core i5-12400T (6 cores / 12 threads, Alder Lake) |
-| RAM | 16 GB DDR4 |
-| OS | Linux 6.6.87 (WSL2) |
+| CPU | Intel Xeon Gold 6254 (2× 18 cores, 72 threads) |
+| RAM | 376 GB |
+| OS | Linux 6.8.0 |
 | Rust | nightly, release profile |
 
 ## Architecture
@@ -755,11 +653,11 @@ When quality data contains unavailable scores (0xFF bytes), BZ falls back to BSC
 - **quality_ctx:** Runs in parallel with BSC streams via rayon. Quality data split into 500K-read blocks compressed via `rayon::par_iter`.
 - **Decompression:** Parallel BSC decompression in groups, parallel sequence reconstruction across records, multi-threaded BGZF output.
 
-### BZ file format
+## File Format
 
 The BZ archive is a chunk-based binary format. All integers are little-endian. Each chunk contains 15 independently compressed columnar streams from up to 2.5M BAM records.
 
-#### File layout
+### File layout
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -776,7 +674,7 @@ The BZ archive is a chunk-based binary format. All integers are little-endian. E
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-#### Global header
+### Global header
 
 ```
 Offset  Size  Type    Field                  Description
@@ -798,7 +696,7 @@ Offset  Size  Type    Field                  Description
 
 The SAM header payload contains both the raw SAM header text and the BAM reference dictionary (n_ref count + per-reference name/length entries), compressed together as a single BSC block.
 
-#### Chunk header (69 bytes)
+### Chunk header (69 bytes)
 
 Each chunk begins with a fixed-size header:
 
@@ -814,7 +712,7 @@ Offset  Size  Type      Field            Description
 
 The 15 stream size entries correspond to streams 0–14. The compressed stream data follows immediately, concatenated in order.
 
-#### Stream index
+### Stream index
 
 | Index | Stream | Encoding | Description |
 |-------|--------|----------|-------------|
@@ -836,7 +734,7 @@ The 15 stream size entries correspond to streams 0–14. The compressed stream d
 
 All streams except quality (index 13) are compressed with BSC (BWT + adaptive QLFC, 25 MB blocks). Quality uses `quality_ctx` context-adaptive range coding when `chunk_flags & 0x01` is set, otherwise BSC.
 
-#### Consensus stream format (stream 0, after BSC decompression)
+### Consensus stream format (stream 0, after BSC decompression)
 
 ```
 +0      4     u32     num_segments     Number of reference segments
@@ -848,7 +746,7 @@ Per segment:
                                        high nibble first), ceil(length/2) bytes
 ```
 
-#### Variable-length stream format (streams 9, 10, 14, after BSC decompression)
+### Variable-length stream format (streams 9, 10, 14, after BSC decompression)
 
 ```
 Per record:
@@ -856,7 +754,7 @@ Per record:
   bytes     field_data    Raw field bytes
 ```
 
-#### Quality stream format (stream 13)
+### Quality stream format (stream 13)
 
 When using `quality_ctx` (`chunk_flags & 0x01`):
 
@@ -869,7 +767,7 @@ Per block:
 
 Each block contains up to 500K reads. When falling back to BSC (no `chunk_flags & 0x01`), the quality stream is a single BSC-compressed blob of varint-framed quality bytes.
 
-#### Fixed-width stream formats (streams 1–8, after BSC decompression)
+### Fixed-width stream formats (streams 1–8, after BSC decompression)
 
 Streams 1–8 contain one value per record, concatenated with no framing:
 
@@ -979,6 +877,118 @@ diff <(samtools view input.bam) <(samtools view roundtrip.bam)
 | `-o, --output PREFIX` | Output prefix (creates `{prefix}_R1.qz` / `{prefix}_R2.qz`) | required |
 | `-w, --working-dir PATH` | Working directory | `.` |
 | `-t, --threads N` | Thread count (0 = auto) | auto |
+
+---
+
+## Installation
+
+### Requirements
+
+- Rust nightly (edition 2024)
+- C++ compiler with OpenMP support (for libbsc)
+
+### Build
+
+```bash
+git clone <repo-url> qz && cd qz
+git clone https://github.com/IlyaGrebnov/libbsc.git third_party/libbsc
+rustup install nightly
+rustup run nightly cargo build --release
+# Binaries: target/release/qz  target/release/bz
+```
+
+### Build with CUDA GPU acceleration (optional)
+
+CUDA accelerates the BWT suffix array construction via [libcubwt](https://github.com/IlyaGrebnov/libcubwt). Requires NVIDIA GPU with CUDA toolkit installed.
+
+```bash
+rustup run nightly cargo build --release --features cuda
+```
+
+Falls back to CPU gracefully when GPU is unavailable at runtime. Warns at startup if GPU VRAM is insufficient for the configured block size.
+
+### Python bindings
+
+```bash
+cd crates/qz-python
+pip install maturin
+maturin develop --release
+```
+
+## Project Structure
+
+```
+qz/
+├── Cargo.toml                     workspace root
+├── third_party/
+│   ├── libbsc/                    libbsc (BWT + QLFC), compiled via build.rs
+│   └── htscodecs/                 htscodecs (fqzcomp quality codec), unmodified
+├── crates/
+│   ├── qz-lib/                    core library (all algorithms, no CLI deps)
+│   │   ├── src/
+│   │   │   ├── compression/
+│   │   │   │   ├── mod.rs             archive format, I/O helpers, public API
+│   │   │   │   ├── compress_impl.rs   chunked compression orchestrator
+│   │   │   │   ├── decompress_impl.rs streaming decompression + header parsing
+│   │   │   │   ├── codecs.rs          per-stream compress/decompress dispatch
+│   │   │   │   ├── bsc.rs             libbsc FFI, block-parallel BSC, threading
+│   │   │   │   ├── quality_ctx.rs     context-adaptive range coder (160K contexts)
+│   │   │   │   ├── ultra.rs           ultra mode (reorder + quality_ctx)
+│   │   │   │   ├── columnar.rs        quality binning + bit-packing
+│   │   │   │   ├── fqzcomp.rs         htscodecs FFI for fqzcomp quality codec
+│   │   │   │   ├── header_col.rs      columnar header compression
+│   │   │   │   ├── n_mask.rs          2-bit DNA encoding + N-bitmap
+│   │   │   │   ├── dna_utils.rs       k-mer hashing, reverse complement
+│   │   │   │   └── ...                additional codec modules
+│   │   │   ├── io/fastq.rs        FASTQ/FASTA reader (buffered, gzip, stdin)
+│   │   │   └── cli.rs             CompressConfig, DecompressConfig (no Clap)
+│   │   ├── build.rs               compiles libbsc + htscodecs as static C/C++ libs
+│   │   └── tests/                 38 roundtrip integration tests
+│   ├── qz-cli/                    CLI binary (Clap) → produces `qz` executable
+│   ├── qz-python/                 Python bindings (PyO3/maturin)
+│   └── qz-bench/                  development benchmark binaries
+├── crates/
+│   ├── bz-lib/                    BZ core library
+│   │   ├── src/
+│   │   │   ├── compression/       compress, decompress, verify, extract modules
+│   │   │   └── io/bam.rs          BAM reader/writer (noodles, multi-threaded BGZF)
+│   │   └── tests/                 19 roundtrip integration tests
+│   └── bz-cli/                    CLI binary (Clap) → produces `bz` executable
+├── benchmarks/                    benchmark scripts and results
+└── real_data/                     test data (not tracked)
+```
+
+### C/C++ dependencies
+
+`build.rs` compiles two C/C++ libraries as static archives linked into the final binary:
+
+**libbsc** — Block-sorting compressor. All source files are compiled with `-O3 -march=native -std=c++11 -fopenmp`. The `LIBBSC_OPENMP_SUPPORT` and `LIBSAIS_OPENMP` defines enable OpenMP-parallel BWT/suffix-array construction. No modifications to upstream source.
+
+**htscodecs** — Only `fqzcomp_qual.c` and `utils.c` are compiled (not the full library). These provide the fqzcomp quality compression algorithm, available as an alternative quality backend. No modifications to upstream source.
+
+## Testing
+
+```bash
+rustup run nightly cargo test --release
+```
+
+139 tests covering lossless and lossy quality modes, ultra mode, FASTA, verify, piping, error handling on corrupt archives, and edge cases.
+
+## Environment Variables
+
+| Variable | Effect |
+|----------|--------|
+| `QZ_NO_BANNER=1` | Suppress version banner on stderr |
+| `RUST_LOG=debug` | Enable debug logging (tracing) |
+
+## Acknowledgments
+
+- [libbsc](https://github.com/IlyaGrebnov/libbsc) by Ilya Grebnov — block-sorting compression (BWT + LZP + QLFC). Apache 2.0.
+- [libsais](https://github.com/IlyaGrebnov/libsais) by Ilya Grebnov — suffix array construction used by libbsc's BWT. Apache 2.0.
+- [fqzcomp](https://github.com/jkbonfield/fqzcomp) by James Bonfield — context-modeled quality compression; quality codec in CRAM 3.1. Integrated via [htscodecs](https://github.com/samtools/htscodecs). BSD.
+  - Bonfield, J.K. and Mahoney, M.V. (2013). Compression of FASTQ and SAM format sequencing data. *PLoS ONE*, 8(3):e59190.
+- [ENANO](https://github.com/guilledufort/EnanoFASTQ) by Guillermo Dufort y Álvarez et al. — sequence-aware quality modeling with stability tracking.
+  - Dufort y Álvarez, G. et al. (2020). ENANO: encoder for nanopore FASTQ files. *Bioinformatics*, 36(16):4506–4507.
 
 ## License
 
