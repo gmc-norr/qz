@@ -198,7 +198,9 @@ pub fn encode_read_ids(read_ids: &[String], template: &ReadIdTemplate) -> Result
         // No template compression, just store raw IDs with length prefixes
         for id in read_ids {
             let bytes = id.as_bytes();
-            encoded.write_all(&(bytes.len() as u16).to_le_bytes())?;
+            let len = u16::try_from(bytes.len())
+                .map_err(|_| anyhow::anyhow!("read ID too long ({} bytes, max 65535): {:?}", bytes.len(), id))?;
+            encoded.write_all(&len.to_le_bytes())?;
             encoded.write_all(bytes)?;
         }
         return Ok(encoded);
@@ -280,7 +282,9 @@ pub fn encode_read_ids(read_ids: &[String], template: &ReadIdTemplate) -> Result
     if template.has_comment && template.common_comment.is_none() {
         for comment in comments {
             if let Some(comm) = comment {
-                encoded.write_all(&(comm.len() as u16).to_le_bytes())?;
+                let len = u16::try_from(comm.len())
+                    .map_err(|_| anyhow::anyhow!("read comment too long ({} bytes, max 65535)", comm.len()))?;
+                encoded.write_all(&len.to_le_bytes())?;
                 encoded.write_all(comm.as_bytes())?;
             } else {
                 // No comment for this read, write length 0

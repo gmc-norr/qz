@@ -5,6 +5,7 @@ use crate::io::bam::BamWriter;
 use anyhow::{Context, Result};
 use qz_lib::compression::bsc;
 use qz_lib::compression::quality_ctx;
+use flate2::Crc;
 use std::io::{BufReader, Read, Write};
 use std::num::NonZeroUsize;
 use std::time::Instant;
@@ -66,16 +67,29 @@ fn read_slice<'a>(stream: &'a [u8], off: &mut usize, len: usize, name: &str) -> 
     Ok(slice)
 }
 
-/// Read all compressed stream data for a chunk from the reader.
+/// Read all compressed stream data for a chunk from the reader and verify CRC32.
+///
+/// The CRC32 is computed over the concatenated compressed stream payloads and
+/// compared to `chunk_header.crc32`.  A mismatch means the archive has been
+/// corrupted on disk; we bail before attempting (potentially slow) BSC decompression.
 pub(super) fn read_chunk_streams<R: Read>(reader: &mut R, chunk_header: &ChunkHeader) -> Result<Vec<Vec<u8>>> {
     let mut compressed_streams: Vec<Vec<u8>> = Vec::with_capacity(NUM_STREAMS);
+    let mut crc = Crc::new();
     for i in 0..NUM_STREAMS {
         let size = chunk_header.stream_sizes[i] as usize;
         let mut data = vec![0u8; size];
         if size > 0 {
             reader.read_exact(&mut data)?;
+            crc.update(&data);
         }
         compressed_streams.push(data);
+    }
+    let computed = crc.sum();
+    if computed != chunk_header.crc32 {
+        anyhow::bail!(
+            "Chunk CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+            chunk_header.crc32, computed
+        );
     }
     Ok(compressed_streams)
 }
@@ -556,6 +570,9 @@ fn decompress_chunk_bsc<W: Write>(
         let tlen_val = streams::zigzag_decode(tlen_raw);
 
         let rn_len = streams::read_varint(&decompressed[9], &mut read_name_off)?;
+        if rn_len > 254 {
+            anyhow::bail!("record {rec_i}: read name length {rn_len} exceeds BAM limit of 254");
+        }
         let read_name = read_slice(&decompressed[9], &mut read_name_off, rn_len, "read_name")
             .with_context(|| format!("record {rec_i}"))?;
 
@@ -566,13 +583,17 @@ fn decompress_chunk_bsc<W: Write>(
             .with_context(|| format!("record {rec_i}"))?;
 
         let diff_count = streams::read_varint(&decompressed[11], &mut seq_diff_off)?;
-        let diff_packed_len = (diff_count + 1) / 2;
+        let diff_packed_len = diff_count.checked_add(1)
+            .map(|n| n / 2)
+            .ok_or_else(|| anyhow::anyhow!("diff_count overflow at record {rec_i}: {diff_count}"))?;
         let diff_data = read_slice(&decompressed[11], &mut seq_diff_off, diff_packed_len, "seq_diff")
             .with_context(|| format!("record {rec_i}"))?;
         let diff_nibbles = streams::unpack_nibble_pairs(diff_data, diff_count);
 
         let extra_count = streams::read_varint(&decompressed[12], &mut seq_extra_off)?;
-        let extra_packed_len = (extra_count + 1) / 2;
+        let extra_packed_len = extra_count.checked_add(1)
+            .map(|n| n / 2)
+            .ok_or_else(|| anyhow::anyhow!("extra_count overflow at record {rec_i}: {extra_count}"))?;
         let extra_data = read_slice(&decompressed[12], &mut seq_extra_off, extra_packed_len, "seq_extra")
             .with_context(|| format!("record {rec_i}"))?;
         let extra_nibbles = streams::unpack_nibble_pairs(extra_data, extra_count);

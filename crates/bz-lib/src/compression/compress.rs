@@ -3,6 +3,7 @@ use crate::compression::archive::{ArchiveHeader, ChunkHeader, CHUNK_FLAG_QUALITY
 use crate::compression::streams::{self, BamStreams, ChunkQualityData, NUM_STREAMS};
 use crate::io::bam::{RawBamReader, RawBamRecord};
 use anyhow::Result;
+use flate2::Crc;
 use qz_lib::compression::bsc;
 use qz_lib::compression::quality_ctx;
 use std::collections::VecDeque;
@@ -247,6 +248,7 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
             }
 
             let mut stream_sizes = [0u32; NUM_STREAMS];
+            let mut crc = Crc::new();
             for (i, cs) in compressed.iter().enumerate() {
                 if cs.len() > u32::MAX as usize {
                     anyhow::bail!(
@@ -254,10 +256,12 @@ pub fn compress(config: &CompressConfig) -> Result<()> {
                     );
                 }
                 stream_sizes[i] = cs.len() as u32;
+                crc.update(cs);
             }
             let chunk_header = ChunkHeader {
                 num_records: n as u32,
                 chunk_flags,
+                crc32: crc.sum(),
                 stream_sizes,
             };
             chunk_header.write_to(&mut writer)?;

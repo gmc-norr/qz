@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::io::{Read, Write};
 
 pub const ARCHIVE_MAGIC: [u8; 2] = *b"BZ";
-pub const ARCHIVE_VERSION: u8 = 3;
+pub const ARCHIVE_VERSION: u8 = 4;
 
 /// Flags for the archive header.
 pub const FLAG_CONSENSUS_DELTA: u8 = 0x01;
@@ -30,7 +30,7 @@ impl ArchiveHeader {
         // Flags
         w.write_all(&[self.flags])?;
 
-        // Compressor codes (v3)
+        // Compressor codes
         w.write_all(&[self.alignment_compressor])?;
         w.write_all(&[self.aux_compressor])?;
 
@@ -74,7 +74,7 @@ impl ArchiveHeader {
         let mut flags = [0u8; 1];
         r.read_exact(&mut flags)?;
 
-        // Compressor codes (v3)
+        // Compressor codes
         let mut compressor_buf = [0u8; 1];
         r.read_exact(&mut compressor_buf)?;
         let alignment_compressor = compressor_buf[0];
@@ -140,6 +140,9 @@ pub struct ChunkHeader {
     pub num_records: u32,
     /// Per-chunk flags (bit 0 = quality_ctx used for this chunk's quality stream).
     pub chunk_flags: u8,
+    /// CRC32 (IEEE) over the concatenated compressed stream payloads for this chunk.
+    /// Computed at write time; verified before BSC decompression at read time.
+    pub crc32: u32,
     pub stream_sizes: [u32; NUM_STREAMS],
 }
 
@@ -147,6 +150,7 @@ impl ChunkHeader {
     pub fn write_to<W: Write>(&self, w: &mut W) -> Result<()> {
         w.write_all(&self.num_records.to_le_bytes())?;
         w.write_all(&[self.chunk_flags])?;
+        w.write_all(&self.crc32.to_le_bytes())?;
         for &size in &self.stream_sizes {
             w.write_all(&size.to_le_bytes())?;
         }
@@ -162,6 +166,9 @@ impl ChunkHeader {
         r.read_exact(&mut flags_buf)?;
         let chunk_flags = flags_buf[0];
 
+        r.read_exact(&mut buf4)?;
+        let crc32 = u32::from_le_bytes(buf4);
+
         let mut stream_sizes = [0u32; NUM_STREAMS];
         for size in &mut stream_sizes {
             r.read_exact(&mut buf4)?;
@@ -171,6 +178,7 @@ impl ChunkHeader {
         Ok(Self {
             num_records,
             chunk_flags,
+            crc32,
             stream_sizes,
         })
     }

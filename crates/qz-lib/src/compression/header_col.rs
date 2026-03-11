@@ -569,9 +569,14 @@ fn read_string(data: &[u8], pos: &mut usize) -> Result<String> {
 }
 
 fn write_combo_dict(out: &mut Vec<u8>, combos: &[String]) {
+    // combos.len() <= 254 is guaranteed by get_or_insert_combo's >= 255 guard
     out.push(combos.len() as u8);
     for combo in combos {
-        out.push(combo.len() as u8);
+        // Individual combo strings must fit in one byte length prefix.
+        // Combos are constructed from short SAM tag values; > 255 bytes is a bug.
+        let combo_len = u8::try_from(combo.len())
+            .expect("combo string exceeds 255 bytes; should have been rejected earlier");
+        out.push(combo_len);
         out.extend_from_slice(combo.as_bytes());
     }
 }
