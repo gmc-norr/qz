@@ -1,6 +1,5 @@
 use crate::cli::QualityMode;
 use std::borrow::Cow;
-use tracing::info;
 
 /// Illumina 8-level binning table
 const ILLUMINA_BINS: [u8; 94] = [
@@ -24,9 +23,7 @@ pub fn quantize_quality<'a>(quality: &'a [u8], mode: QualityMode) -> Cow<'a, [u8
         QualityMode::Illumina4 => Cow::Owned(quantize_four_level(quality)),
         QualityMode::Binary => Cow::Owned(quantize_binary(quality, 20, 40, 6)),
         QualityMode::Qvz => {
-            // TODO: Implement QVZ compression
-            info!("QVZ mode not yet implemented, using lossless");
-            Cow::Borrowed(quality)
+            unimplemented!("QVZ quality mode is not yet implemented");
         }
         QualityMode::Discard => {
             Cow::Owned(vec![b'!'; quality.len()])

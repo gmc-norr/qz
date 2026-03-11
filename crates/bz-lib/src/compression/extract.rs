@@ -214,30 +214,21 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
         }
     }
 
-    // Handle remaining unpaired reads
+    // Handle remaining unpaired reads — write to SE file, never fabricate synthetic mates
     let unpaired = pair_buffer.len();
     if unpaired > 0 {
         warn!(
-            "{} reads remain unpaired after processing all {} records",
+            "{} reads remain unpaired after processing all {} records — writing to SE file",
             unpaired, total_records
         );
         for (_name, (r1_opt, r2_opt)) in pair_buffer.drain() {
-            match (r1_opt, r2_opt) {
-                (Some((h1, s1, q1)), None) => {
-                    write_fastq_record(&mut r1_writer, &h1, &s1, &q1)?;
-                    let dummy_seq = vec![b'N'; s1.len()];
-                    let dummy_qual = vec![b'!'; s1.len()];
-                    write_fastq_record(&mut r2_writer, &h1, &dummy_seq, &dummy_qual)?;
-                    pairs_written += 1;
-                }
-                (None, Some((h2, s2, q2))) => {
-                    let dummy_seq = vec![b'N'; s2.len()];
-                    let dummy_qual = vec![b'!'; s2.len()];
-                    write_fastq_record(&mut r1_writer, &h2, &dummy_seq, &dummy_qual)?;
-                    write_fastq_record(&mut r2_writer, &h2, &s2, &q2)?;
-                    pairs_written += 1;
-                }
-                _ => {}
+            if let Some((h, s, q)) = r1_opt {
+                write_fastq_record(&mut se_writer, &h, &s, &q)?;
+                single_count += 1;
+            }
+            if let Some((h, s, q)) = r2_opt {
+                write_fastq_record(&mut se_writer, &h, &s, &q)?;
+                single_count += 1;
             }
         }
     }
