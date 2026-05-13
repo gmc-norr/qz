@@ -93,9 +93,10 @@ fn stream_decompressor_inner(
     let num_blocks = u32::from_le_bytes(buf4) as usize;
 
     let mut blocks_done = 0;
+    let max_batch = super::decompress_batch_size();
 
     while blocks_done < num_blocks {
-        let batch_size = DECOMPRESS_BATCH_SIZE.min(num_blocks - blocks_done);
+        let batch_size = max_batch.min(num_blocks - blocks_done);
 
         // Read compressed blocks from file (sequential I/O)
         let mut compressed_blocks = Vec::with_capacity(batch_size);
@@ -1292,6 +1293,17 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
 pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
     use std::io::Write;
 
+    // Honor -t / num_threads for all rayon work below (BSC block decompression,
+    // record reconstruction, etc.). build_global is best-effort; if a pool was
+    // already installed (e.g. by a prior call in the same process or by tests),
+    // we silently keep the existing one.
+    let num_threads = resolve_num_threads(args.num_threads);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok();
+    info!("Using {} threads for decompression", num_threads);
+
     // If input is stdin, spool to a temp file first (decompression needs seeking)
     let (_stdin_tmp, args) = if crate::cli::is_stdio_path(&args.input) {
         info!("Reading archive from stdin...");
@@ -1456,8 +1468,24 @@ fn verify_streaming(input: &std::path::Path, hasher: &mut HashWriter) -> Result<
     parse_archive_header(&archive_data)
 }
 
+/// Resolve a CLI thread count: 0 means "auto-detect", otherwise honor it.
+fn resolve_num_threads(requested: usize) -> usize {
+    if requested == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
+    } else {
+        requested
+    }
+}
+
 /// Verify a QZ archive: fully decompress all streams, compute CRC32, report metadata.
 pub(super) fn verify(config: &VerifyConfig) -> Result<VerifyResult> {
+    let num_threads = resolve_num_threads(config.num_threads);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .ok();
+    info!("Using {} threads for verification", num_threads);
+
     let start_time = Instant::now();
 
     // Handle stdin: spool to temp file

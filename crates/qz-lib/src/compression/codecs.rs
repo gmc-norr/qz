@@ -60,6 +60,7 @@ impl ByteBackend {
             QualityCompressor::Zstd => Some(ByteBackend::Zstd { level }),
             QualityCompressor::OpenZl => Some(ByteBackend::OpenZl),
             QualityCompressor::Fqzcomp | QualityCompressor::QualityCtx => None,
+            QualityCompressor::Auto => unreachable!("Auto must be resolved before reaching codec backends"),
         }
     }
 
@@ -473,6 +474,7 @@ pub(super) fn compress_qualities_with_dict(
             compress_qualities_fqzcomp(records)
         }
         QualityCompressor::QualityCtx => unreachable!("quality_ctx handled separately"),
+        QualityCompressor::Auto => unreachable!("Auto must be resolved before reaching codec backends"),
     }
 }
 

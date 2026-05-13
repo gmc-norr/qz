@@ -27,8 +27,15 @@ use anyhow::{Context, Result};
 use std::time::Instant;
 use tracing::info;
 
-/// Number of BSC blocks to decompress in each parallel batch
-const DECOMPRESS_BATCH_SIZE: usize = 8;
+/// Number of BSC blocks to decompress in each parallel batch.
+///
+/// Sizing rationale: 3 streams (headers, sequences, qualities) each batch
+/// independently and submit blocks to the shared rayon pool. To saturate the
+/// pool we want roughly `threads / 3` blocks in flight per stream, but we
+/// cap the burst to keep memory bounded.
+pub(super) fn decompress_batch_size() -> usize {
+    rayon::current_num_threads().div_ceil(3).clamp(8, 32)
+}
 
 /// Minimum reads for quality_ctx to outperform BSC (below this, models don't converge)
 const MIN_READS_QUALITY_CTX: usize = 100_000;
@@ -107,6 +114,30 @@ fn compressor_to_code(compressor: QualityCompressor) -> u8 {
         QualityCompressor::OpenZl => 2,
         QualityCompressor::Fqzcomp => 3,
         QualityCompressor::QualityCtx => 4,
+        // Auto must always be resolved before reaching storage.
+        QualityCompressor::Auto => unreachable!("Auto must be resolved before storage"),
+    }
+}
+
+/// Resolve `Auto` to a concrete quality compressor based on input characteristics.
+/// Non-Auto values are returned unchanged.
+pub(super) fn resolve_quality_compressor(
+    requested: QualityCompressor,
+    record_count: usize,
+    quality_mode: QualityMode,
+    no_quality: bool,
+) -> QualityCompressor {
+    if requested != QualityCompressor::Auto {
+        return requested;
+    }
+    // Quality_ctx only helps for lossless quality with enough reads to train context models.
+    if no_quality
+        || quality_mode != QualityMode::Lossless
+        || record_count < MIN_READS_QUALITY_CTX
+    {
+        QualityCompressor::Bsc
+    } else {
+        QualityCompressor::QualityCtx
     }
 }
 

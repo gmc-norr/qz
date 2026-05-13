@@ -181,8 +181,6 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
     } else {
         quality_mode_to_binning(quality_mode)
     };
-    let use_fqzcomp = args.advanced.quality_compressor == QualityCompressor::Fqzcomp;
-
     if sort_chunks {
         info!("Chunked compression (sorted): {} records per chunk", chunk_size);
     } else {
@@ -199,11 +197,22 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
         anyhow::bail!("Empty input file");
     }
 
-    // Decide quality strategy from first chunk (must be consistent across all chunks)
+    // Resolve Auto -> concrete compressor based on first chunk size. We use the
+    // first chunk's record count as a proxy: it equals the total when the input
+    // fits in one chunk, and is otherwise large enough to justify QualityCtx.
+    let resolved_quality_compressor = super::resolve_quality_compressor(
+        args.advanced.quality_compressor,
+        cur_records.len(),
+        quality_mode,
+        no_quality,
+    );
+    let use_fqzcomp = resolved_quality_compressor == QualityCompressor::Fqzcomp;
+
+    // Decide quality strategy. Note: with the explicit Auto variant, this no
+    // longer silently overrides an explicit Bsc choice — Bsc means Bsc.
     let collect_for_ctx = !no_quality && quality_mode == QualityMode::Lossless && !use_fqzcomp;
     let use_quality_ctx = collect_for_ctx
-        && (args.advanced.quality_compressor == QualityCompressor::QualityCtx
-            || cur_records.len() >= MIN_READS_QUALITY_CTX);
+        && resolved_quality_compressor == QualityCompressor::QualityCtx;
 
     // Detect constant lengths from first chunk
     // const_qual_len only applies to BSC quality path (fqzcomp/quality_ctx have their own framing)
@@ -775,6 +784,17 @@ pub(super) fn compress_global_reorder_bsc(args: &CompressConfig) -> Result<()> {
 pub(super) fn compress(args: &CompressConfig) -> Result<()> {
     let start_time = Instant::now();
 
+    // Cap bsc_block_size_mb at 64. The streaming decompressor refuses any
+    // compressed block > 64 MiB (corruption guard), and BSC output never
+    // exceeds input + header — so capping input at 64 MiB guarantees the
+    // archive is always decompressible.
+    if args.advanced.bsc_block_size_mb == 0 || args.advanced.bsc_block_size_mb > 64 {
+        anyhow::bail!(
+            "bsc_block_size_mb must be in 1..=64 (got {})",
+            args.advanced.bsc_block_size_mb
+        );
+    }
+
     // Set up thread pool
     let num_threads = if args.threads == 0 {
         std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
@@ -907,6 +927,16 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
 
     info!("Read {} records", records.len());
 
+    // Resolve Auto -> concrete compressor. The in-memory path doesn't support
+    // QualityCtx (advanced encodings here pre-empt it), so Auto effectively
+    // means Bsc in this code path.
+    let resolved_quality_compressor = super::resolve_quality_compressor(
+        args.advanced.quality_compressor,
+        records.len(),
+        args.quality_mode,
+        args.no_quality,
+    );
+
     // Apply quality quantization if needed (skip for lossless — avoids ~1.5 GB clone)
     let processed_records: Vec<FastqRecord> = if !args.no_quality && args.quality_mode != QualityMode::Lossless {
         records
@@ -972,7 +1002,7 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
         let (qual_compressed, model) = if let Some(ref dict) = quality_dict_opt {
             codecs::compress_qualities_with_model_and_dict(&processed_records, dict, args.advanced.compression_level)?
         } else {
-            codecs::compress_qualities_with_model(&processed_records, args.advanced.compression_level, args.advanced.quality_compressor, args.advanced.bsc_static)?
+            codecs::compress_qualities_with_model(&processed_records, args.advanced.compression_level, resolved_quality_compressor, args.advanced.bsc_static)?
         };
         (None, Some((qual_compressed, model)))
     } else {
@@ -989,9 +1019,9 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
         } else if args.no_quality {
             Ok(Vec::new())
         } else if let Some(ref dict) = quality_dict_opt {
-            codecs::compress_qualities_with_dict(&processed_records, quality_binning, dict, args.advanced.compression_level, args.advanced.quality_compressor)
+            codecs::compress_qualities_with_dict(&processed_records, quality_binning, dict, args.advanced.compression_level, resolved_quality_compressor)
         } else {
-            codecs::compress_qualities_with(&processed_records, quality_binning, args.advanced.compression_level, args.advanced.quality_compressor, bsc_static)
+            codecs::compress_qualities_with(&processed_records, quality_binning, args.advanced.compression_level, resolved_quality_compressor, bsc_static)
         }
     };
 
@@ -1134,7 +1164,7 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
     hdr.push(0u8); // flags: 0x00 = no const-length fields
 
     hdr.push(binning_to_code(quality_binning));
-    hdr.push(compressor_to_code(args.advanced.quality_compressor));
+    hdr.push(compressor_to_code(resolved_quality_compressor));
     hdr.push(seq_compressor_to_code(args.advanced.sequence_compressor));
     hdr.push(header_compressor_to_code(args.advanced.header_compressor));
 

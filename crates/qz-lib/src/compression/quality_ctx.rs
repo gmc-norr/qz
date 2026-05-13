@@ -23,7 +23,7 @@ const MAX_QUAL: usize = 50; // max Phred score we handle
 const N_BASE_CTX: usize = 25; // 5 prev_base * 5 cur_base (including sentinel)
 const N_DELTA: usize = 2; // 0 = stable (|q_prev - q_prev2| <= 2), 1 = changing
 const MAX_CONTEXTS: usize = MAX_POS_BINS * MAX_QUAL * N_DELTA * N_BASE_CTX; // 160000
-const RESCALE_THRESHOLD: u32 = 1 << 20;
+const RESCALE_THRESHOLD: u32 = 1 << 15;
 
 // ============================================================================
 // Range Encoder (LZMA-style with carry propagation via 64-bit low)
@@ -138,18 +138,18 @@ impl<'a> RangeDecoder<'a> {
     }
 
     #[inline(always)]
-    fn decode(&mut self, cum_freqs: &[u32], n_symbols: usize, total: u32) -> usize {
+    fn decode(&mut self, cum_freqs: &[u16], n_symbols: usize, total: u32) -> usize {
         let r = self.range / total;
         let offset = (self.code / r).min(total - 1);
 
-        // Linear scan for symbol (fast for small alphabets ~20)
+        // Find symbol: largest sym where cum_freqs[sym] <= offset < cum_freqs[sym+1].
         let mut sym = 0;
-        while sym + 1 < n_symbols && cum_freqs[sym + 1] <= offset {
+        while sym + 1 < n_symbols && cum_freqs[sym + 1] as u32 <= offset {
             sym += 1;
         }
 
-        let cum = cum_freqs[sym];
-        let freq = cum_freqs[sym + 1] - cum;
+        let cum = cum_freqs[sym] as u32;
+        let freq = cum_freqs[sym + 1] as u32 - cum;
 
         self.code -= cum * r;
         if cum + freq < total {
@@ -172,8 +172,10 @@ impl<'a> RangeDecoder<'a> {
 
 struct ModelArena {
     /// Flat storage: `data[slot * stride .. (slot+1) * stride]` = cum_freqs for model `slot`.
-    data: Vec<u32>,
-    /// Per-model cumulative total.
+    /// u16 halves arena size (13.4 MB → 6.7 MB) for better cache utilisation.
+    /// All values stay < RESCALE_THRESHOLD (1<<15 = 32768), which fits in u16.
+    data: Vec<u16>,
+    /// Per-model cumulative total (u32 for range-coder arithmetic).
     totals: Vec<u32>,
     stride: usize, // n_symbols + 1
     n_symbols: usize,
@@ -197,7 +199,7 @@ impl ModelArena {
         let base = self.data.len();
         self.data.resize(base + self.stride, 0);
         for i in 0..self.stride {
-            self.data[base + i] = i as u32;
+            self.data[base + i] = i as u16;
         }
         self.totals.push(self.n_symbols as u32);
         slot
@@ -206,13 +208,13 @@ impl ModelArena {
     #[inline(always)]
     fn encode_params(&self, slot: usize, sym: usize) -> (u32, u32, u32) {
         let base = slot * self.stride;
-        let cum = self.data[base + sym];
-        let freq = self.data[base + sym + 1] - cum;
+        let cum = self.data[base + sym] as u32;
+        let freq = self.data[base + sym + 1] as u32 - cum;
         (cum, freq, self.totals[slot])
     }
 
     #[inline(always)]
-    fn cum_freqs(&self, slot: usize) -> &[u32] {
+    fn cum_freqs(&self, slot: usize) -> &[u16] {
         let base = slot * self.stride;
         &self.data[base..base + self.stride]
     }
@@ -225,8 +227,9 @@ impl ModelArena {
     #[inline(always)]
     fn update(&mut self, slot: usize, sym: usize) {
         let base = slot * self.stride;
-        for i in (sym + 1)..=self.n_symbols {
-            self.data[base + i] += 1;
+        let slice = &mut self.data[base + sym + 1..base + self.n_symbols + 1];
+        for v in slice.iter_mut() {
+            *v += 1;
         }
         self.totals[slot] += 1;
         if self.totals[slot] >= RESCALE_THRESHOLD {
@@ -236,7 +239,7 @@ impl ModelArena {
 
     fn rescale(&mut self, slot: usize) {
         let base = slot * self.stride;
-        let mut cum = 0u32;
+        let mut cum = 0u16;
         self.data[base] = 0;
         for i in 0..self.n_symbols {
             let freq = self.data[base + i + 1] - self.data[base + i];
@@ -244,7 +247,7 @@ impl ModelArena {
             cum += new_freq;
             self.data[base + i + 1] = cum;
         }
-        self.totals[slot] = cum;
+        self.totals[slot] = cum as u32;
     }
 }
 
@@ -274,17 +277,6 @@ static BASE_TO_IDX_LUT: [u8; 256] = {
     t[b'T' as usize] = 3; t[b't' as usize] = 3;
     t
 };
-
-/// Batch-convert an ASCII sequence to base indices. Avoids per-symbol LUT
-/// lookups in the hot encode/decode loops.
-#[inline]
-fn precompute_base_indices(seq: &[u8]) -> Vec<u8> {
-    let mut indices = vec![0u8; seq.len()];
-    for i in 0..seq.len() {
-        indices[i] = BASE_TO_IDX_LUT[seq[i] as usize];
-    }
-    indices
-}
 
 // ============================================================================
 // Compress
@@ -342,7 +334,9 @@ pub fn compress_qualities_ctx(qualities: &[&[u8]], sequences: &[&[u8]]) -> Resul
         if qb.len() > sb.len() {
             anyhow::bail!("quality_ctx compress: quality length {} > sequence length {}", qb.len(), sb.len());
         }
-        let base_idx = precompute_base_indices(sb);
+        // Direct LUT lookup avoids the per-read Vec allocation that
+        // precompute_base_indices used to do — the inner loop has serial deps
+        // on the range coder anyway, so there's no vectorisation gain to lose.
         let mut prev_q: u8 = 0;
         let mut prev_q2: u8 = 0;
         let mut prev_base: u8 = 4; // sentinel for position 0
@@ -350,7 +344,7 @@ pub fn compress_qualities_ctx(qualities: &[&[u8]], sequences: &[&[u8]]) -> Resul
         for j in 0..qb.len() {
             let phred = qb[j] - 33;
             let sym = sym_map[phred as usize] as usize;
-            let cur_base = base_idx[j];
+            let cur_base = BASE_TO_IDX_LUT[sb[j] as usize];
             let ctx = context_id(j, prev_q, prev_q2, prev_base, cur_base);
 
             let slot = if ctx_slots[ctx] == u16::MAX {
@@ -464,7 +458,6 @@ pub fn decompress_qualities_ctx(
                 i, sb.len(), this_len
             );
         }
-        let base_idx = precompute_base_indices(&sb[..this_len]);
 
         // Get or create the output vec for this read
         let qual_bytes = if read_len > 0 {
@@ -479,7 +472,7 @@ pub fn decompress_qualities_ctx(
         let mut prev_base: u8 = 4; // sentinel
 
         for j in 0..this_len {
-            let cur_base = base_idx[j];
+            let cur_base = BASE_TO_IDX_LUT[sb[j] as usize];
             let ctx = context_id(j, prev_q, prev_q2, prev_base, cur_base);
 
             let slot = if ctx_slots[ctx] == u16::MAX {
@@ -625,7 +618,7 @@ mod tests {
         let compressed = enc.finish();
 
         let mut dec = RangeDecoder::new(&compressed);
-        let cum = &[0u32, 1, 2, 3, 4];
+        let cum = &[0u16, 1, 2, 3, 4];
         assert_eq!(dec.decode(cum, 4, 4), 0);
         assert_eq!(dec.decode(cum, 4, 4), 1);
         assert_eq!(dec.decode(cum, 4, 4), 2);
@@ -647,7 +640,7 @@ mod tests {
         let compressed = enc.finish();
 
         let mut dec = RangeDecoder::new(&compressed);
-        let cum = &[0u32, 97, 100];
+        let cum = &[0u16, 97, 100];
         for &expected in &syms {
             let got = dec.decode(cum, 2, total);
             assert_eq!(got, expected);
@@ -659,11 +652,11 @@ mod tests {
         let n = 20;
         let mut enc = RangeEncoder::new();
         let total = n as u32;
-        let cum: Vec<u32> = (0..=n).map(|i| i as u32).collect();
+        let cum: Vec<u16> = (0..=n).map(|i| i as u16).collect();
 
         let syms: Vec<usize> = (0..5000).map(|i| (i * 7 + 3) % n).collect();
         for &s in &syms {
-            enc.encode(cum[s], cum[s + 1] - cum[s], total);
+            enc.encode(cum[s] as u32, (cum[s + 1] - cum[s]) as u32, total);
         }
         let compressed = enc.finish();
 

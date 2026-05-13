@@ -117,7 +117,7 @@ impl Default for AdvancedOptions {
             dict_training: false,
             dict_size: 64,
             compression_level: 3,
-            quality_compressor: QualityCompressor::Bsc,
+            quality_compressor: QualityCompressor::Auto,
             sequence_compressor: SequenceCompressor::Bsc,
             header_compressor: HeaderCompressor::Columnar,
             bsc_static: false,
@@ -185,7 +185,7 @@ pub enum QualityMode {
 pub enum QualityCompressor {
     /// Legacy zstd (faster, ~20% larger)
     Zstd = 0,
-    /// BSC/BWT (best compression, default)
+    /// BSC/BWT (best raw byte-stream compression)
     Bsc = 1,
     /// OpenZL format-aware compression
     OpenZl = 2,
@@ -193,6 +193,9 @@ pub enum QualityCompressor {
     Fqzcomp = 3,
     /// Context-adaptive range coding
     QualityCtx = 4,
+    /// Pick automatically: QualityCtx for lossless inputs >=100k reads, else Bsc.
+    /// Never stored in the archive — resolved to a concrete choice at compress time.
+    Auto = 5,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize_repr, Deserialize_repr)]

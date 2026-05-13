@@ -87,11 +87,13 @@ fn auto_select_level() -> u8 {
         .map(|n| n.get())
         .unwrap_or(8);
 
+    // Cap auto-select at 3. Empirically on 10M-read Illumina WGS, levels 4/5
+    // produce identical archives to level 3 but decompress 2-3x slower (larger
+    // BSC blocks → fewer blocks → less decompress parallelism). Users who want
+    // higher levels can opt in explicitly; auto picks the empirical sweet spot.
     let max_level_for_cores: u8 = if cores < 4 { 1 }
         else if cores < 8 { 2 }
-        else if cores < 16 { 3 }
-        else if cores < 32 { 4 }
-        else { 5 };
+        else { 3 };
 
     let mut selected = 1u8;
     for level in &ULTRA_LEVELS {
