@@ -70,7 +70,7 @@ fn main() {
     {
         let seqs_bytes: Vec<Vec<u8>> = sequences.iter().map(|s| s.as_bytes().to_vec()).collect();
         let t = Instant::now();
-        let packed = qz_lib::compression::dna_utils::pack_dna_2bit(&seqs_bytes);
+        let packed = qz_lib::compression::dna_utils::pack_dna_2bit(&seqs_bytes).unwrap();
         let pack_time = t.elapsed();
 
         let t = Instant::now();

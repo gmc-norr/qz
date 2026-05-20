@@ -12,6 +12,11 @@ pub mod debruijn;
 pub mod dna_utils;
 pub mod fqzcomp;
 pub mod greedy_contig;
+// Bench-only alternative quality coder. Production uses `quality_ctx` (no
+// trailing -ext). Two near-identical names exist to keep the bench comparison
+// honest, but the experimental gate prevents this module from leaking into
+// production builds, where a future contributor might pick the wrong one.
+#[cfg(feature = "experimental")]
 pub mod quality_context;
 pub mod openzl;
 pub mod template;
@@ -48,6 +53,13 @@ const ARCHIVE_VERSION: u8 = 2;
 const V2_PREFIX_SIZE: usize = 8;
 /// I/O buffer size for reading archive files during decompression
 const IO_BUFFER_SIZE: usize = 8 * 1024 * 1024; // 8 MB
+
+/// Read a single byte from `data` at `offset`, returning an error on truncation.
+fn read_u8(data: &[u8], offset: usize) -> Result<u8> {
+    data.get(offset)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("truncated archive at offset {offset}"))
+}
 
 /// Read a little-endian u16 from `data` at `offset`, returning an error on truncation.
 fn read_le_u16(data: &[u8], offset: usize) -> Result<u16> {
@@ -694,7 +706,47 @@ fn decompress_headers_dispatch(
 }
 
 pub fn compress(args: &CompressConfig) -> Result<()> {
-    compress_impl::compress(args)
+    // Stdio output bypasses the atomic-write path — pipe writes can't be renamed.
+    if crate::cli::is_stdio_path(&args.output) {
+        return compress_impl::compress(args);
+    }
+
+    if args.output.exists() && !args.force {
+        anyhow::bail!(
+            "Output file already exists: {}\nUse --force to overwrite",
+            args.output.display()
+        );
+    }
+
+    // Compress to a sibling .tmp file, then atomically rename on success.
+    // A drop guard removes the tmp file on any error or panic mid-compress so
+    // a crash never leaves a half-written archive at the user's target path.
+    let tmp_output = {
+        let mut name = args.output.file_name()
+            .ok_or_else(|| anyhow::anyhow!("output path has no file name: {}", args.output.display()))?
+            .to_os_string();
+        name.push(".tmp");
+        args.output.with_file_name(name)
+    };
+
+    struct TmpCleanup(std::path::PathBuf);
+    impl Drop for TmpCleanup {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+    let tmp_guard = TmpCleanup(tmp_output.clone());
+
+    let mut tmp_args = args.clone();
+    tmp_args.output = tmp_output.clone();
+    compress_impl::compress(&tmp_args)?;
+
+    // Success path: rename tmp → final. Disarm the drop guard first so a rename
+    // failure (only e.g. cross-device) re-arms it ourselves and reports clearly.
+    std::mem::forget(tmp_guard);
+    if let Err(e) = std::fs::rename(&tmp_output, &args.output) {
+        let _ = std::fs::remove_file(&tmp_output);
+        anyhow::bail!("Failed to rename temp file to {}: {}", args.output.display(), e);
+    }
+    Ok(())
 }
 
 

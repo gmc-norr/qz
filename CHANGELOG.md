@@ -2,10 +2,77 @@
 
 ## Unreleased
 
+### Security / Safety
+
+- **Archive parser hardened against malformed input** — `parse_archive_header` previously indexed raw bytes (`data[offset]`) after offsets were advanced by attacker-controlled `num_lengths * 4`; a crafted archive could trigger an index-out-of-bounds panic (DoS). All single-byte reads now go through a bounds-checked `read_u8` helper; the read-lengths block is validated against the archive size before being skipped.
+- **`u8_to_u32` no longer panics on truncated payload** — Both `arithmetic_sequence` and `arithmetic_quality` decoders previously asserted that the compressed payload length was a multiple of 4, panicking the process on corrupt input. They now return a clear `anyhow::Error`.
+- **`bsc::decompress_parallel` rejects pathological `num_blocks`** — A hostile archive declaring `num_blocks = 0xFFFFFFFF` would previously try to `Vec::with_capacity(~32 GB)` of slice slots. The block count is now validated against the remaining payload before allocation.
+- **`pack_dna_2bit` returns an error on IUPAC bases** — Ambiguity codes (R, Y, S, W, K, M, B, D, H, V) were silently mapped to A by the 2-bit codec and to N by the 4-bit codec, corrupting reads round-trip. The codec now returns a clear error; callers needing IUPAC support must route via the raw+BSC sequence path.
+- **`debruijn` decoder bails on out-of-bounds mismatch position** — Previously a mismatch position past the read length was silently dropped while subsequent deltas continued from the bad position, irreversibly corrupting later mismatches. Now errors explicitly.
+- **`quality_model` and `quality_delta` reject Phred > 93** — The decoders clamp reconstructions to `0..=93`, so encoding higher values silently corrupted PacBio/ONT data. Encoders now refuse such inputs with a clear message pointing at the offending byte.
+- **Lossy quality modes emit a `warn!` log at compression start** — `Discard`, `IlluminaBin`, `Illumina4`, `Binary`, and `--no-quality` previously ran silently; the user-facing log now states clearly that the archived qualities are not recoverable.
+- **Mismatch positions widened from `u16` to `usize` in memory** — `debruijn` and `greedy_contig` encoders held mismatch positions as `u16`, which silently truncated for reads > 65535 bp. The wire format is unchanged (varint), so existing archives still decompress.
+- **Output atomic-write + `--force` flag** — `qz compress` (and now `bz compress` / `bz decompress` / `bz extract`) refuses to overwrite an existing output unless `--force` is set. Internally writes to a sibling `.tmp` file and atomically renames on success; a crash mid-compress no longer leaves a half-written archive at the user's target path.
+- **CLI flag combinations now validated** — `--fasta` + `--quality-mode <non-lossless>` and `--no-quality` + `--quality-mode <non-lossless>` were silently accepted (with surprising semantics). They now error at parse time.
+
+### libbsc Threading
+
+- **`LIBBSC_FEATURE_MULTITHREADING` no longer enabled at `bsc_init`** — Initializing libbsc with the multithreading flag pinned process-wide OpenMP state and contradicted CLAUDE.md's "rayon owns parallelism" rule. Per-call enablement on the two MT entry points works without it. `ensure_initialized` now propagates init failure as a `Result` instead of warning and continuing into UB territory.
+- **`compress_with_params` / `compress_mt_inner` now `shrink_to_fit()` the output buffer** — Without this, the worst-case `input_size + 1052` capacity per block could pile up to ~35 GB of unused headroom on 1400-block streams (documented in CLAUDE.md but not previously honored at the source).
+
+### Python bindings (qz)
+
+- **GIL released around long-running `compress`/`decompress` calls** — Previously a multi-minute compression call blocked the entire Python interpreter (no other thread, no signal handling, no Ctrl-C). Now wrapped in `py.allow_threads(|| ...)`.
+- **`tracing` subscriber installed on first call** — `info!`/`warn!` messages from qz-lib (including the new lossy-quality warning) used to be silently dropped; they now reach stderr. Honors `RUST_LOG`.
+- **`pyproject.toml` enriched** — Added classifiers, readme, license, project URLs, keywords, and explicit `module-name`. Version bumped to 0.2.0 to match the workspace.
+- **`compress(..., force=False)` parameter** — Mirrors the CLI flag; defaults to refusing to overwrite an existing output.
+
+### FASTQ Reader
+
+- **UTF-8 BOM stripped from the first record** — Some editors and Windows tools prepend EF BB BF; without stripping it landed in the first ID and the next record's `+` check failed with a misleading "expected '+' separator" error. Now silently consumed.
+- **Edge-case tests added** — CRLF line endings, BOM, and truncated record handling are now covered by unit tests.
+- **Error message no longer debug-prints paths** — `Failed to open file: "/path/x"` (with quotes) is now `Failed to open file: /path/x`.
+
+### Experimental code
+
+- **`compress_sequences_template_hybrid` gated behind `experimental` feature** — This encoder writes a "THB1" archive but has no corresponding decompressor. The function is now `#[cfg(feature = "experimental")]` so production builds cannot accidentally produce unreadable archives. `qz-bench` enables the feature explicitly.
+- **`quality_context` module also gated behind `experimental`** — Bench-only alternative quality coder, distinct from the production `quality_ctx`. Now feature-gated so a future contributor cannot pick the wrong file by accident.
+
+### bz-cli
+
+- **`bz verify` shows unknown compressor codes** — Previously rendered any non-zero byte as `zstd`, hiding archive corruption.
+- **All three subcommands accept `-f`/`--force`** — Compress, Decompress, and Extract refuse to overwrite an existing output unless the flag is set. Extract additionally checks all three derived outputs (`{prefix}_R1.qz`, `_R2.qz`, `_SE.qz`).
+
+### bz-lib
+
+- **`extract` pair-buffer hard-capped at 50M unpaired reads** — Previously only warned at 10M and grew unboundedly, OOM-ing the host on name-mismatched BAMs. Now errors with a clear pointer at `samtools sort -n`.
+
+### Build
+
+- **`build.rs` checks for `third_party/libbsc` and `third_party/htscodecs` submodules** — Clearly tells the user to run `git submodule update --init --recursive` instead of failing with an opaque `cc` error mid-compile.
+
+### Internal
+
+- **`fast_ultra` field removed** — Was marked deprecated but still wired; now gone. Use `--ultra 2` instead.
+- **Unified thread-default rendering in qz-cli** — `--threads` now defaults to `num_cpus()` in all three subcommands (was inconsistent between `"0"` and `num_cpus()`).
+- **`compress_window` documentation matches the default** — Comment claimed default 2; actual default is 4.
+- **`fqzcomp::decompress` short-circuits on `num_reads == 0`** — Avoids passing a zero-length-Vec ptr into htscodecs.
+- **`encode_reads` (debruijn) sorts unitig IDs before assigning compact IDs** — Was iterating `FxHashSet` directly, producing nondeterministic archive bytes for identical inputs.
+
 ### Breaking Changes
 
 - **Archive format v2**: Archives now start with an 8-byte prefix (`QZ\x02\x00` + header_size u32 LE). Archives produced by previous versions are no longer readable.
 - **FastqRecord uses `Vec<u8>`**: `id`, `sequence`, and `quality` fields are now byte vectors instead of `String`.
+- **`CompressConfig.force: bool` added** — Default `false`; existing constructors using `..CompressConfig::default()` are unaffected. Library callers must opt in if they want to overwrite.
+- **`CompressConfig.advanced.fast_ultra` removed** — Use `ultra: Some(2)` instead.
+- **`quality_model::encode_with_model` and `quality_delta::encode_quality_deltas` return `Result`** — Bail on Phred > 93 rather than silently corrupting.
+- **`dna_utils::pack_dna_2bit` returns `Result`** — Bails on IUPAC bases rather than silently corrupting.
+- **`debruijn::encode_reads` and `greedy_contig::encode_reads` return `Result`** — Propagate from the changed `pack_dna_2bit`.
+
+### Known limitations (not fixed in this pass)
+
+- **Casava header columnar codec uses `u16` for tile/x/y** — NovaSeq X x/y coordinates can exceed 65535. Such headers correctly fall back to raw BSC (no data loss) and now emit a one-line `warn!` so operators can see the slower path. A v0x03 format with `u32` fields would be needed to compress these as efficiently as standard Illumina headers.
+- **Bench-only OpenZL graph variants ship in qz-lib** — `openzl::compress_ace/dna_numeric/clustering/...` are called only from `bench_openzl_graphs`. Left in qz-lib for now (no correctness impact; small binary-size cost).
 
 ### Added
 

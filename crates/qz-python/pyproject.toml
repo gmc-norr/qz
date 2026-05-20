@@ -4,9 +4,35 @@ build-backend = "maturin"
 
 [project]
 name = "qz"
-version = "0.1.0"
-description = "High-performance FASTQ compression"
+version = "0.2.0"
+description = "High-performance FASTQ compression (BSC/BWT + columnar encoding)"
+readme = "README.md"
 requires-python = ">=3.8"
+license = { text = "See LICENSE file" }
+authors = [{ name = "QZ Contributors" }]
+keywords = ["fastq", "bioinformatics", "compression", "genomics", "bsc", "bwt"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/qz"
+Repository = "https://github.com/your-org/qz"
+Issues = "https://github.com/your-org/qz/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+module-name = "qz"

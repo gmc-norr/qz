@@ -12,6 +12,11 @@ name = "qz_lib"
 [features]
 default = []
 cuda = []
+# Enables experimental encoders that are not (yet) round-trippable.
+# Currently gates `compress_sequences_template_hybrid` — it writes a "THB1"
+# archive but no decompressor exists, so building with this feature MUST NOT be
+# used for archives a downstream tool needs to read back.
+experimental = []
 
 [dependencies]
 anyhow.workspace = true

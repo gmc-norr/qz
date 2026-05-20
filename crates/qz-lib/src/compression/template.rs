@@ -886,6 +886,11 @@ fn map_reads_to_templates_syncmer(
 ///   - Consensus: 2-bit packed templates
 ///
 /// This avoids inflating the BSC stream with \0 bytes for mapped reads.
+///
+/// **Experimental**: the encoder writes a "THB1" archive but no matching
+/// decompressor exists. Gated behind the `experimental` feature so production
+/// builds cannot accidentally produce unreadable archives.
+#[cfg(feature = "experimental")]
 pub fn compress_sequences_template_hybrid(
     sequences: &[String],
     params: &TemplateParams,
@@ -1046,7 +1051,7 @@ pub fn compress_sequences_template_hybrid(
 
     // Template consensus for decompression
     let consensus_seqs: Vec<Vec<u8>> = used_templates.iter().map(|t| t.sequence.clone()).collect();
-    let consensus_bytes = pack_dna_2bit(&consensus_seqs);
+    let consensus_bytes = pack_dna_2bit(&consensus_seqs)?;
 
     // Step 5: BSC-compress all streams
     eprintln!("  Step 5: BSC-compressing...");

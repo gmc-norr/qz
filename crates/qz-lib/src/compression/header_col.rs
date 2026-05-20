@@ -61,8 +61,38 @@ pub fn compress_headers_columnar(headers: &[&str]) -> Result<Vec<u8>> {
     match format {
         Some(HeaderFormat::Sra) => compress_sra(headers),
         Some(HeaderFormat::Casava) => compress_casava(headers),
-        None => compress_raw_fallback(headers),
+        None => {
+            // Warn once if the header *looks* Casava-shaped but a numeric field
+            // doesn't fit u16 — NovaSeq X x/y can reach ~70k. We still compress
+            // correctly via the raw BSC fallback, just less compactly.
+            if looks_like_overflowing_casava(headers[0]) {
+                tracing::warn!(
+                    "Header field exceeds u16 (likely NovaSeq X x/y coordinate); \
+                     falling back to raw header BSC encoding (correct, but ~5-10% larger)."
+                );
+            }
+            compress_raw_fallback(headers)
+        }
     }
+}
+
+/// Returns true if the first header looks Casava-shaped except that one of the
+/// numeric fields (lane/tile/x/y) overflows u16. Used only for the diagnostic
+/// warning when the columnar fast path falls back to raw BSC.
+fn looks_like_overflowing_casava(header: &str) -> bool {
+    let without_at = header.strip_prefix('@').unwrap_or(header);
+    let name_part = without_at.split_once(' ').map(|(n, _)| n).unwrap_or(without_at);
+    let fields: Vec<&str> = name_part.split(':').collect();
+    if fields.len() < 7 { return false; }
+    // Wider parses must succeed but at least one must overflow the u16-based codec.
+    let lane_u32 = fields[3].parse::<u32>().ok();
+    let tile_u32 = fields[4].parse::<u32>().ok();
+    let x_u32 = fields[5].parse::<u32>().ok();
+    let y_u32 = fields[6].parse::<u32>().ok();
+    matches!((lane_u32, tile_u32, x_u32, y_u32), (Some(_), Some(_), Some(_), Some(_)))
+        && (tile_u32.unwrap() > u16::MAX as u32
+            || x_u32.unwrap() > u16::MAX as u32
+            || y_u32.unwrap() > u16::MAX as u32)
 }
 
 /// Decompress columnar-encoded headers.

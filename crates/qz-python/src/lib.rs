@@ -1,9 +1,25 @@
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
 use std::path::PathBuf;
+use std::sync::Once;
 
 use qz_lib::cli::{CompressConfig, DecompressConfig, QualityMode};
 use qz_lib::compression;
+
+/// Install a tracing subscriber once per process so `info!`/`warn!` from
+/// qz-lib reach stderr instead of being silently dropped. Honors RUST_LOG.
+fn ensure_tracing_initialized() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        use tracing_subscriber::EnvFilter;
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("info"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .try_init();
+    });
+}
 
 /// Compress a FASTQ file to QZ format.
 ///
@@ -18,6 +34,7 @@ use qz_lib::compression;
 ///     no_quality: Discard quality scores (default: False)
 ///     threads: Number of threads (0 = auto, default: 0)
 ///     working_dir: Working directory for temporary files (default: ".")
+///     force: Overwrite output if it exists (default: False)
 ///
 /// Example:
 ///     >>> import qz
@@ -33,8 +50,11 @@ use qz_lib::compression;
     no_quality = false,
     threads = 0,
     working_dir = ".",
+    force = false,
 ))]
+#[allow(clippy::too_many_arguments)]
 fn compress(
+    py: Python<'_>,
     input: String,
     output: String,
     quality_mode: &str,
@@ -43,7 +63,9 @@ fn compress(
     no_quality: bool,
     threads: usize,
     working_dir: &str,
+    force: bool,
 ) -> PyResult<()> {
+    ensure_tracing_initialized();
     let qmode = parse_quality_mode(quality_mode)?;
 
     let config = CompressConfig {
@@ -55,10 +77,16 @@ fn compress(
         fasta,
         quality_mode: qmode,
         ultra,
+        force,
         ..CompressConfig::default()
     };
 
-    compression::compress(&config).map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+    // Release the GIL during compression. Without this, a multi-minute
+    // compress call would block the entire Python interpreter — no other
+    // thread runs, signals (Ctrl-C) are not delivered, and any concurrent
+    // Python work effectively halts.
+    py.allow_threads(|| compression::compress(&config))
+        .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
 }
 
 /// Decompress a QZ archive to FASTQ format.
@@ -85,6 +113,7 @@ fn compress(
     gzip_level = 6,
 ))]
 fn decompress(
+    py: Python<'_>,
     input: String,
     output: String,
     working_dir: &str,
@@ -92,6 +121,7 @@ fn decompress(
     gzipped: bool,
     gzip_level: u32,
 ) -> PyResult<()> {
+    ensure_tracing_initialized();
     let num_threads = if threads == 0 {
         qz_lib::cli::num_cpus()
     } else {
@@ -107,7 +137,9 @@ fn decompress(
         gzip_level,
     };
 
-    compression::decompress(&config).map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
+    // See compress() above for the GIL rationale.
+    py.allow_threads(|| compression::decompress(&config))
+        .map_err(|e| PyRuntimeError::new_err(format!("{:?}", e)))
 }
 
 /// Get QZ version string.

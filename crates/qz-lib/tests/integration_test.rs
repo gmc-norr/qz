@@ -1294,6 +1294,44 @@ fn test_decompress_invalid_compressor_codes() {
 }
 
 #[test]
+fn test_compress_refuses_to_overwrite_without_force() {
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, "@r1\nACGT\n+\nIIII\n").unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressConfig {
+        input: vec![input_fastq.clone()],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ..CompressConfig::default()
+    };
+
+    qz_lib::compression::compress(&compress_args).unwrap();
+    let original_size = fs::metadata(&archive_path).unwrap().len();
+
+    // Second compress with the same output must refuse, not overwrite.
+    let err = qz_lib::compression::compress(&compress_args).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("already exists"), "unexpected error: {msg}");
+    assert_eq!(fs::metadata(&archive_path).unwrap().len(), original_size,
+        "existing archive must be left untouched");
+
+    // With --force, it should overwrite cleanly.
+    let mut forced = compress_args.clone();
+    forced.force = true;
+    qz_lib::compression::compress(&forced).unwrap();
+    assert!(archive_path.exists());
+
+    // And no .tmp sibling should be left behind on success.
+    let tmp = archive_path.with_file_name("test.qz.tmp");
+    assert!(!tmp.exists(), "tmp file should be cleaned up on success");
+}
+
+#[test]
 fn test_decompress_too_small_archive() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
@@ -1309,6 +1347,26 @@ fn test_decompress_too_small_archive() {
 // ========================================
 // EDGE CASE TESTS
 // ========================================
+
+#[test]
+fn test_pack_dna_2bit_rejects_iupac() {
+    // pack_dna_2bit must refuse IUPAC ambiguity codes instead of silently
+    // mapping them to A or N (data corruption). Default raw+BSC path stays
+    // tolerant; this guard only fires for the 2-bit codec invoked by
+    // debruijn/greedy/template hybrids.
+    use qz_lib::compression::dna_utils::pack_dna_2bit;
+    let pure = vec![b"ACGT".to_vec()];
+    assert!(pack_dna_2bit(&pure).is_ok(), "pure ACGT must pack");
+    let with_n = vec![b"ACGTN".to_vec()];
+    assert!(pack_dna_2bit(&with_n).is_ok(), "ACGTN must pack");
+    for &iupac in b"RYSWKMBDHV".iter() {
+        let seq = vec![iupac, b'A', b'C', b'G'];
+        let err = pack_dna_2bit(&[seq])
+            .expect_err(&format!("IUPAC {} must be rejected", iupac as char));
+        let msg = format!("{err}");
+        assert!(msg.contains("unsupported base"), "unexpected error: {msg}");
+    }
+}
 
 #[test]
 fn test_all_n_bases() {

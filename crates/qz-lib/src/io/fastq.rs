@@ -28,6 +28,7 @@ pub struct FastqReader<R: BufRead> {
     reader: R,
     is_fasta: bool,
     buffer: Vec<u8>,
+    bom_checked: bool,
 }
 
 // Enum to hold either a plain file reader, gzipped reader, or stdin reader
@@ -81,7 +82,7 @@ impl FastqReader<FileReader> {
     /// Open a FASTQ file (auto-detects gzip)
     pub fn from_path(path: impl AsRef<Path>, is_fasta: bool) -> Result<Self> {
         let file = std::fs::File::open(path.as_ref())
-            .with_context(|| format!("Failed to open file: {:?}", path.as_ref()))?;
+            .with_context(|| format!("Failed to open file: {}", path.as_ref().display()))?;
 
         // Check if file is gzipped by reading magic bytes
         let mut buffered = BufReader::with_capacity(4 * 1024 * 1024, file);
@@ -126,6 +127,7 @@ impl<R: BufRead> FastqReader<R> {
             reader,
             is_fasta,
             buffer: Vec::with_capacity(512), // Pre-allocate for typical read lengths
+            bom_checked: false,
         }
     }
 
@@ -145,6 +147,16 @@ impl<R: BufRead> FastqReader<R> {
         let bytes_read = self.reader.read_until(b'\n', &mut self.buffer)?;
         if bytes_read == 0 {
             return Ok(None); // EOF
+        }
+        // Strip a UTF-8 BOM (EF BB BF) from the start of the very first line.
+        // Some editors and Windows tools add it; without stripping it lands in
+        // the first record's ID and the next record's '+' check then fails
+        // with a misleading "expected '+' separator" message.
+        if !self.bom_checked {
+            self.bom_checked = true;
+            if self.buffer.starts_with(&[0xEF, 0xBB, 0xBF]) {
+                self.buffer.drain(..3);
+            }
         }
         Self::trim_newline(&mut self.buffer);
         let id = self.buffer.clone();
@@ -257,5 +269,53 @@ mod tests {
         assert_eq!(record1.id, b">seq1");
         assert_eq!(record1.sequence, b"ACGT");
         assert!(record1.quality.is_none());
+    }
+
+    #[test]
+    fn test_crlf_line_endings() {
+        // Windows-style CRLF must not appear in the stored bytes.
+        let data = b"@r1\r\nACGT\r\n+\r\nIIII\r\n@r2\r\nTGCA\r\n+\r\nJJJJ\r\n";
+        let cursor = BufReader::new(Cursor::new(data));
+        let mut reader = FastqReader::new(cursor, false);
+        let r1 = reader.next().unwrap().unwrap();
+        assert_eq!(r1.id, b"@r1");
+        assert_eq!(r1.sequence, b"ACGT");
+        assert_eq!(r1.quality, Some(b"IIII".to_vec()));
+        let r2 = reader.next().unwrap().unwrap();
+        assert_eq!(r2.id, b"@r2");
+        assert_eq!(r2.sequence, b"TGCA");
+        assert_eq!(r2.quality, Some(b"JJJJ".to_vec()));
+        assert!(reader.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_utf8_bom_stripped() {
+        // EF BB BF prepended; without stripping, the first ID would start with
+        // garbage bytes and the next record's '+' check would fail confusingly.
+        let mut data = vec![0xEF, 0xBB, 0xBF];
+        data.extend_from_slice(b"@r1\nACGT\n+\nIIII\n@r2\nTGCA\n+\nJJJJ\n");
+        let cursor = BufReader::new(Cursor::new(data));
+        let mut reader = FastqReader::new(cursor, false);
+        let r1 = reader.next().unwrap().unwrap();
+        assert_eq!(r1.id, b"@r1");
+        let r2 = reader.next().unwrap().unwrap();
+        assert_eq!(r2.id, b"@r2");
+    }
+
+    #[test]
+    fn test_truncated_at_quality_line() {
+        // EOF in the middle of a record must error, not silently emit a partial record.
+        let data = b"@r1\nACGT\n+\n";
+        let cursor = BufReader::new(Cursor::new(data));
+        let mut reader = FastqReader::new(cursor, false);
+        assert!(reader.next().is_err(), "truncated quality line must error");
+    }
+
+    #[test]
+    fn test_truncated_at_separator() {
+        let data = b"@r1\nACGT\n";
+        let cursor = BufReader::new(Cursor::new(data));
+        let mut reader = FastqReader::new(cursor, false);
+        assert!(reader.next().is_err(), "truncated separator line must error");
     }
 }

@@ -34,6 +34,8 @@ pub struct CompressConfig {
     pub quality_mode: QualityMode,
     /// Ultra compression with optional level (1-5, 0=auto)
     pub ultra: Option<u8>,
+    /// Overwrite output if it already exists (default false — refuse to clobber)
+    pub force: bool,
     /// Advanced/experimental options (compressor selection, encoding variants, etc.)
     pub advanced: AdvancedOptions,
 }
@@ -49,6 +51,7 @@ impl Default for CompressConfig {
             fasta: false,
             quality_mode: QualityMode::Lossless,
             ultra: None,
+            force: false,
             advanced: AdvancedOptions::default(),
         }
     }
@@ -94,18 +97,17 @@ pub struct AdvancedOptions {
     pub sequence_delta: bool,
     /// Local reordering with delta encoding
     pub local_reorder: bool,
-    /// Deprecated: use ultra level 2 instead
-    pub fast_ultra: bool,
     /// Number of reads per quality_ctx sub-block (default 500K)
     pub quality_ctx_block_size: usize,
     /// BSC block size in MB for parallel compression (default 25)
     pub bsc_block_size_mb: usize,
     /// Records per chunk for chunked compression (default 2_500_000)
     pub chunk_records: usize,
-    /// Number of chunks to compress simultaneously (default 2).
+    /// Number of chunks to compress simultaneously (default 4).
     /// Each concurrent chunk submits its BSC blocks to the shared rayon pool,
-    /// keeping more threads busy. window=2 raises utilisation from ~49% to ~97%
-    /// on 72 cores (35 blocks/chunk × 2 = 70 concurrent tasks).
+    /// keeping more threads busy. A window ≥ 2 raises 72-core utilisation from
+    /// ~49% to ~97% (35 blocks/chunk × window concurrent tasks). The default
+    /// of 4 trades extra RAM for stable saturation when chunk sizes are uneven.
     pub compress_window: usize,
 }
 
@@ -128,7 +130,6 @@ impl Default for AdvancedOptions {
             sequence_hints: false,
             sequence_delta: false,
             local_reorder: false,
-            fast_ultra: false,
             quality_ctx_block_size: 500_000,
             bsc_block_size_mb: 25,
             chunk_records: 2_500_000,

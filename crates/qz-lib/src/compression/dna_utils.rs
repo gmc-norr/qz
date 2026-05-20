@@ -141,18 +141,36 @@ pub fn shannon_entropy(seq: &[u8]) -> f64 {
 /// Pack DNA sequences to 2-bit format (4 bases per byte)
 /// - No N: 2-bit (4 bases/byte) A=0, C=1, G=2, T=3
 /// - Has N: 4-bit (2 bases/byte) A=0, G=1, C=2, T=3, N=4 (C/G swapped!)
-pub fn pack_dna_2bit(sequences: &[Vec<u8>]) -> Vec<u8> {
+///
+/// Returns an error if any sequence contains a non-ACGTN base (e.g. IUPAC
+/// ambiguity codes RYSWKMBDHV). Silently round-tripping those as N or A would
+/// corrupt user data; callers that need IUPAC support must use a different
+/// encoder (raw + BSC).
+pub fn pack_dna_2bit(sequences: &[Vec<u8>]) -> Result<Vec<u8>> {
     let mut packed = Vec::new();
 
     // Write number of sequences
     write_varint(&mut packed, sequences.len() as u64);
 
-    for seq in sequences {
+    for (seq_idx, seq) in sequences.iter().enumerate() {
         let len = seq.len();
         write_varint(&mut packed, len as u64);
 
-        // Check if sequence contains N
-        let has_n = seq.iter().any(|&b| !matches!(b, b'A' | b'a' | b'C' | b'c' | b'G' | b'g' | b'T' | b't'));
+        // Classify: pure ACGT, ACGTN, or contains an unsupported byte (IUPAC etc.)
+        let mut has_n = false;
+        for &b in seq {
+            match b {
+                b'A' | b'a' | b'C' | b'c' | b'G' | b'g' | b'T' | b't' => {}
+                b'N' | b'n' => has_n = true,
+                other => anyhow::bail!(
+                    "pack_dna_2bit: sequence {} contains unsupported base 0x{:02x} ({:?}); \
+                     only ACGTN are supported (IUPAC ambiguity codes must use the raw+BSC path)",
+                    seq_idx,
+                    other,
+                    other as char,
+                ),
+            }
+        }
 
         // Write encoding flag
         packed.push(if has_n { 1 } else { 0 });
@@ -163,12 +181,13 @@ pub fn pack_dna_2bit(sequences: &[Vec<u8>]) -> Vec<u8> {
             for chunk in seq.chunks(2) {
                 let mut byte = 0u8;
                 for (i, &base) in chunk.iter().enumerate() {
-                    let val = match base {
+                    let val: u8 = match base {
                         b'A' | b'a' => 0,
                         b'G' | b'g' => 1,
                         b'C' | b'c' => 2,
                         b'T' | b't' => 3,
-                        _ => 4, // N
+                        b'N' | b'n' => 4,
+                        _ => unreachable!("classified above"),
                     };
                     byte |= val << (4 * i); // 4 bits per base
                 }
@@ -180,12 +199,12 @@ pub fn pack_dna_2bit(sequences: &[Vec<u8>]) -> Vec<u8> {
             for chunk in seq.chunks(4) {
                 let mut byte = 0u8;
                 for (i, &base) in chunk.iter().enumerate() {
-                    let val = match base {
+                    let val: u8 = match base {
                         b'A' | b'a' => 0,
                         b'C' | b'c' => 1,
                         b'G' | b'g' => 2,
                         b'T' | b't' => 3,
-                        _ => 0, // Should never happen
+                        _ => unreachable!("classified above"),
                     };
                     byte |= val << (2 * i); // 2 bits per base
                 }
@@ -194,7 +213,7 @@ pub fn pack_dna_2bit(sequences: &[Vec<u8>]) -> Vec<u8> {
         }
     }
 
-    packed
+    Ok(packed)
 }
 
 /// Unpack DNA sequences from 2-bit/4-bit packed format.

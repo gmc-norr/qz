@@ -103,6 +103,11 @@ pub fn decompress(compressed: &[u8], num_reads: usize) -> Result<(Vec<u8>, Vec<i
     if compressed.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
+    // Zero-length lengths Vec gives a dangling-but-aligned ptr. Whether htscodecs
+    // dereferences it depends on its internal mode, so short-circuit here.
+    if num_reads == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
     let mut out_size: libc::size_t = 0;
     if num_reads > libc::c_int::MAX as usize {

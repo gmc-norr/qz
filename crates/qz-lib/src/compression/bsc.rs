@@ -124,23 +124,36 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Ensure bsc_init is called exactly once
+/// Ensure bsc_init is called exactly once.
+///
+/// Init does NOT include `LIBBSC_FEATURE_MULTITHREADING` — that would pin process-wide
+/// OpenMP state and break the project's "rayon owns parallelism" invariant
+/// (CLAUDE.md). Per-call enablement on the few MT entry points works without it.
 static BSC_INIT: Once = Once::new();
+static BSC_INIT_RESULT: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MIN);
 
-fn ensure_initialized() {
+fn ensure_initialized() -> Result<()> {
     BSC_INIT.call_once(|| {
-        unsafe {
-            // Init with both features so we can use either per-call
-            let features = LIBBSC_FEATURE_FASTMODE | LIBBSC_FEATURE_MULTITHREADING | cuda_feature();
-            let result = bsc_init(features);
-            if result != LIBBSC_NO_ERROR {
-                eprintln!("Warning: BSC initialization failed with code {}", result);
-            }
-        }
+        let features = LIBBSC_FEATURE_FASTMODE | cuda_feature();
+        let result = unsafe { bsc_init(features) };
+        BSC_INIT_RESULT.store(result, std::sync::atomic::Ordering::SeqCst);
     });
+    let result = BSC_INIT_RESULT.load(std::sync::atomic::Ordering::SeqCst);
+    if result != LIBBSC_NO_ERROR {
+        anyhow::bail!("BSC initialization failed with code {}", result);
+    }
+    Ok(())
 }
 
-/// Max OpenMP threads for BSC-internal multithreading (compress_adaptive_mt only).
+/// Max OpenMP threads for BSC-internal multithreading.
+///
+/// Used only by the `*_mt` entry points below. Those entry points MUST NOT be
+/// called concurrently from rayon worker threads — they enable OpenMP per-call
+/// and call `omp_set_num_threads(BSC_MT_THREADS)`, which mutates a
+/// process-wide OpenMP team size. The combined effective parallelism is
+/// `(callers in flight) * BSC_MT_THREADS`; oversubscription past the physical
+/// CPU count is wasteful and can cause memory blowups inside libsais.
 const BSC_MT_THREADS: c_int = 12;
 
 /// Compress data using BSC (matching official SPRING settings)
@@ -157,7 +170,7 @@ pub fn compress_with_params(
     block_sorter: i32,
     coder: i32,
 ) -> Result<Vec<u8>> {
-    ensure_initialized();
+    ensure_initialized()?;
 
     if data.is_empty() {
         return Ok(vec![]);
@@ -187,6 +200,7 @@ pub fn compress_with_params(
     }
 
     output.truncate(compressed_size as usize);
+    output.shrink_to_fit();
     Ok(output)
 }
 
@@ -220,7 +234,7 @@ pub fn compress_adaptive_mt_no_lzp(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn compress_mt_inner(data: &[u8], lzp_hash_size: i32, lzp_min_len: i32) -> Result<Vec<u8>> {
-    ensure_initialized();
+    ensure_initialized()?;
 
     if data.is_empty() {
         return Ok(vec![]);
@@ -232,7 +246,8 @@ fn compress_mt_inner(data: &[u8], lzp_hash_size: i32, lzp_min_len: i32) -> Resul
     let mut output = vec![0u8; data.len() + LIBBSC_HEADER_SIZE + 1024];
 
     let compressed_size = unsafe {
-        // Limit OpenMP threads per BSC call (only affects MT path, not default rayon path)
+        // Limit OpenMP threads per BSC call (only affects MT path, not default rayon path).
+        // Side effect: mutates process-wide OMP team size — see BSC_MT_THREADS doc.
         omp_set_num_threads(BSC_MT_THREADS);
         bsc_compress(
             data.as_ptr(),
@@ -251,6 +266,7 @@ fn compress_mt_inner(data: &[u8], lzp_hash_size: i32, lzp_min_len: i32) -> Resul
     }
 
     output.truncate(compressed_size as usize);
+    output.shrink_to_fit();
     Ok(output)
 }
 
@@ -262,7 +278,7 @@ where
 {
     use rayon::prelude::*;
 
-    ensure_initialized();
+    ensure_initialized()?;
 
     if data.is_empty() {
         return Ok(vec![]);
@@ -334,6 +350,16 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
 
     let num_blocks = super::read_le_u32(data, 0)? as usize;
 
+    // Each block contributes at least 4 bytes of length prefix + 1 byte of payload.
+    // Reject obviously malformed inputs before we Vec::with_capacity(num_blocks).
+    if num_blocks > 0 && num_blocks.saturating_mul(5) > data.len().saturating_sub(4) {
+        anyhow::bail!(
+            "BSC parallel: num_blocks={} exceeds remaining payload ({} bytes)",
+            num_blocks,
+            data.len() - 4,
+        );
+    }
+
     // First pass: collect block slices (sequential, just pointer math)
     let mut offset = 4;
     let mut block_slices = Vec::with_capacity(num_blocks);
@@ -351,20 +377,16 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
         offset += block_len;
     }
 
-    // Second pass: decompress all blocks in parallel
-    let decompressed_blocks: Vec<Result<Vec<u8>>> = block_slices
+    // Second pass: decompress all blocks in parallel. Short-circuit on first error.
+    let decompressed_blocks: Vec<Vec<u8>> = block_slices
         .par_iter()
         .map(|block| decompress(block))
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
 
-    // Concatenate in order
-    let total_size: usize = decompressed_blocks.iter()
-        .filter_map(|r| r.as_ref().ok())
-        .map(|b| b.len())
-        .sum();
+    let total_size: usize = decompressed_blocks.iter().map(|b| b.len()).sum();
     let mut output = Vec::with_capacity(total_size);
-    for result in decompressed_blocks {
-        output.extend_from_slice(&result?);
+    for block in decompressed_blocks {
+        output.extend_from_slice(&block);
     }
 
     Ok(output)
@@ -382,7 +404,7 @@ pub fn decompress_mt(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn decompress_with_features(data: &[u8], features: c_int) -> Result<Vec<u8>> {
-    ensure_initialized();
+    ensure_initialized()?;
 
     if data.is_empty() {
         return Ok(vec![]);

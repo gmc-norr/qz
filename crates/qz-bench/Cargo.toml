@@ -7,7 +7,9 @@ license.workspace = true
 description = "Benchmarking tools for QZ FASTQ compression"
 
 [dependencies]
-qz-lib.workspace = true
+# Benches exercise experimental encoders (e.g. compress_sequences_template_hybrid)
+# that production builds intentionally do not expose.
+qz-lib = { workspace = true, features = ["experimental"] }
 rayon.workspace = true
 rustc-hash.workspace = true
 syncmers.workspace = true

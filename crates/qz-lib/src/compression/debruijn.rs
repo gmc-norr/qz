@@ -427,12 +427,16 @@ fn encode_reads(
     sequences: &[Vec<u8>],
     unitigs: &[Unitig],
     mappings: &[Option<ReadMapping>],
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
-    // Determine which unitigs are actually used
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
+    // Determine which unitigs are actually used.
+    // Sort the IDs so the compact ID assignment below is deterministic across runs —
+    // FxHashSet iteration order varies, which otherwise leaks into archive bytes.
     let mut used_unitig_ids: FxHashSet<usize> = FxHashSet::default();
     for m in mappings.iter().flatten() {
         used_unitig_ids.insert(m.unitig_id);
     }
+    let mut used_unitig_ids: Vec<usize> = used_unitig_ids.into_iter().collect();
+    used_unitig_ids.sort_unstable();
 
     // Remap unitig IDs to compact range
     let mut unitig_id_map: FxHashMap<usize, usize> = FxHashMap::default();
@@ -444,7 +448,7 @@ fn encode_reads(
 
     // Stream 0: consensus sequences (2-bit packed)
     let consensus_seqs: Vec<Vec<u8>> = used_unitigs.iter().map(|u| u.sequence.clone()).collect();
-    let consensus_bytes = pack_dna_2bit(&consensus_seqs);
+    let consensus_bytes = pack_dna_2bit(&consensus_seqs)?;
 
     // Stream 1: metadata + Stream 2: mismatches
     let mut meta_bytes: Vec<u8> = Vec::new();
@@ -476,15 +480,17 @@ fn encode_reads(
                     (read.clone(), region.to_vec())
                 };
 
-                let mut mismatches: Vec<(u16, u8)> = Vec::new();
+                // Positions held as usize end-to-end; the wire format is varint so
+                // the in-memory width does not affect archive bytes.
+                let mut mismatches: Vec<(usize, u8)> = Vec::new();
                 for (i, (&r, &c)) in compare_read.iter().zip(compare_ref.iter()).enumerate() {
                     if r != c {
-                        mismatches.push((i as u16, r)); // store the READ's base
+                        mismatches.push((i, r)); // store the READ's base
                     }
                 }
 
                 write_varint(&mut mismatch_bytes, mismatches.len() as u64);
-                let mut prev_pos: u16 = 0;
+                let mut prev_pos: usize = 0;
                 for (pos, base) in &mismatches {
                     write_varint(&mut mismatch_bytes, (*pos - prev_pos) as u64);
                     mismatch_bytes.push(*base);
@@ -498,12 +504,12 @@ fn encode_reads(
         }
     }
 
-    let singleton_bytes = pack_dna_2bit(&singleton_seqs);
+    let singleton_bytes = pack_dna_2bit(&singleton_seqs)?;
 
     eprintln!("  Encoding: {} unitigs used, {} singletons packed",
              used_unitigs.len(), singleton_seqs.len());
 
-    (consensus_bytes, meta_bytes, mismatch_bytes, singleton_bytes)
+    Ok((consensus_bytes, meta_bytes, mismatch_bytes, singleton_bytes))
 }
 
 /// Compress sequences using de Bruijn graph unitig extraction.
@@ -536,7 +542,7 @@ pub fn compress_sequences_debruijn(sequences: &[String], k_override: usize) -> R
     // If reads are shorter than k, fall back to packing them all as singletons
     if max_readlen < k {
         eprintln!("  Reads shorter than k={}, encoding all as singletons", k);
-        let packed = pack_dna_2bit(&seqs);
+        let packed = pack_dna_2bit(&seqs)?;
         let compressed = bsc::compress_parallel(&packed)?;
         let mut output = Vec::new();
         output.extend_from_slice(b"DBG1");
@@ -590,7 +596,7 @@ pub fn compress_sequences_debruijn(sequences: &[String], k_override: usize) -> R
     // Encode into 4 streams
     eprintln!("  Encoding streams...");
     let (consensus_raw, meta_raw, mismatch_raw, singleton_raw) =
-        encode_reads(&seqs, &unitigs, &mappings);
+        encode_reads(&seqs, &unitigs, &mappings)?;
 
     // BSC-compress each stream
     eprintln!("  BSC-compressing 4 streams...");
@@ -723,17 +729,25 @@ pub fn decompress_sequences_debruijn(data: &[u8], num_reads: usize) -> Result<Ve
             let num_mismatches = read_varint(&mismatch_raw, &mut mismatch_offset)
                 .ok_or_else(|| anyhow::anyhow!("Failed to read mismatch count"))? as usize;
 
-            let mut prev_pos: u16 = 0;
+            let mut prev_pos: usize = 0;
             for _ in 0..num_mismatches {
                 let delta = read_varint(&mismatch_raw, &mut mismatch_offset)
-                    .ok_or_else(|| anyhow::anyhow!("Failed to read mismatch delta"))? as u16;
+                    .ok_or_else(|| anyhow::anyhow!("Failed to read mismatch delta"))? as usize;
+                if mismatch_offset >= mismatch_raw.len() {
+                    anyhow::bail!("truncated mismatch base byte");
+                }
                 let base = mismatch_raw[mismatch_offset];
                 mismatch_offset += 1;
 
-                let pos = prev_pos + delta;
-                if (pos as usize) < read.len() {
-                    read[pos as usize] = base;
+                let pos = prev_pos.checked_add(delta)
+                    .ok_or_else(|| anyhow::anyhow!("mismatch position overflow"))?;
+                if pos >= read.len() {
+                    anyhow::bail!(
+                        "mismatch position {} >= read length {} (archive corrupt)",
+                        pos, read.len()
+                    );
                 }
+                read[pos] = base;
                 prev_pos = pos;
             }
 

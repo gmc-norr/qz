@@ -206,10 +206,24 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
             );
         }
 
-        if pair_buffer.len() > 10_000_000 {
+        // Hard cap: refuse to grow the unpaired buffer past 50M reads.
+        // The previous behavior warned at 10M and grew unboundedly, OOMing the
+        // host on name-mismatched BAMs. A read-name-pair mismatch is a data
+        // problem the user should fix (e.g. samtools sort -n), not silently
+        // burn RAM forever.
+        const PAIR_BUFFER_HARD_CAP: usize = 50_000_000;
+        if pair_buffer.len() > 10_000_000 && !pair_buffer.is_empty() {
             warn!(
                 "Pair buffer has {} unpaired reads — BAM may not be properly paired",
                 pair_buffer.len()
+            );
+        }
+        if pair_buffer.len() > PAIR_BUFFER_HARD_CAP {
+            anyhow::bail!(
+                "Pair buffer exceeded {} unpaired reads ({} processed so far). \
+                 Input BAM is likely not query-name-sorted or is missing mates. \
+                 Re-sort with `samtools sort -n` before extracting.",
+                PAIR_BUFFER_HARD_CAP, total_records,
             );
         }
     }

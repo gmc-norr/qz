@@ -142,7 +142,7 @@ fn build_quality_model_stream(records: &[crate::io::FastqRecord], model: &qualit
     for record in records {
         if let Some(qual) = &record.quality {
             write_varint(&mut stream, qual.len())?;
-            let deltas = quality_model::encode_with_model(qual, model);
+            let deltas = quality_model::encode_with_model(qual, model)?;
             let packed = quality_model::pack_deltas(&deltas);
             stream.write_all(&packed)?;
         }
@@ -529,7 +529,7 @@ pub(super) fn compress_qualities_with_delta(records: &[crate::io::FastqRecord], 
         anyhow::bail!("No quality scores for delta encoding");
     }
 
-    let encoded_deltas = quality_delta::encode_quality_deltas(&quality_strings);
+    let encoded_deltas = quality_delta::encode_quality_deltas(&quality_strings)?;
 
     let stats = quality_delta::analyze_deltas(&encoded_deltas);
     info!("Quality delta encoding: {:.1}% zeros, {:.1}% small (|Δ|≤3), max delta: {}",
@@ -590,7 +590,7 @@ pub(super) fn compress_qualities_with_delta_and_dict(
         anyhow::bail!("No quality scores for delta encoding");
     }
 
-    let encoded_deltas = quality_delta::encode_quality_deltas(&quality_strings);
+    let encoded_deltas = quality_delta::encode_quality_deltas(&quality_strings)?;
 
     let stats = quality_delta::analyze_deltas(&encoded_deltas);
     info!("Quality delta encoding: {:.1}% zeros, {:.1}% small (|Δ|≤3), max delta: {}",

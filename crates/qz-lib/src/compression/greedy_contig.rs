@@ -545,9 +545,9 @@ fn encode_reads(
     sequences: &[Vec<u8>],
     contigs: &[Contig],
     mappings: &[Option<ReadMapping>],
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)> {
     let contig_seqs: Vec<Vec<u8>> = contigs.iter().map(|c| c.sequence.clone()).collect();
-    let consensus_bytes = pack_dna_2bit(&contig_seqs);
+    let consensus_bytes = pack_dna_2bit(&contig_seqs)?;
 
     let mut meta_bytes: Vec<u8> = Vec::new();
     let mut mismatch_bytes: Vec<u8> = Vec::new();
@@ -574,15 +574,17 @@ fn encode_reads(
                     (read.clone(), region.to_vec())
                 };
 
-                let mut mismatches: Vec<(u16, u8)> = Vec::new();
+                // Positions held as usize end-to-end; wire format is varint so
+                // in-memory width does not affect archive bytes.
+                let mut mismatches: Vec<(usize, u8)> = Vec::new();
                 for (i, (&r, &c)) in compare_read.iter().zip(compare_ref.iter()).enumerate() {
                     if r != c {
-                        mismatches.push((i as u16, r));
+                        mismatches.push((i, r));
                     }
                 }
 
                 write_varint(&mut mismatch_bytes, mismatches.len() as u64);
-                let mut prev_pos: u16 = 0;
+                let mut prev_pos: usize = 0;
                 for (pos, base) in &mismatches {
                     write_varint(&mut mismatch_bytes, (*pos - prev_pos) as u64);
                     mismatch_bytes.push(*base);
@@ -596,13 +598,13 @@ fn encode_reads(
         }
     }
 
-    let singleton_bytes = pack_dna_2bit(&singleton_seqs);
+    let singleton_bytes = pack_dna_2bit(&singleton_seqs)?;
 
     let mapped = mappings.iter().filter(|m| m.is_some()).count();
     eprintln!("  Encoded: {} mapped, {} singletons",
              mapped, singleton_seqs.len());
 
-    (consensus_bytes, meta_bytes, mismatch_bytes, singleton_bytes)
+    Ok((consensus_bytes, meta_bytes, mismatch_bytes, singleton_bytes))
 }
 
 // ── Public API ──────────────────────────────────────────────────────────────
@@ -660,7 +662,7 @@ pub fn compress_sequences_greedy(sequences: &[String]) -> Result<Vec<u8>> {
     // Step 5: Encode
     eprintln!("  Step 5: Encoding...");
     let (consensus_raw, meta_raw, mismatch_raw, singleton_raw) =
-        encode_reads(&seqs, &contigs, &mappings);
+        encode_reads(&seqs, &contigs, &mappings)?;
 
     // Step 6: BSC-compress
     eprintln!("  Step 6: BSC-compressing...");

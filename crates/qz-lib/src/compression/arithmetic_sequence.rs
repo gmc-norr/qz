@@ -98,13 +98,21 @@ fn u32_to_u8(data: &[u32]) -> Vec<u8> {
     data.iter().flat_map(|&x| x.to_le_bytes()).collect()
 }
 
-/// Convert Vec<u8> back to Vec<u32>
-fn u8_to_u32(data: &[u8]) -> Vec<u32> {
-    assert!(data.len() % 4 == 0,
-        "u8_to_u32: input length {} is not a multiple of 4", data.len());
-    data.chunks_exact(4)
+/// Convert Vec<u8> back to Vec<u32>.
+///
+/// Returns an error on non-multiple-of-4 input rather than panicking — the
+/// input is attacker-controlled archive bytes and corruption must not crash.
+fn u8_to_u32(data: &[u8]) -> Result<Vec<u32>> {
+    if data.len() % 4 != 0 {
+        anyhow::bail!(
+            "arithmetic-coded payload length {} is not a multiple of 4 (archive corrupt)",
+            data.len()
+        );
+    }
+    Ok(data
+        .chunks_exact(4)
         .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
+        .collect())
 }
 
 /// Encode sequences using adaptive arithmetic coding
@@ -171,7 +179,7 @@ pub fn decode_sequences_arithmetic(
     read_lengths: &[usize],
     num_reads: usize,
 ) -> Result<Vec<String>> {
-    let compressed_u32 = u8_to_u32(compressed);
+    let compressed_u32 = u8_to_u32(compressed)?;
     let mut decoder = DefaultAnsCoder::from_compressed(compressed_u32)
         .map_err(|e| anyhow::anyhow!("Failed to create decoder: {:?}", e))?;
 

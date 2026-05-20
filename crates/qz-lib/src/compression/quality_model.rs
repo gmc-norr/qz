@@ -72,11 +72,24 @@ pub fn build_quality_model(quality_strings: &[Vec<u8>]) -> Result<QualityModel> 
 
 /// Encode quality string using positional model
 /// Returns delta-encoded values (signed differences from expected)
-pub fn encode_with_model(quality: &[u8], model: &QualityModel) -> Vec<i8> {
+/// Encode a quality string as positional deltas against `model`.
+///
+/// Errors when any phred value exceeds 93. Phred values above 93 would be
+/// silently clamped on decode (output range is 0..=93), causing irreversible
+/// corruption of long-read data (PacBio/ONT). Refuse the lossy path explicitly.
+pub fn encode_with_model(quality: &[u8], model: &QualityModel) -> anyhow::Result<Vec<i8>> {
     let mut deltas = Vec::with_capacity(quality.len());
 
     for (pos, &qual_ascii) in quality.iter().enumerate() {
-        let phred = qual_ascii.saturating_sub(33) as i16;
+        let phred_unclamped = (qual_ascii as i16) - 33;
+        if !(0..=93).contains(&phred_unclamped) {
+            anyhow::bail!(
+                "quality byte 0x{:02x} (phred {}) at position {} is outside the 0..=93 range \
+                 supported by quality modeling — disable --quality-modeling for this dataset",
+                qual_ascii, phred_unclamped, pos,
+            );
+        }
+        let phred = phred_unclamped;
 
         // Get expected quality at this position
         let expected = if pos < model.positional_medians.len() {
@@ -86,12 +99,11 @@ pub fn encode_with_model(quality: &[u8], model: &QualityModel) -> Vec<i8> {
             *model.positional_medians.last().unwrap_or(&30) as i16
         };
 
-        // Store delta (clamped to i8 range)
-        let delta = (phred - expected).clamp(-128, 127) as i8;
-        deltas.push(delta);
+        // Delta is bounded by (93 - 0) = 93 and (0 - 93) = -93, both within i8 range.
+        deltas.push((phred - expected) as i8);
     }
 
-    deltas
+    Ok(deltas)
 }
 
 /// Decode quality string from delta-encoded values
@@ -201,10 +213,19 @@ mod tests {
         let model = build_quality_model(&qualities).unwrap();
         let test_qual = b"IIIIIHHHHGGGGFFFF";
 
-        let deltas = encode_with_model(test_qual, &model);
+        let deltas = encode_with_model(test_qual, &model).unwrap();
         let decoded = decode_with_model(&deltas, &model);
 
         assert_eq!(test_qual.to_vec(), decoded);
+    }
+
+    #[test]
+    fn test_encode_rejects_phred_above_93() {
+        // Phred above 93 would silently clamp on decode — must be a hard error.
+        let model = QualityModel { positional_medians: vec![30], read_length: 1 };
+        let bad = [33 + 94]; // phred 94
+        let err = encode_with_model(&bad, &model).unwrap_err();
+        assert!(format!("{err}").contains("0..=93"), "unexpected error: {err}");
     }
 
     #[test]
@@ -233,7 +254,7 @@ mod tests {
 
         // Most deltas should be 0 or very small
         for qual in &qualities {
-            let deltas = encode_with_model(qual, &model);
+            let deltas = encode_with_model(qual, &model).unwrap();
             let max_delta = deltas.iter().map(|&d| d.abs()).max().unwrap_or(0);
             assert!(max_delta <= 5, "Deltas should be small, got max: {}", max_delta);
         }

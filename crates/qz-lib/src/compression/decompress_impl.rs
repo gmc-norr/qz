@@ -797,10 +797,10 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
     // Body starts after v2 prefix
     let mut offset = V2_PREFIX_SIZE;
 
-    let encoding_type = data[offset];
+    let encoding_type = super::read_u8(data, offset)?;
     offset += 1;
 
-    let flags = data[offset];
+    let flags = super::read_u8(data, offset)?;
     offset += 1;
     let arithmetic_enabled = flags & 0x01 != 0;
     let const_length_present = flags & 0x02 != 0;
@@ -808,19 +808,28 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
     if arithmetic_enabled {
         let num_lengths = read_le_u32(data, offset)? as usize;
         offset += 4;
-        offset += num_lengths * 4;
+        // Bound num_lengths against the remaining archive bytes before advancing.
+        // 4 bytes per length entry; reject obviously malformed counts up front
+        // so we never advance offset past data.len() (subsequent indexing panics
+        // were a DoS vector on hostile archives).
+        let len_bytes = num_lengths.checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("num_lengths={} overflows", num_lengths))?;
+        offset = offset.checked_add(len_bytes)
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| anyhow::anyhow!(
+                "read-lengths block extends past archive (offset={}, num_lengths={}, archive_len={})",
+                offset, num_lengths, data.len()
+            ))?;
     }
 
-    let quality_binning = code_to_binning(data[offset])?;
+    let quality_binning = code_to_binning(super::read_u8(data, offset)?)?;
     offset += 1;
 
-    let quality_compressor = if offset < data.len() && data[offset] <= 4 {
-        let compressor = code_to_compressor(data[offset])?;
-        offset += 1;
-        compressor
-    } else {
-        QualityCompressor::Zstd
-    };
+    // Compressor code lives in bytes 0..=4. Anything else is a corrupt or
+    // unknown-version archive — fail loudly instead of silently coercing to Zstd.
+    let compressor_byte = super::read_u8(data, offset)?;
+    let quality_compressor = code_to_compressor(compressor_byte)?;
+    offset += 1;
 
     // Fqzcomp stores raw ASCII quality bytes (not bit-packed), so override binning
     let quality_binning = if quality_compressor == QualityCompressor::Fqzcomp {
@@ -829,13 +838,13 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         quality_binning
     };
 
-    let sequence_compressor = code_to_seq_compressor(data[offset])?;
+    let sequence_compressor = code_to_seq_compressor(super::read_u8(data, offset)?)?;
     offset += 1;
 
-    let header_compressor = code_to_header_compressor(data[offset])?;
+    let header_compressor = code_to_header_compressor(super::read_u8(data, offset)?)?;
     offset += 1;
 
-    let quality_model_enabled = data[offset] != 0;
+    let quality_model_enabled = super::read_u8(data, offset)? != 0;
     offset += 1;
     let quality_model_opt = if quality_model_enabled {
         let model_size = read_le_u16(data, offset)? as usize;
@@ -850,10 +859,10 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         None
     };
 
-    let quality_delta_enabled = data[offset] != 0;
+    let quality_delta_enabled = super::read_u8(data, offset)? != 0;
     offset += 1;
 
-    let quality_dict_opt = if data[offset] != 0 {
+    let quality_dict_opt = if super::read_u8(data, offset)? != 0 {
         offset += 1;
         let dict_size = read_le_u32(data, offset)? as usize;
         offset += 4;
@@ -875,7 +884,7 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         .ok_or_else(|| anyhow::anyhow!("template prefix extends beyond archive data (offset={offset}, size={template_prefix_len}, archive_len={})", data.len()))?;
     let template_prefix = String::from_utf8_lossy(&data[offset..end]).to_string();
     offset = end;
-    let template_has_comment = data[offset] != 0;
+    let template_has_comment = super::read_u8(data, offset)? != 0;
     offset += 1;
 
     let common_comment = if template_prefix_len > 0 && template_has_comment {

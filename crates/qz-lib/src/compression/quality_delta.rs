@@ -8,11 +8,30 @@
 
 use anyhow::Result;
 
-/// Encode quality strings as deltas from previous read
-/// First read is stored as-is, subsequent reads as signed differences
-pub fn encode_quality_deltas(quality_strings: &[Vec<u8>]) -> Vec<Vec<i8>> {
+/// Encode quality strings as deltas from previous read.
+/// First read is stored as-is, subsequent reads as signed differences.
+///
+/// Errors when any phred value exceeds 93 — the decoder clamps reconstructions
+/// to 0..=93, so encoding higher values would silently corrupt long-read
+/// (PacBio/ONT) data. Refuse the lossy path explicitly.
+pub fn encode_quality_deltas(quality_strings: &[Vec<u8>]) -> Result<Vec<Vec<i8>>> {
     if quality_strings.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
+    }
+
+    // Pre-validate the full input so corruption is surfaced before any state is built.
+    for (read_idx, qual) in quality_strings.iter().enumerate() {
+        for (pos, &b) in qual.iter().enumerate() {
+            let phred = (b as i16) - 33;
+            if !(0..=93).contains(&phred) {
+                anyhow::bail!(
+                    "quality byte 0x{:02x} (phred {}) in read {} at position {} is outside the \
+                     0..=93 range supported by quality delta encoding — disable \
+                     --quality-delta for this dataset",
+                    b, phred, read_idx, pos,
+                );
+            }
+        }
     }
 
     let mut encoded = Vec::with_capacity(quality_strings.len());
@@ -43,15 +62,14 @@ pub fn encode_quality_deltas(quality_strings: &[Vec<u8>]) -> Vec<Vec<i8>> {
                 30 // Default quality if previous read is shorter
             };
 
-            // Compute and clamp delta
-            let delta = (curr_phred - prev_phred).clamp(-128, 127) as i8;
-            deltas.push(delta);
+            // Delta is bounded by ±93 (both phreds validated to 0..=93), within i8 range.
+            deltas.push((curr_phred - prev_phred) as i8);
         }
 
         encoded.push(deltas);
     }
 
-    encoded
+    Ok(encoded)
 }
 
 /// Decode quality strings from delta encoding
@@ -165,7 +183,7 @@ mod tests {
             b"IIIIIIIIII".to_vec(),
         ];
 
-        let encoded = encode_quality_deltas(&qualities);
+        let encoded = encode_quality_deltas(&qualities).unwrap();
         let decoded = decode_quality_deltas(&encoded).unwrap();
 
         assert_eq!(qualities, decoded);
@@ -184,7 +202,7 @@ mod tests {
             b"IIIIIHHHHH".to_vec(), // Back to original
         ];
 
-        let encoded = encode_quality_deltas(&qualities);
+        let encoded = encode_quality_deltas(&qualities).unwrap();
         let decoded = decode_quality_deltas(&encoded).unwrap();
 
         assert_eq!(qualities, decoded);
@@ -202,7 +220,7 @@ mod tests {
             b"III".to_vec(),       // Shorter
         ];
 
-        let encoded = encode_quality_deltas(&qualities);
+        let encoded = encode_quality_deltas(&qualities).unwrap();
         let decoded = decode_quality_deltas(&encoded).unwrap();
 
         assert_eq!(qualities, decoded);
@@ -211,7 +229,7 @@ mod tests {
     #[test]
     fn test_empty() {
         let qualities: Vec<Vec<u8>> = vec![];
-        let encoded = encode_quality_deltas(&qualities);
+        let encoded = encode_quality_deltas(&qualities).unwrap();
         let decoded = decode_quality_deltas(&encoded).unwrap();
         assert_eq!(qualities, decoded);
     }
@@ -219,8 +237,16 @@ mod tests {
     #[test]
     fn test_single_quality() {
         let qualities = vec![b"IIIII".to_vec()];
-        let encoded = encode_quality_deltas(&qualities);
+        let encoded = encode_quality_deltas(&qualities).unwrap();
         let decoded = decode_quality_deltas(&encoded).unwrap();
         assert_eq!(qualities, decoded);
+    }
+
+    #[test]
+    fn test_rejects_phred_above_93() {
+        // Phred above 93 would silently clamp on decode — must be a hard error.
+        let qualities = vec![vec![33 + 94u8]];
+        let err = encode_quality_deltas(&qualities).unwrap_err();
+        assert!(format!("{err}").contains("0..=93"), "unexpected error: {err}");
     }
 }

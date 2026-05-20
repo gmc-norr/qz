@@ -811,6 +811,31 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
     info!("Input files: {:?}", args.input);
     info!("Output: {:?}", args.output);
 
+    // Warn loudly when the user opted into lossy quality compression. Silent
+    // data loss is the worst kind — make it visible in the log so a downstream
+    // pipeline can spot the choice in archived runs.
+    match args.quality_mode {
+        crate::cli::QualityMode::Lossless => {}
+        crate::cli::QualityMode::Discard => {
+            tracing::warn!(
+                "Lossy quality mode 'discard': all quality scores will be replaced with a single \
+                 placeholder value. Original qualities will NOT be recoverable from the archive."
+            );
+        }
+        other => {
+            tracing::warn!(
+                "Lossy quality mode {:?}: quality scores will be re-binned. Original qualities \
+                 will NOT be recoverable from the archive.",
+                other,
+            );
+        }
+    }
+    if args.no_quality {
+        tracing::warn!(
+            "Quality scores disabled (--no-quality): the archive will not contain quality data."
+        );
+    }
+
     // Validate --sequence-hints compatibility
     if args.advanced.sequence_hints && args.advanced.sequence_compressor != SequenceCompressor::Bsc {
         anyhow::bail!("--sequence-hints requires BSC sequence compressor (default)");
@@ -836,12 +861,12 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
         }
     }
 
-    // Validate --local-reorder / --ultra / --fast-ultra compatibility
+    // Validate --local-reorder / --ultra compatibility
     let has_ultra = args.ultra.is_some();
-    if args.advanced.local_reorder || has_ultra || args.advanced.fast_ultra {
-        let mode_name = if args.advanced.local_reorder { "--local-reorder" } else if args.advanced.fast_ultra { "--fast-ultra" } else { "--ultra" };
-        if (args.advanced.local_reorder as u8 + has_ultra as u8 + args.advanced.fast_ultra as u8) > 1 {
-            anyhow::bail!("--local-reorder, --ultra, and --fast-ultra cannot be combined");
+    if args.advanced.local_reorder || has_ultra {
+        let mode_name = if args.advanced.local_reorder { "--local-reorder" } else { "--ultra" };
+        if (args.advanced.local_reorder as u8 + has_ultra as u8) > 1 {
+            anyhow::bail!("--local-reorder and --ultra cannot be combined");
         }
         if args.advanced.sequence_hints || args.advanced.sequence_delta || args.advanced.rc_canon {
             anyhow::bail!("{mode_name} cannot be combined with other encoding options");
@@ -889,12 +914,6 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
     // Ultra mode: level-based compression with auto-tuning
     if let Some(requested_level) = args.ultra {
         let level = ultra::resolve_ultra_level(requested_level);
-        return ultra::compress_reorder_local_with_level(args, level);
-    }
-
-    // Backwards compat: --fast-ultra maps to ultra level 2
-    if args.advanced.fast_ultra {
-        let level = ultra::resolve_ultra_level(2);
         return ultra::compress_reorder_local_with_level(args, level);
     }
 

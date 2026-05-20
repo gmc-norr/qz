@@ -46,6 +46,9 @@ struct CompressArgs {
     /// Advanced options JSON config file
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
+    /// Overwrite the output file if it already exists
+    #[arg(short = 'f', long)]
+    force: bool,
 }
 
 #[derive(Parser)]
@@ -62,6 +65,9 @@ struct DecompressArgs {
     /// Number of threads (0 = auto-detect)
     #[arg(short = 't', long, default_value = "0")]
     threads: usize,
+    /// Overwrite the output file if it already exists
+    #[arg(short = 'f', long)]
+    force: bool,
 }
 
 #[derive(Parser)]
@@ -78,6 +84,9 @@ struct ExtractArgs {
     /// Number of threads (0 = auto-detect)
     #[arg(short = 't', long, default_value = "0")]
     threads: usize,
+    /// Overwrite output files if they already exist
+    #[arg(short = 'f', long)]
+    force: bool,
 }
 
 #[derive(Parser)]
@@ -88,6 +97,17 @@ struct VerifyArgs {
     /// Number of threads (0 = auto-detect)
     #[arg(short = 't', long, default_value = "0")]
     threads: usize,
+}
+
+/// Refuse to clobber an existing output file unless `force` is set.
+fn check_overwrite(path: &std::path::Path, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        anyhow::bail!(
+            "Output file already exists: {}\nUse --force to overwrite",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn install_panic_hook(debug: bool) {
@@ -170,6 +190,7 @@ fn run(cli: Cli) -> Result<()> {
 
     match cli.command {
         Commands::Compress(args) => {
+            check_overwrite(&args.output, args.force)?;
             info!("Starting compression...");
             let advanced = if let Some(ref config_path) = args.config {
                 let json_str = std::fs::read_to_string(config_path)
@@ -191,6 +212,7 @@ fn run(cli: Cli) -> Result<()> {
             info!("Compression complete!");
         }
         Commands::Decompress(args) => {
+            check_overwrite(&args.output, args.force)?;
             info!("Starting decompression...");
             let config = bz_lib::DecompressConfig {
                 input: args.input,
@@ -201,6 +223,12 @@ fn run(cli: Cli) -> Result<()> {
             info!("Decompression complete!");
         }
         Commands::Extract(args) => {
+            // Extract writes up to three outputs derived from --output prefix.
+            // Refuse to clobber any of them unless --force is set.
+            for suffix in ["_R1.qz", "_R2.qz", "_SE.qz"] {
+                let path = PathBuf::from(format!("{}{}", args.output, suffix));
+                check_overwrite(&path, args.force)?;
+            }
             info!("Starting BAM to QZ extraction...");
             let config = bz_lib::ExtractConfig {
                 input: args.input,
@@ -216,7 +244,13 @@ fn run(cli: Cli) -> Result<()> {
             };
             match bz_lib::verify(&config) {
                 Ok(result) => {
-                    let comp_name = |c: u8| if c == 0 { "bsc" } else { "zstd" };
+                    let comp_name = |c: u8| -> String {
+                        match c {
+                            0 => "bsc".to_string(),
+                            1 => "zstd".to_string(),
+                            other => format!("unknown({})", other),
+                        }
+                    };
                     eprintln!("Archive:     {:?}", args.input);
                     eprintln!("Status:      OK");
                     eprintln!("Records:     {}", result.num_records);

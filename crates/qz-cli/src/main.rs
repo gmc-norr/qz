@@ -56,8 +56,8 @@ struct CompressArgs {
     #[arg(short, long, default_value = ".")]
     working_dir: PathBuf,
 
-    /// Number of threads (0 = auto-detect)
-    #[arg(short = 't', long, default_value = "0")]
+    /// Number of threads
+    #[arg(short = 't', long, default_value_t = qz_lib::cli::num_cpus())]
     threads: usize,
 
     /// Input is FASTA format (no quality scores)
@@ -83,6 +83,10 @@ struct CompressArgs {
     /// JSON config file for advanced compression options (overrides defaults)
     #[arg(long, value_name = "FILE")]
     config: Option<PathBuf>,
+
+    /// Overwrite the output file if it already exists
+    #[arg(short = 'f', long)]
+    force: bool,
 }
 
 #[derive(Parser)]
@@ -139,6 +143,22 @@ impl VerifyArgs {
 
 impl CompressArgs {
     fn into_config(self) -> anyhow::Result<CompressConfig> {
+        // Reject flag combinations whose intent is ambiguous. Previously these
+        // were silently coerced — e.g. `--fasta --quality-mode lossless` would
+        // strip quality despite the user explicitly asking for lossless.
+        if self.fasta && self.quality_mode != CliQualityMode::Lossless {
+            anyhow::bail!(
+                "--fasta is incompatible with --quality-mode {:?} (FASTA has no quality data)",
+                self.quality_mode
+            );
+        }
+        if self.no_quality && self.quality_mode != CliQualityMode::Lossless {
+            anyhow::bail!(
+                "--no-quality is incompatible with --quality-mode {:?} (choose one)",
+                self.quality_mode
+            );
+        }
+
         let quality_mode = match self.quality_mode {
             CliQualityMode::Lossless => LibQualityMode::Lossless,
             CliQualityMode::IlluminaBin => LibQualityMode::IlluminaBin,
@@ -163,6 +183,7 @@ impl CompressArgs {
             no_quality: self.no_quality || self.quality_mode == CliQualityMode::Discard,
             quality_mode,
             ultra: self.ultra,
+            force: self.force,
             advanced,
         })
     }
@@ -259,17 +280,18 @@ fn run(cli: Cli) -> Result<()> {
         }
         Commands::Verify(args) => {
             info!("Verifying archive...");
-            let input_display = format!("{:?}", args.input);
+            let input_display = args.input.display().to_string();
             let config = args.into_config();
             let result = qz_lib::compression::verify(&config)?;
 
-            let encoding_name = match result.encoding_type {
-                0 => "default (0)",
-                4 => "raw+hints (4)",
-                6 => "rc-canon (6)",
-                8 => "local-reorder (8)",
-                9 => "ultra (9)",
-                n => &format!("unknown ({n})"),
+            // String, not &str, so the borrow lives until after the eprintln chain.
+            let encoding_name: String = match result.encoding_type {
+                0 => "default (0)".to_string(),
+                4 => "raw+hints (4)".to_string(),
+                6 => "rc-canon (6)".to_string(),
+                8 => "local-reorder (8)".to_string(),
+                9 => "ultra (9)".to_string(),
+                n => format!("unknown ({n})"),
             };
 
             eprintln!("Archive:     {}", input_display);

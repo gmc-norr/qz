@@ -9,6 +9,27 @@ fn main() {
     let third_party = workspace_root.join("third_party");
     let cuda_enabled = std::env::var("CARGO_FEATURE_CUDA").is_ok();
 
+    // Friendly error if the libbsc submodule isn't checked out. Without this,
+    // cc errors out mid-compile with an opaque "file not found" message.
+    let libbsc_entrypoint = third_party.join("libbsc/libbsc/libbsc/libbsc.cpp");
+    if !libbsc_entrypoint.exists() {
+        panic!(
+            "third_party/libbsc is missing or empty. \
+             Run: git submodule update --init --recursive\n\
+             (looked for {})",
+            libbsc_entrypoint.display()
+        );
+    }
+    let htscodecs_entrypoint = third_party.join("htscodecs/htscodecs/fqzcomp_qual.c");
+    if !htscodecs_entrypoint.exists() {
+        panic!(
+            "third_party/htscodecs is missing or empty. \
+             Run: git submodule update --init --recursive\n\
+             (looked for {})",
+            htscodecs_entrypoint.display()
+        );
+    }
+
     // C/C++ PGO support:
     //   QZ_PGO_GENERATE=/path/to/dir  → instrument for profile collection
     //   QZ_PGO_USE=/path/to/dir       → optimize using collected profiles
