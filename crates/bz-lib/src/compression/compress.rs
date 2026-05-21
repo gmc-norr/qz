@@ -411,12 +411,22 @@ fn compress_quality_ctx_parallel(quality_data: &ChunkQualityData, block_size: us
         })
         .collect();
 
-    // Combine into multiblock format
+    // Combine into multiblock format matching qz-lib's quality_ctx reader:
+    // [num_blocks: u32][block_len: u32, crc32: u32, qctx_blob]...
+    // The per-block CRC is redundant with bz's outer per-chunk CRC32, but the
+    // reader is shared with qz which uses it for archive-level integrity.
+    use flate2::Crc;
     let mut result = Vec::new();
     result.extend_from_slice(&(compressed_blocks.len() as u32).to_le_bytes());
     for block_result in compressed_blocks {
         let block = block_result?;
+        let crc = {
+            let mut h = Crc::new();
+            h.update(&block);
+            h.sum()
+        };
         result.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        result.extend_from_slice(&crc.to_le_bytes());
         result.extend_from_slice(&block);
     }
 

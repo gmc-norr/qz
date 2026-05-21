@@ -162,6 +162,22 @@ pub struct VerifyConfig {
     pub working_dir: PathBuf,
     /// Number of threads
     pub num_threads: usize,
+    /// Fast mode: only verify per-block CRC32 checksums without invoking BSC
+    /// decompression. Catches bit-rot in O(IO + CRC) time instead of O(BWT),
+    /// but does not reconstruct the FASTQ output (so the deep-verify CRC32
+    /// over the decompressed FASTQ bytes is not computed).
+    pub fast: bool,
+}
+
+impl Default for VerifyConfig {
+    fn default() -> Self {
+        Self {
+            input: PathBuf::new(),
+            working_dir: PathBuf::from("."),
+            num_threads: 0,
+            fast: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize_repr, Deserialize_repr)]

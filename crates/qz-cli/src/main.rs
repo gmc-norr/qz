@@ -129,6 +129,12 @@ struct VerifyArgs {
     /// Number of threads
     #[arg(short = 't', long, default_value_t = qz_lib::cli::num_cpus())]
     threads: usize,
+
+    /// Fast mode: verify per-block CRC32s only, without invoking BSC
+    /// decompression. Catches bit-rot in O(IO + CRC) instead of O(BWT); does
+    /// not compute the deep CRC32 over the reconstructed FASTQ bytes.
+    #[arg(long)]
+    fast: bool,
 }
 
 impl VerifyArgs {
@@ -137,6 +143,7 @@ impl VerifyArgs {
             input: self.input,
             working_dir: self.working_dir,
             num_threads: self.threads,
+            fast: self.fast,
         }
     }
 }
@@ -296,13 +303,32 @@ fn run(cli: Cli) -> Result<()> {
 
             eprintln!("Archive:     {}", input_display);
             eprintln!("Status:      OK");
+            eprintln!("Mode:        {}", match result.mode {
+                qz_lib::compression::VerifyMode::Deep => "deep (full decompress + FASTQ CRC32)",
+                qz_lib::compression::VerifyMode::Fast => "fast (per-block CRC32 only)",
+            });
             eprintln!("Reads:       {}", result.num_reads);
             eprintln!("Encoding:    {}", encoding_name);
             eprintln!("Headers:     {} bytes ({:?})", result.headers_compressed_len, result.header_compressor);
             eprintln!("Sequences:   {} bytes", result.sequences_compressed_len);
             eprintln!("Qualities:   {} bytes ({:?})", result.qualities_compressed_len, result.quality_compressor);
-            eprintln!("CRC32:       {:08x}", result.crc32);
-            eprintln!("FASTQ size:  {} bytes", result.total_bytes);
+            match result.mode {
+                qz_lib::compression::VerifyMode::Deep => {
+                    eprintln!("CRC32:       {:08x} (over reconstructed FASTQ bytes)", result.crc32);
+                    eprintln!("FASTQ size:  {} bytes", result.total_bytes);
+                }
+                qz_lib::compression::VerifyMode::Fast => {
+                    eprintln!("Blocks:      {} verified (per-block CRC32 only)", result.blocks_verified);
+                    eprintln!("Comp size:   {} bytes", result.total_bytes);
+                    if result.streams_skipped > 0 {
+                        eprintln!(
+                            "Skipped:     {} stream(s) not v3-framed (e.g. raw zstd) \
+                             — rerun without --fast for full coverage",
+                            result.streams_skipped
+                        );
+                    }
+                }
+            }
             eprintln!("Verified in: {:.2}s", result.elapsed_secs);
 
             info!("Verification complete!");

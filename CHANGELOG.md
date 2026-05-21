@@ -2,6 +2,57 @@
 
 ## Unreleased
 
+### Post-review fixes (round 3)
+
+Three external reviewers + Codex independently flagged real bugs in the v3 verify path and in two compress-time config paths. All addressed:
+
+- **`qz verify --fast` no longer false-passes on RC-canon archives** — previously slurped only headers/sequences/nmasks/qualities, leaving the RC flags stream (encoding_type 6) entirely unchecked. Bit-rot in RC flags would report "Status: OK". Now walks the RC flags stream via the same v3 block-CRC verifier.
+- **`qz verify --fast` no longer false-fails on raw-zstd streams** — previously read the zstd magic as `num_blocks=0xFD2FB528` and bailed with a confusing "BSC parallel: num_blocks=4.25 billion exceeds remaining payload" on healthy archives. Now detects the per-stream compressor and skips non-v3 streams (counted in the new `VerifyResult::streams_skipped`); the CLI prints how many streams were skipped and tells the user to rerun without `--fast` for full coverage.
+- **`qz verify --fast` refuses ultra/local-reorder archives** — the outer per-chunk frame in encoding_type 8/9 has no per-block CRC, so a fast walker would mis-interpret chunk_len as block_len. Now bails up front with `"fast verify does not support encoding_type=8/9 (ultra/local-reorder)"`.
+- **`--dict-training` now requires `--quality-compressor zstd`** — previously fell back to BSC/OpenZL/fqzcomp silently while the archive header still claimed `dict_present=1`, producing archives that failed to decompress with "Unknown frame descriptor". Now errors at compress time with a clear "use zstd or disable dict-training" message.
+- **`--quality-modeling` + `--quality-compressor fqzcomp` now rejected at compress time** — fqzcomp doesn't support quality modeling, so the encoder silently substituted BSC for the model deltas while the header still advertised Fqzcomp. The resulting archive was unreadable. Now errors with a "pick another compressor or disable quality modeling" message.
+- **rayon thread-pool conflicts now logged** — `qz_lib::compression::{compress,decompress,verify}` calls `ThreadPoolBuilder::build_global()`, which can only succeed once per process. Subsequent calls with a different thread count were previously silently ignored (a footgun for `qz-python` users calling `compress()` repeatedly). Now logs a `warn!` with both the requested and the actual thread count. The bz-lib design (init in the binary, not the library) is the cleaner long-term fix.
+- **Streaming-decompress comments corrected** — module/function docs claimed "bounded channels" and "~300 MB peak memory" but the channels are `mpsc::channel` (unbounded) and `drain_channel` accumulates each stream's decompressed bytes in a contiguous Vec. Comments now match reality and point at `decompress_to_records` for the truly memory-bounded path.
+- **README updated to v3 format** — magic-byte/version examples, decompression-pipeline diagram, and "Bounded decompression channels" line all corrected. New "Multi-block stream layout (v3)" section documents the per-block CRC32 framing shared by all five codecs.
+- **Wide-spatial header mixed-batch test added** — explicit test that a Casava batch where one row overflows u16 promotes the whole archive to v0x03 (per-archive width, not per-row — guards against a future per-row refactor breaking the format silently).
+- **`block_crc32` factored into a `pub(crate)` helper in `bsc.rs`** — 13 inline `flate2::Crc::new()/update/sum()` copies across 8 files collapsed to a single call site. Eliminates drift risk if the algorithm ever changes.
+- **`quality_context` module clearly documented as bench-only** — non-v3 framing; module docstring spells out that its output must never be written into a qz archive.
+- **`parse_archive_header` `num_reads` cap tightened to drive downstream allocation** — was `num_reads <= data.len()` (broke roundtrips with very compressible data where the read count legitimately exceeds the archive size); now caps at `MAX_RECORD_PREALLOC_BYTES (256 GB) / sizeof(Vec<u8>) ≈ 11 billion`, which bounds the per-record Vec allocations while still allowing extreme compression ratios.
+
+### Workspace builds and `experimental` feature
+
+The `experimental` feature gates `pub mod template`, the bench-only OpenZL graph variants, and the bench-only `quality_context` module. Under `cargo build --workspace` (or `cargo test --workspace`), Cargo's unified feature resolution **does** enable `experimental` for `qz-cli` and `qz-python` because `qz-bench` declares `qz-lib = { features = ["experimental"] }`. The gate fully isolates experimental code only when building production crates individually: `cargo build -p qz-cli --release` or `cargo build -p qz-python --release`. Production release builds and PyPI publishing should use the per-crate form.
+
+### Archive Format
+
+- **Per-block CRC32 (qz archive v3)** — Every block in every codec stream (BSC, OpenZL, columnar headers, fqzcomp, quality_ctx) now carries a CRC32 (IEEE) over its compressed payload. The CRC is computed at write time and verified before invoking the inner codec, so bit-rot and disk corruption are caught with a clear "block N CRC32 mismatch" error instead of bubbling through libbsc as a cryptic `block_info failed` or producing silently wrong output. Wire layout per block: `[block_len: u32 LE][crc32: u32 LE][payload]`. Matches the pattern bz-lib has used since v4 (commit e2a877b); shares `flate2::Crc` so the two crates compute identical checksums.
+- **Breaking change**: v2 archives are not readable by v3 builds. The version-mismatch error includes a clear "please re-encode with `qz compress`, or use an older qz binary to decompress" message.
+- **`qz verify --fast`** — New fast verification mode walks the per-block CRC32s without invoking any codec decoder. Catches bit-rot in O(IO + CRC) time instead of O(BWT) — on a 500K-read archive (22 MB compressed) fast verify is **~1000× faster** than deep verify (~1 ms vs 3.8 s) while still catching the same single-byte flip the deep mode catches. Deep verify (current behavior, with full FASTQ-bytes CRC32) remains the default.
+- **`VerifyResult` gained `mode: VerifyMode` and `blocks_verified: u32`** to distinguish deep vs fast results. Now `Debug + Clone`.
+
+### Hardening
+
+- **`parse_archive_header` caps declared stream sizes against the archive size**. A hostile archive declaring `headers_len = u64::MAX` (or any of the other four stream lengths) previously wrapped the body-end check and bypassed truncation detection, then triggered huge Vec allocations downstream. All four stream lengths and `num_reads` are now validated `<= data.len()` up front, and the body-end calculation uses `checked_add` so wraparound is caught.
+- **`bsc::decompress_parallel` / `openzl::decompress_parallel` bound `num_blocks * 9` against remaining payload** (was `* 5` pre-CRC). Catches malformed `num_blocks` before `Vec::with_capacity` allocation.
+- **`quality_ctx` decoder caps `read_len × num_reads` pre-allocation at 256 GB** with a clear error. Previously a corrupt header could ask the decoder to pre-allocate petabytes and OOM the host before any decoding failure could surface.
+
+### Cross-pollination from bz-lib
+
+- The per-block CRC32 design directly mirrors bz-lib's `ChunkHeader.crc32`. The shared decoder helpers (`bsc::verify_parallel_crcs`, `flate2::Crc`) mean qz and bz now produce checksums comparable byte-for-byte.
+
+### Header Compression
+
+- **Casava v0x03 / SRA v0x04 wide-spatial formats** — The columnar header codec now writes 32-bit `tile`/`x`/`y` fields when any value exceeds `u16::MAX` (NovaSeq X x/y coordinates reach ~70k). Typical Illumina datasets continue to use the existing v0x02 (Casava) / v0x01 (SRA) layouts — byte-identical to pre-widening output — so older archives stay compatible and current archives don't grow. Decoder accepts both widths.
+
+### Experimental Code
+
+- **`pub mod template` gated behind the `experimental` feature** — The entire template-based hybrid sequence encoder and its supporting machinery (TemplateGraph, mapping, etc.) was only ever called by `compress_sequences_template_hybrid` (which was already gated) and `qz-bench`. Production qz-cli / qz-python builds no longer ship the code, eliminating 18 "unused symbol" warnings.
+- **`openzl` bench-only graph variants gated behind `experimental`** — `compress_ace`, `compress_clustering`, `compress_delta_entropy`, `compress_dna_numeric`, `compress_field_lz`, `compress_fse`, `compress_huffman`, `compress_transpose_zstd` and their `*_graph_fn` helpers were only called by `bench_openzl_graphs.rs`. They no longer reach production binaries.
+
+### Tests
+
+- **`assert_cmd` smoke tests for `qz` and `bz` binaries** — 8 + 5 = 13 new tests covering: `--help` and `--version`, friendly error on missing input, overwrite refusal without `--force`, end-to-end compress→decompress→cmp roundtrip via the binary, `verify` happy path, and CLI flag-conflict rejection (`--fasta`/`--no-quality` × `--quality-mode`).
+
 ### Security / Safety
 
 - **Archive parser hardened against malformed input** — `parse_archive_header` previously indexed raw bytes (`data[offset]`) after offsets were advanced by attacker-controlled `num_lengths * 4`; a crafted archive could trigger an index-out-of-bounds panic (DoS). All single-byte reads now go through a bounds-checked `read_u8` helper; the read-lengths block is validated against the archive size before being skipped.
@@ -68,11 +119,6 @@
 - **`quality_model::encode_with_model` and `quality_delta::encode_quality_deltas` return `Result`** — Bail on Phred > 93 rather than silently corrupting.
 - **`dna_utils::pack_dna_2bit` returns `Result`** — Bails on IUPAC bases rather than silently corrupting.
 - **`debruijn::encode_reads` and `greedy_contig::encode_reads` return `Result`** — Propagate from the changed `pack_dna_2bit`.
-
-### Known limitations (not fixed in this pass)
-
-- **Casava header columnar codec uses `u16` for tile/x/y** — NovaSeq X x/y coordinates can exceed 65535. Such headers correctly fall back to raw BSC (no data loss) and now emit a one-line `warn!` so operators can see the slower path. A v0x03 format with `u32` fields would be needed to compress these as efficiently as standard Illumina headers.
-- **Bench-only OpenZL graph variants ship in qz-lib** — `openzl::compress_ace/dna_numeric/clustering/...` are called only from `bench_openzl_graphs`. Left in qz-lib for now (no correctness impact; small binary-size cost).
 
 ### Added
 

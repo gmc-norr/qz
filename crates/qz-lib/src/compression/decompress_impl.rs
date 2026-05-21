@@ -1,4 +1,6 @@
-//! Streaming BSC decompression: parallel block decompression through bounded channels.
+//! Parallel BSC decompression: per-stream rayon-batched block decompression.
+//! Each stream is drained into a contiguous `Vec<u8>` before record
+//! reconstruction, so peak memory scales with the decompressed FASTQ size.
 
 use anyhow::{Context, Result};
 use std::time::Instant;
@@ -40,6 +42,7 @@ impl std::io::Write for HashWriter {
 }
 
 /// Result of archive verification.
+#[derive(Debug, Clone)]
 pub struct VerifyResult {
     pub num_reads: usize,
     pub encoding_type: u8,
@@ -48,9 +51,33 @@ pub struct VerifyResult {
     pub headers_compressed_len: usize,
     pub sequences_compressed_len: usize,
     pub qualities_compressed_len: usize,
+    /// CRC32 (IEEE) over the reconstructed FASTQ bytes. Only populated by deep
+    /// verify; set to 0 in fast mode (use `mode` to distinguish).
     pub crc32: u32,
+    /// In deep mode: total bytes of reconstructed FASTQ. In fast mode: total
+    /// compressed bytes whose CRC32s were verified.
     pub total_bytes: u64,
+    /// Number of qz-v3 blocks whose per-block CRC32 was verified. Only set in
+    /// fast mode (zero in deep mode, since deep verify catches corruption via
+    /// the codecs themselves while reconstructing records).
+    pub blocks_verified: u32,
+    /// Number of streams the fast-verify walker skipped because they were not
+    /// encoded in qz-v3 multi-block framing (e.g. raw zstd streams, ultra-mode
+    /// chunk framing). Always 0 in deep mode. A non-zero value means fast
+    /// verify did NOT cover the whole archive — callers must run deep verify
+    /// for full integrity assurance.
+    pub streams_skipped: u32,
+    pub mode: VerifyMode,
     pub elapsed_secs: f64,
+}
+
+/// Verification mode reported back to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerifyMode {
+    /// Full decompress + reconstruct + CRC32 over FASTQ output bytes.
+    Deep,
+    /// Per-block CRC32 verification only — does not invoke BSC/codec decoders.
+    Fast,
 }
 
 /// Block-by-block BSC stream decoder for memory-efficient decompression.
@@ -98,8 +125,10 @@ fn stream_decompressor_inner(
     while blocks_done < num_blocks {
         let batch_size = max_batch.min(num_blocks - blocks_done);
 
-        // Read compressed blocks from file (sequential I/O)
-        let mut compressed_blocks = Vec::with_capacity(batch_size);
+        // Read compressed blocks from file (sequential I/O). v3 layout per block:
+        // [block_len: u32 LE][crc32: u32 LE][BSC payload]. The CRC is verified
+        // alongside the parallel decompress below, before libbsc is invoked.
+        let mut compressed_blocks: Vec<(Vec<u8>, u32)> = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             file.read_exact(&mut buf4)?;
             let block_len = u32::from_le_bytes(buf4) as usize;
@@ -109,15 +138,27 @@ fn stream_decompressor_inner(
                     block_len
                 );
             }
+            file.read_exact(&mut buf4)?;
+            let expected_crc = u32::from_le_bytes(buf4);
             let mut data = vec![0u8; block_len];
             file.read_exact(&mut data)?;
-            compressed_blocks.push(data);
+            compressed_blocks.push((data, expected_crc));
         }
 
-        // Decompress batch in parallel using rayon
+        // Verify CRC + decompress each block in parallel using rayon.
         let decompressed: Result<Vec<Vec<u8>>> = compressed_blocks
             .into_par_iter()
-            .map(|block| bsc::decompress(&block))
+            .enumerate()
+            .map(|(i, (block, expected_crc))| {
+                let actual_crc = bsc::block_crc32(&block);
+                if actual_crc != expected_crc {
+                    anyhow::bail!(
+                        "BSC streaming block {} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                        blocks_done + i, expected_crc, actual_crc
+                    );
+                }
+                bsc::decompress(&block)
+            })
             .collect();
         let decompressed = decompressed?;
 
@@ -172,8 +213,9 @@ fn stream_decompressor_columnar_inner(
     file.read_exact(&mut buf4)?;
     let num_blocks = u32::from_le_bytes(buf4) as usize;
 
-    for _ in 0..num_blocks {
-        // Read block: [block_len: u32][data]
+    for idx in 0..num_blocks {
+        // v3 layout: [block_len: u32][crc32: u32][payload: block_len bytes]
+        // Payload = [chunk_reads: u32][columnar_blob].
         file.read_exact(&mut buf4)?;
         let block_len = u32::from_le_bytes(buf4) as usize;
         if block_len > 64 * 1024 * 1024 {
@@ -182,10 +224,20 @@ fn stream_decompressor_columnar_inner(
                 block_len
             );
         }
+        file.read_exact(&mut buf4)?;
+        let expected_crc = u32::from_le_bytes(buf4);
         let mut data = vec![0u8; block_len];
         file.read_exact(&mut data)?;
 
-        // First 4 bytes of data = num_reads in this block
+        let actual_crc = bsc::block_crc32(&data);
+        if actual_crc != expected_crc {
+            anyhow::bail!(
+                "Columnar header block {idx} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                expected_crc, actual_crc
+            );
+        }
+
+        // First 4 bytes of payload = num_reads in this block
         if data.len() < 4 {
             anyhow::bail!("Columnar header block too short");
         }
@@ -232,11 +284,22 @@ fn can_stream_decompress_path(input: &std::path::Path) -> Result<bool> {
         anyhow::bail!("Not a QZ archive (missing magic bytes)");
     }
     let version = header[2];
-    if version > ARCHIVE_VERSION {
-        anyhow::bail!(
-            "Archive version {} is newer than this build supports (max {}). Please update qz.",
-            version, ARCHIVE_VERSION
-        );
+    if version != ARCHIVE_VERSION {
+        if version < ARCHIVE_VERSION {
+            anyhow::bail!(
+                "Archive format v{} is no longer supported (current format is v{}). \
+                 v3 added a per-block CRC32 to the BSC/OpenZL block layout — older archives \
+                 cannot be read without that field. Please re-encode with `qz compress`, \
+                 or use an older qz binary to decompress the original.",
+                version, ARCHIVE_VERSION
+            );
+        } else {
+            anyhow::bail!(
+                "Archive version {} is newer than this build supports (max v{}). \
+                 Please update qz.",
+                version, ARCHIVE_VERSION
+            );
+        }
     }
 
     let b: usize = V2_PREFIX_SIZE; // body starts after v2 prefix
@@ -264,15 +327,22 @@ fn can_stream_decompress_path(input: &std::path::Path) -> Result<bool> {
         && (header_compressor == 1 || header_compressor == 3))  // BSC or Columnar
 }
 
-/// Memory-efficient parallel streaming decompression for BSC archives.
+/// Parallel decompression for BSC archives, three streams in parallel.
 ///
 /// Spawns 3 decompressor threads (one per stream: headers, sequences, qualities)
 /// that read and decompress BSC blocks in parallel batches using rayon.
-/// Decompressed blocks are fed through bounded channels to the main thread,
-/// which reconstructs FASTQ records and writes them to the output file.
+/// Decompressed blocks are pushed through **unbounded** mpsc channels into
+/// `drain_channel`, which collects each stream into one contiguous `Vec<u8>`
+/// before record reconstruction begins. This means peak memory scales with
+/// the **decompressed** size of the FASTQ data, not a fixed 300 MB —
+/// downstream record-reconstruction code (`scan_header_offsets`, varint
+/// walking) needs the full stream resident to compute offsets.
 ///
-/// Peak memory: ~300 MB (3 streams x ~4 decompressed blocks x 25 MB + output buffer)
-/// regardless of input size. Uses all available CPU cores via rayon.
+/// In practice peak memory is roughly the size of the decompressed FASTQ plus
+/// the BSC block batch buffers (≈ `batch_size * 25 MB` per stream while
+/// decompression is in flight). For very large inputs, prefer the
+/// in-memory `decompress_to_records` path with mmap, which avoids the
+/// channel copies.
 pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
     use std::io::{Read, Write};
 
@@ -294,11 +364,22 @@ pub(super) fn decompress_streaming_bsc(args: &DecompressConfig) -> Result<()> {
         anyhow::bail!("Not a QZ archive (missing magic bytes)");
     }
     let version = header[2];
-    if version > ARCHIVE_VERSION {
-        anyhow::bail!(
-            "Archive version {} is newer than this build supports (max {}). Please update qz.",
-            version, ARCHIVE_VERSION
-        );
+    if version != ARCHIVE_VERSION {
+        if version < ARCHIVE_VERSION {
+            anyhow::bail!(
+                "Archive format v{} is no longer supported (current format is v{}). \
+                 v3 added a per-block CRC32 to the BSC/OpenZL block layout — older archives \
+                 cannot be read without that field. Please re-encode with `qz compress`, \
+                 or use an older qz binary to decompress the original.",
+                version, ARCHIVE_VERSION
+            );
+        } else {
+            anyhow::bail!(
+                "Archive version {} is newer than this build supports (max v{}). \
+                 Please update qz.",
+                version, ARCHIVE_VERSION
+            );
+        }
     }
     let stored_header_size = read_le_u32(&header, 4)? as usize;
 
@@ -786,11 +867,22 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         anyhow::bail!("Not a QZ archive (missing magic bytes)");
     }
     let version = data[2];
-    if version > ARCHIVE_VERSION {
-        anyhow::bail!(
-            "Archive version {} is newer than this build supports (max {}). Please update qz.",
-            version, ARCHIVE_VERSION
-        );
+    if version != ARCHIVE_VERSION {
+        if version < ARCHIVE_VERSION {
+            anyhow::bail!(
+                "Archive format v{} is no longer supported (current format is v{}). \
+                 v3 added a per-block CRC32 to the BSC/OpenZL block layout — older archives \
+                 cannot be read without that field. Please re-encode with `qz compress`, \
+                 or use an older qz binary to decompress the original.",
+                version, ARCHIVE_VERSION
+            );
+        } else {
+            anyhow::bail!(
+                "Archive version {} is newer than this build supports (max v{}). \
+                 Please update qz.",
+                version, ARCHIVE_VERSION
+            );
+        }
     }
     let _stored_header_size = read_le_u32(data, 4)? as usize;
 
@@ -932,8 +1024,53 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         (0, 0)
     };
 
-    if data.len() < offset + headers_len + sequences_len + nmasks_len + qualities_len {
-        anyhow::bail!("Invalid archive: data truncated");
+    // Cap each declared stream length at the archive size — no individual stream
+    // can be larger than the file it's stored in. Without this, a hostile archive
+    // declaring any of {headers_len, sequences_len, nmasks_len, qualities_len} =
+    // 0xFFFF_FFFF_FFFF_FFFF would wrap the addition below and silently bypass
+    // the truncation check, then trigger huge Vec allocations downstream.
+    for (name, len) in [
+        ("headers_len", headers_len),
+        ("sequences_len", sequences_len),
+        ("nmasks_len", nmasks_len),
+        ("qualities_len", qualities_len),
+    ] {
+        if len > data.len() {
+            anyhow::bail!(
+                "Invalid archive: {name} = {len} exceeds archive size {}",
+                data.len()
+            );
+        }
+    }
+    // Bound `num_reads` against the downstream pre-allocation it drives.
+    // Each per-record `Vec<u8>` allocated in the decompress path costs ~24 bytes
+    // of metadata (ptr + len + cap, all `usize`); cap the total at 256 GB so
+    // `num_reads = u64::MAX` can't OOM the host before any decoding starts.
+    // Highly compressible inputs may have num_reads >> archive size, which is
+    // legitimate (a 30 000-read FASTQ of repeated ACGT compresses to ~5 KB),
+    // so this cap is intentionally loose against the data length.
+    const MAX_RECORD_PREALLOC_BYTES: usize = 256 * 1024 * 1024 * 1024;
+    const PER_RECORD_OVERHEAD: usize = std::mem::size_of::<Vec<u8>>();
+    let max_plausible_reads = MAX_RECORD_PREALLOC_BYTES / PER_RECORD_OVERHEAD;
+    if num_reads > max_plausible_reads {
+        anyhow::bail!(
+            "Invalid archive: num_reads = {num_reads} exceeds plausible cap {} \
+             (would pre-allocate >256 GB of per-record metadata)",
+            max_plausible_reads
+        );
+    }
+
+    let body_end = offset
+        .checked_add(headers_len)
+        .and_then(|o| o.checked_add(sequences_len))
+        .and_then(|o| o.checked_add(nmasks_len))
+        .and_then(|o| o.checked_add(qualities_len))
+        .ok_or_else(|| anyhow::anyhow!("Invalid archive: stream-length sum overflows usize"))?;
+    if data.len() < body_end {
+        anyhow::bail!(
+            "Invalid archive: streams claim {body_end} bytes but archive is {}",
+            data.len()
+        );
     }
 
     Ok(ArchiveHeader {
@@ -1302,16 +1439,31 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
 pub(super) fn decompress(args: &DecompressConfig) -> Result<()> {
     use std::io::Write;
 
-    // Honor -t / num_threads for all rayon work below (BSC block decompression,
-    // record reconstruction, etc.). build_global is best-effort; if a pool was
-    // already installed (e.g. by a prior call in the same process or by tests),
-    // we silently keep the existing one.
+    // Honor -t / num_threads for rayon work below (BSC block decompression,
+    // record reconstruction, etc.). Note: rayon's global pool is process-wide
+    // and can only be built once — the first qz-lib call wins, so subsequent
+    // calls with a different thread count are silently ignored. We warn when
+    // that happens so library users (qz-python, etc.) can spot the mismatch.
     let num_threads = resolve_num_threads(args.num_threads);
-    rayon::ThreadPoolBuilder::new()
+    let actual_threads = match rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global()
-        .ok();
-    info!("Using {} threads for decompression", num_threads);
+    {
+        Ok(()) => num_threads,
+        Err(_) => {
+            let existing = rayon::current_num_threads();
+            if existing != num_threads {
+                tracing::warn!(
+                    "Requested {} threads but the rayon pool was already \
+                     initialized to {} threads (process-wide setting). \
+                     Using {} threads.",
+                    num_threads, existing, existing
+                );
+            }
+            existing
+        }
+    };
+    info!("Using {} threads for decompression", actual_threads);
 
     // If input is stdin, spool to a temp file first (decompression needs seeking)
     let (_stdin_tmp, args) = if crate::cli::is_stdio_path(&args.input) {
@@ -1411,11 +1563,22 @@ fn verify_streaming(input: &std::path::Path, hasher: &mut HashWriter) -> Result<
         anyhow::bail!("Not a QZ archive (missing magic bytes)");
     }
     let version = header[2];
-    if version > ARCHIVE_VERSION {
-        anyhow::bail!(
-            "Archive version {} is newer than this build supports (max {}). Please update qz.",
-            version, ARCHIVE_VERSION
-        );
+    if version != ARCHIVE_VERSION {
+        if version < ARCHIVE_VERSION {
+            anyhow::bail!(
+                "Archive format v{} is no longer supported (current format is v{}). \
+                 v3 added a per-block CRC32 to the BSC/OpenZL block layout — older archives \
+                 cannot be read without that field. Please re-encode with `qz compress`, \
+                 or use an older qz binary to decompress the original.",
+                version, ARCHIVE_VERSION
+            );
+        } else {
+            anyhow::bail!(
+                "Archive version {} is newer than this build supports (max v{}). \
+                 Please update qz.",
+                version, ARCHIVE_VERSION
+            );
+        }
     }
     let stored_header_size = read_le_u32(&header, 4)? as usize;
 
@@ -1489,11 +1652,26 @@ fn resolve_num_threads(requested: usize) -> usize {
 /// Verify a QZ archive: fully decompress all streams, compute CRC32, report metadata.
 pub(super) fn verify(config: &VerifyConfig) -> Result<VerifyResult> {
     let num_threads = resolve_num_threads(config.num_threads);
-    rayon::ThreadPoolBuilder::new()
+    // See compress() and decompress() for the rayon global-pool caveat.
+    let actual_threads = match rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global()
-        .ok();
-    info!("Using {} threads for verification", num_threads);
+    {
+        Ok(()) => num_threads,
+        Err(_) => {
+            let existing = rayon::current_num_threads();
+            if existing != num_threads {
+                tracing::warn!(
+                    "Requested {} threads but the rayon pool was already \
+                     initialized to {} threads (process-wide setting). \
+                     Using {} threads.",
+                    num_threads, existing, existing
+                );
+            }
+            existing
+        }
+    };
+    info!("Using {} threads for verification", actual_threads);
 
     let start_time = Instant::now();
 
@@ -1510,6 +1688,10 @@ pub(super) fn verify(config: &VerifyConfig) -> Result<VerifyResult> {
         (None, std::borrow::Cow::Borrowed(&config.input))
     };
     let input_path: &std::path::Path = &input_path;
+
+    if config.fast {
+        return verify_fast(input_path, start_time);
+    }
 
     let mut hasher = HashWriter::new();
 
@@ -1537,6 +1719,130 @@ pub(super) fn verify(config: &VerifyConfig) -> Result<VerifyResult> {
         qualities_compressed_len: hdr.qualities_len,
         crc32: hasher.checksum(),
         total_bytes: hasher.total_bytes(),
+        blocks_verified: 0,
+        streams_skipped: 0,
+        mode: VerifyMode::Deep,
+        elapsed_secs: elapsed.as_secs_f64(),
+    })
+}
+
+/// Fast verify: walk every qz-v3 block header in each stream and verify its
+/// CRC32 without invoking the inner codec. Catches bit-rot in O(IO + CRC)
+/// time. Does NOT reconstruct FASTQ output — the deep CRC32 over decoded
+/// bytes is not computed (caller can run plain `verify` for that).
+///
+/// Only walks streams that actually use v3 multi-block framing. Raw-zstd
+/// streams are skipped (and counted in `streams_skipped`), and ultra-mode
+/// archives are rejected outright — their outer per-chunk frame has no per-block
+/// CRC, so a fast walker can't safely verify them without false positives.
+fn verify_fast(input_path: &std::path::Path, start_time: Instant) -> Result<VerifyResult> {
+    use crate::compression::bsc;
+    use crate::cli::{HeaderCompressor, QualityCompressor};
+
+    info!("Verifying (fast mode: per-block CRC32 only)...");
+    let input_file = std::fs::File::open(input_path)?;
+    let archive_data = unsafe { memmap2::Mmap::map(&input_file) }?;
+    let hdr = parse_archive_header(&archive_data)?;
+
+    // Ultra and local-reorder archives wrap streams in an extra per-chunk
+    // frame `[num_chunks][chunk_len, chunk_data]...` that has no per-block
+    // CRC32. Walking it with the v3 verifier would mis-interpret chunk_len
+    // bytes as `[block_len, crc, payload]` and produce spurious "CRC
+    // mismatch" errors on healthy archives. Refuse and tell the user.
+    if hdr.encoding_type == 8 || hdr.encoding_type == 9 {
+        anyhow::bail!(
+            "fast verify does not support encoding_type={} (ultra/local-reorder); \
+             the outer per-chunk frame has no per-block CRC32. Rerun without --fast \
+             for a full integrity check.",
+            hdr.encoding_type
+        );
+    }
+
+    // Per-stream compressor → whether v3 multi-block framing applies.
+    // Zstd writes raw zstd bytes (no num_blocks/CRC framing). BSC, OpenZL,
+    // Columnar (headers), Fqzcomp + QualityCtx (qualities) all use v3 framing.
+    let header_is_v3 = !matches!(hdr.header_compressor, HeaderCompressor::Zstd);
+    let qual_is_v3 = !matches!(hdr.quality_compressor, QualityCompressor::Zstd);
+
+    let data = &archive_data[..];
+    let h_start = hdr.data_offset;
+    let s_start = h_start + hdr.headers_len;
+    let n_start = s_start + hdr.sequences_len;
+    let q_start = n_start + hdr.nmasks_len;
+    let q_end = q_start + hdr.qualities_len;
+
+    let mut total_blocks: usize = 0;
+    let mut total_compressed: u64 = 0;
+    let mut streams_skipped: u32 = 0;
+
+    // (name, slice, is_v3) per stream. sequences + nmasks always use BSC (v3).
+    let streams: [(&str, &[u8], bool); 4] = [
+        ("headers",   &data[h_start..h_start + hdr.headers_len], header_is_v3),
+        ("sequences", &data[s_start..s_start + hdr.sequences_len], true),
+        ("nmasks",    &data[n_start..n_start + hdr.nmasks_len],    true),
+        ("qualities", &data[q_start..q_start + hdr.qualities_len], qual_is_v3),
+    ];
+    for (name, stream, is_v3) in streams {
+        if !is_v3 {
+            streams_skipped += 1;
+            info!(
+                "  {name}: {} bytes — SKIPPED (non-v3 framing, e.g. raw zstd)",
+                stream.len()
+            );
+            continue;
+        }
+        let n = bsc::verify_parallel_crcs(stream)
+            .with_context(|| format!("fast verify: {name} stream"))?;
+        total_blocks += n;
+        total_compressed += stream.len() as u64;
+        info!("  {name}: {} bytes, {} blocks verified", stream.len(), n);
+    }
+
+    // encoding_type=6 (rc_canon) appends a v3-framed RC flags stream after
+    // qualities: `[rc_flags_len: u64 LE][num_blocks][block_len, crc, payload]...`.
+    // Skipping this would let bit-rot in RC flags slip past fast verify.
+    if hdr.encoding_type == 6 && q_end + 8 <= data.len() {
+        let rc_len = super::read_le_u64(data, q_end)? as usize;
+        let rc_start = q_end + 8;
+        let rc_end = rc_start.checked_add(rc_len)
+            .filter(|&e| e <= data.len())
+            .ok_or_else(|| anyhow::anyhow!("rc_flags stream extends past archive"))?;
+        let rc_stream = &data[rc_start..rc_end];
+        let n = bsc::verify_parallel_crcs(rc_stream)
+            .with_context(|| "fast verify: rc_flags stream")?;
+        total_blocks += n;
+        total_compressed += rc_stream.len() as u64;
+        info!("  rc_flags: {} bytes, {} blocks verified", rc_stream.len(), n);
+    }
+
+    let elapsed = start_time.elapsed();
+    info!(
+        "Fast verification completed in {:.2}s: {} blocks across {} bytes ({} streams skipped)",
+        elapsed.as_secs_f64(),
+        total_blocks,
+        total_compressed,
+        streams_skipped,
+    );
+    if streams_skipped > 0 {
+        tracing::warn!(
+            "Fast verify skipped {} non-v3 stream(s); rerun without --fast for full coverage.",
+            streams_skipped
+        );
+    }
+
+    Ok(VerifyResult {
+        num_reads: hdr.num_reads,
+        encoding_type: hdr.encoding_type,
+        header_compressor: hdr.header_compressor,
+        quality_compressor: hdr.quality_compressor,
+        headers_compressed_len: hdr.headers_len,
+        sequences_compressed_len: hdr.sequences_len,
+        qualities_compressed_len: hdr.qualities_len,
+        crc32: 0, // not computed in fast mode
+        total_bytes: total_compressed,
+        blocks_verified: total_blocks as u32,
+        streams_skipped,
+        mode: VerifyMode::Fast,
         elapsed_secs: elapsed.as_secs_f64(),
     })
 }

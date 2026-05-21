@@ -29,23 +29,29 @@ enum HeaderFormat {
     Casava,
 }
 
-/// Parsed SRA header fields (borrows from original header — zero allocation)
+/// Parsed SRA header fields (borrows from original header — zero allocation).
+///
+/// Spatial fields are u32 to support newer instruments (NovaSeq X x/y can reach
+/// ~70k, which overflows u16). The on-disk layout still uses u16 (v0x01) when
+/// all values fit, and switches to u32 (v0x04) only when they don't, keeping
+/// archive size stable for typical Illumina runs.
 struct SraRow<'h> {
     combo: &'h str,
     read_num: u32,
     lane: u8,
-    tile: u16,
-    x: u16,
-    y: u16,
+    tile: u32,
+    x: u32,
+    y: u32,
 }
 
-/// Parsed Casava header fields (borrows from original header — zero allocation)
+/// Parsed Casava header fields (borrows from original header — zero allocation).
+/// See [`SraRow`] for the u32 rationale and the dual-version (0x02 / 0x03) layout.
 struct CasavaRow<'h> {
     combo: &'h str,
     lane: u8,
-    tile: u16,
-    x: u16,
-    y: u16,
+    tile: u32,
+    x: u32,
+    y: u32,
     umi: Option<&'h str>,
     comment: &'h str,
 }
@@ -56,43 +62,15 @@ pub fn compress_headers_columnar(headers: &[&str]) -> Result<Vec<u8>> {
         return Ok(vec![0x00]);
     }
 
-    // Detect format from first header
+    // Detect format from first header. NovaSeq X-scale x/y values are handled
+    // by the wide-spatial format variants (Casava v0x03, SRA v0x04) — no
+    // raw-fallback warning needed.
     let format = detect_format(headers[0]);
     match format {
         Some(HeaderFormat::Sra) => compress_sra(headers),
         Some(HeaderFormat::Casava) => compress_casava(headers),
-        None => {
-            // Warn once if the header *looks* Casava-shaped but a numeric field
-            // doesn't fit u16 — NovaSeq X x/y can reach ~70k. We still compress
-            // correctly via the raw BSC fallback, just less compactly.
-            if looks_like_overflowing_casava(headers[0]) {
-                tracing::warn!(
-                    "Header field exceeds u16 (likely NovaSeq X x/y coordinate); \
-                     falling back to raw header BSC encoding (correct, but ~5-10% larger)."
-                );
-            }
-            compress_raw_fallback(headers)
-        }
+        None => compress_raw_fallback(headers),
     }
-}
-
-/// Returns true if the first header looks Casava-shaped except that one of the
-/// numeric fields (lane/tile/x/y) overflows u16. Used only for the diagnostic
-/// warning when the columnar fast path falls back to raw BSC.
-fn looks_like_overflowing_casava(header: &str) -> bool {
-    let without_at = header.strip_prefix('@').unwrap_or(header);
-    let name_part = without_at.split_once(' ').map(|(n, _)| n).unwrap_or(without_at);
-    let fields: Vec<&str> = name_part.split(':').collect();
-    if fields.len() < 7 { return false; }
-    // Wider parses must succeed but at least one must overflow the u16-based codec.
-    let lane_u32 = fields[3].parse::<u32>().ok();
-    let tile_u32 = fields[4].parse::<u32>().ok();
-    let x_u32 = fields[5].parse::<u32>().ok();
-    let y_u32 = fields[6].parse::<u32>().ok();
-    matches!((lane_u32, tile_u32, x_u32, y_u32), (Some(_), Some(_), Some(_), Some(_)))
-        && (tile_u32.unwrap() > u16::MAX as u32
-            || x_u32.unwrap() > u16::MAX as u32
-            || y_u32.unwrap() > u16::MAX as u32)
 }
 
 /// Decompress columnar-encoded headers.
@@ -101,10 +79,14 @@ pub fn decompress_headers_columnar(data: &[u8], num_reads: usize) -> Result<Vec<
         return Ok(Vec::new());
     }
 
+    // 0x01/0x02: legacy u16 spatial fields. 0x03/0x04: u32 spatial fields for
+    // NovaSeq X-scale x/y. Both widths share the same column-blob layout.
     let strings = match data[0] {
         0x00 => decompress_raw_fallback(&data[1..], num_reads),
-        0x01 => decompress_sra(&data[1..], num_reads),
-        0x02 => decompress_casava(&data[1..], num_reads),
+        0x01 => decompress_sra(&data[1..], num_reads, false),
+        0x04 => decompress_sra(&data[1..], num_reads, true),
+        0x02 => decompress_casava(&data[1..], num_reads, false),
+        0x03 => decompress_casava(&data[1..], num_reads, true),
         v => anyhow::bail!("Unknown header_col version: {}", v),
     }?;
     Ok(strings.into_iter().map(String::into_bytes).collect())
@@ -118,7 +100,8 @@ fn detect_format(header: &str) -> Option<HeaderFormat> {
     let without_at = header.strip_prefix('@').unwrap_or(header);
     let (name_part, comment) = without_at.split_once(' ')?;
 
-    // SRA format: name has dots, comment has 7+ colon-separated fields
+    // SRA format: name has dots, comment has 7+ colon-separated fields.
+    // u32 parses accept NovaSeq X-scale x/y values (which would overflow u16).
     if name_part.contains('.') {
         let rn_str = name_part.rsplit('.').next()?;
         if rn_str.parse::<u32>().is_ok() {
@@ -126,7 +109,7 @@ fn detect_format(header: &str) -> Option<HeaderFormat> {
             let fields: Vec<&str> = comment_base.split(':').collect();
             if fields.len() >= 7
                 && fields[3].parse::<u8>().is_ok()
-                && fields[5].parse::<u16>().is_ok()
+                && fields[5].parse::<u32>().is_ok()
             {
                 return Some(HeaderFormat::Sra);
             }
@@ -137,9 +120,9 @@ fn detect_format(header: &str) -> Option<HeaderFormat> {
     let name_fields: Vec<&str> = name_part.split(':').collect();
     if name_fields.len() >= 7
         && name_fields[3].parse::<u8>().is_ok()
-        && name_fields[4].parse::<u16>().is_ok()
-        && name_fields[5].parse::<u16>().is_ok()
-        && name_fields[6].parse::<u16>().is_ok()
+        && name_fields[4].parse::<u32>().is_ok()
+        && name_fields[5].parse::<u32>().is_ok()
+        && name_fields[6].parse::<u32>().is_ok()
     {
         return Some(HeaderFormat::Casava);
     }
@@ -173,6 +156,15 @@ fn parse_sra_row(header: &str) -> Option<SraRow<'_>> {
     })
 }
 
+/// Pick the on-disk version for the spatial columns.
+/// Returns the width byte (`0x01` SRA v0x01 / `0x02` Casava v0x02 → u16 fields;
+/// `0x04` SRA v0x04 / `0x03` Casava v0x03 → u32 fields). Encoders pick the
+/// narrower version whenever values fit, so existing Illumina datasets stay
+/// byte-identical to pre-widening output.
+fn fits_in_u16(values: &[u32]) -> bool {
+    values.iter().all(|&v| v <= u16::MAX as u32)
+}
+
 fn compress_sra(headers: &[&str]) -> Result<Vec<u8>> {
     let (name_prefix, pair_suffix) = detect_sra_template(headers[0]);
     let n = headers.len();
@@ -190,6 +182,12 @@ fn compress_sra(headers: &[&str]) -> Result<Vec<u8>> {
     let mut tiles = Vec::with_capacity(n * 2);
     let mut xs = Vec::with_capacity(n * 2);
     let mut ys = Vec::with_capacity(n * 2);
+
+    // Collect spatial fields as u32 first; the on-disk width is decided after
+    // the full scan based on whether any value overflows u16.
+    let mut tiles_u32 = Vec::with_capacity(n);
+    let mut xs_u32 = Vec::with_capacity(n);
+    let mut ys_u32 = Vec::with_capacity(n);
 
     for row_opt in &rows {
         let row = match row_opt {
@@ -210,16 +208,31 @@ fn compress_sra(headers: &[&str]) -> Result<Vec<u8>> {
         read_nums.extend_from_slice(&row.read_num.to_le_bytes());
         combo_idxs.push(idx);
         lanes.push(row.lane);
-        tiles.extend_from_slice(&row.tile.to_le_bytes());
-        xs.extend_from_slice(&row.x.to_le_bytes());
-        ys.extend_from_slice(&row.y.to_le_bytes());
+        tiles_u32.push(row.tile);
+        xs_u32.push(row.x);
+        ys_u32.push(row.y);
+    }
+
+    // Pick the narrowest format that fits. Preserves byte-identical output for
+    // typical Illumina headers; only NovaSeq X-scale x/y triggers v0x04.
+    let narrow = fits_in_u16(&tiles_u32) && fits_in_u16(&xs_u32) && fits_in_u16(&ys_u32);
+    if narrow {
+        for v in &tiles_u32 { tiles.extend_from_slice(&(*v as u16).to_le_bytes()); }
+        for v in &xs_u32    { xs.extend_from_slice(&(*v as u16).to_le_bytes()); }
+        for v in &ys_u32    { ys.extend_from_slice(&(*v as u16).to_le_bytes()); }
+    } else {
+        for v in &tiles_u32 { tiles.extend_from_slice(&v.to_le_bytes()); }
+        for v in &xs_u32    { xs.extend_from_slice(&v.to_le_bytes()); }
+        for v in &ys_u32    { ys.extend_from_slice(&v.to_le_bytes()); }
     }
 
     let combos_owned: Vec<String> = combos.iter().map(|s| s.to_string()).collect();
-    compress_sra_columns(&name_prefix, &pair_suffix, combos_owned, combo_idxs, read_nums, lanes, tiles, xs, ys, n)
+    let version = if narrow { 0x01u8 } else { 0x04u8 };
+    compress_sra_columns(version, &name_prefix, &pair_suffix, combos_owned, combo_idxs, read_nums, lanes, tiles, xs, ys, n)
 }
 
 fn compress_sra_columns(
+    version: u8,
     name_prefix: &str,
     pair_suffix: &str,
     combos: Vec<String>,
@@ -256,7 +269,7 @@ fn compress_sra_columns(
     let c_ys = c_ys?;
 
     let mut out = Vec::new();
-    out.push(0x01); // version = SRA columnar
+    out.push(version); // 0x01 (u16 tile/x/y) or 0x04 (u32 tile/x/y)
     write_string(&mut out, name_prefix);
     write_string(&mut out, pair_suffix);
     write_combo_dict(&mut out, &combos);
@@ -267,7 +280,7 @@ fn compress_sra_columns(
     Ok(out)
 }
 
-fn decompress_sra(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
+fn decompress_sra(data: &[u8], num_reads: usize, wide: bool) -> Result<Vec<String>> {
     let mut pos = 0;
 
     let name_prefix = read_string(data, &mut pos)?;
@@ -296,14 +309,22 @@ fn decompress_sra(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
     let d_xs = col_iter.next().unwrap()?;
     let d_ys = col_iter.next().unwrap()?;
 
+    let read_spatial = |blob: &[u8], idx: usize| -> Result<u32> {
+        if wide {
+            super::read_le_u32(blob, idx * 4)
+        } else {
+            super::read_le_u16(blob, idx * 2).map(|v| v as u32)
+        }
+    };
+
     let headers: Result<Vec<String>> = (0..num_reads).into_par_iter().map(|i| {
         let rn = super::read_le_u32(&d_rn, i * 4)?;
         let ci = *d_ci.get(i).ok_or_else(|| anyhow::anyhow!("SRA: combo index out of bounds at read {i}"))?;
         let combo = combos.get(ci as usize).ok_or_else(|| anyhow::anyhow!("SRA: combo dict entry {} out of range at read {i}", ci))?;
         let lane = *d_ln.get(i).ok_or_else(|| anyhow::anyhow!("SRA: lane out of bounds at read {i}"))?;
-        let tile = super::read_le_u16(&d_ti, i * 2)?;
-        let x = super::read_le_u16(&d_xs, i * 2)?;
-        let y = super::read_le_u16(&d_ys, i * 2)?;
+        let tile = read_spatial(&d_ti, i)?;
+        let x = read_spatial(&d_xs, i)?;
+        let y = read_spatial(&d_ys, i)?;
 
         Ok(if pair_suffix.is_empty() {
             format!("@{}{} {}:{}:{}:{}:{}", name_prefix, rn, combo, lane, tile, x, y)
@@ -350,9 +371,9 @@ fn parse_casava_row(header: &str) -> Option<CasavaRow<'_>> {
     let combo_len = fields[0].len() + 1 + fields[1].len() + 1 + fields[2].len();
     let combo = &name_part[..combo_len];
     let lane: u8 = fields[3].parse().ok()?;
-    let tile: u16 = fields[4].parse().ok()?;
-    let x: u16 = fields[5].parse().ok()?;
-    let y: u16 = fields[6].parse().ok()?;
+    let tile: u32 = fields[4].parse().ok()?;
+    let x: u32 = fields[5].parse().ok()?;
+    let y: u32 = fields[6].parse().ok()?;
     // UMI: everything after field[6] (may be multi-part with ':')
     let umi = if fields.len() >= 8 {
         let no_umi_len = combo_len
@@ -382,9 +403,10 @@ fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
     let mut combo_map: HashMap<&str, u8> = HashMap::new();
     let mut combo_idxs = Vec::with_capacity(n);
     let mut lanes = Vec::with_capacity(n);
-    let mut tiles = Vec::with_capacity(n * 2);
-    let mut xs = Vec::with_capacity(n * 2);
-    let mut ys = Vec::with_capacity(n * 2);
+    // Collect spatial as u32; pick wire width after the full scan.
+    let mut tiles_u32 = Vec::with_capacity(n);
+    let mut xs_u32 = Vec::with_capacity(n);
+    let mut ys_u32 = Vec::with_capacity(n);
 
     for row_opt in &rows {
         let row = match row_opt {
@@ -410,10 +432,27 @@ fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
         };
         combo_idxs.push(idx);
         lanes.push(row.lane);
-        tiles.extend_from_slice(&row.tile.to_le_bytes());
-        xs.extend_from_slice(&row.x.to_le_bytes());
-        ys.extend_from_slice(&row.y.to_le_bytes());
+        tiles_u32.push(row.tile);
+        xs_u32.push(row.x);
+        ys_u32.push(row.y);
     }
+
+    // Pick the narrowest format that fits — v0x02 (u16) for typical Illumina,
+    // v0x03 (u32) only when NovaSeq X-scale x/y values overflow.
+    let narrow = fits_in_u16(&tiles_u32) && fits_in_u16(&xs_u32) && fits_in_u16(&ys_u32);
+    let mut tiles = Vec::with_capacity(n * if narrow { 2 } else { 4 });
+    let mut xs = Vec::with_capacity(n * if narrow { 2 } else { 4 });
+    let mut ys = Vec::with_capacity(n * if narrow { 2 } else { 4 });
+    if narrow {
+        for v in &tiles_u32 { tiles.extend_from_slice(&(*v as u16).to_le_bytes()); }
+        for v in &xs_u32    { xs.extend_from_slice(&(*v as u16).to_le_bytes()); }
+        for v in &ys_u32    { ys.extend_from_slice(&(*v as u16).to_le_bytes()); }
+    } else {
+        for v in &tiles_u32 { tiles.extend_from_slice(&v.to_le_bytes()); }
+        for v in &xs_u32    { xs.extend_from_slice(&v.to_le_bytes()); }
+        for v in &ys_u32    { ys.extend_from_slice(&v.to_le_bytes()); }
+    }
+    let version = if narrow { 0x02u8 } else { 0x03u8 };
 
     // Build per-read comment and UMI byte columns using already-parsed slices.
     let mut comments: Vec<u8> = Vec::new();
@@ -456,7 +495,7 @@ fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
 
     // Build output
     let mut out = Vec::new();
-    out.push(0x02); // version = Casava columnar
+    out.push(version); // 0x02 (u16 tile/x/y) or 0x03 (u32 tile/x/y)
     let combos_owned: Vec<String> = combos.iter().map(|s| s.to_string()).collect();
     write_combo_dict(&mut out, &combos_owned);
 
@@ -493,7 +532,7 @@ fn compress_casava(headers: &[&str]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn decompress_casava(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
+fn decompress_casava(data: &[u8], num_reads: usize, wide: bool) -> Result<Vec<String>> {
     let mut pos = 0;
 
     let combos = read_combo_dict(data, &mut pos)?;
@@ -575,13 +614,21 @@ fn decompress_casava(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
         None
     };
 
+    let read_spatial = |blob: &[u8], idx: usize| -> Result<u32> {
+        if wide {
+            super::read_le_u32(blob, idx * 4)
+        } else {
+            super::read_le_u16(blob, idx * 2).map(|v| v as u32)
+        }
+    };
+
     let headers: Result<Vec<String>> = (0..num_reads).into_par_iter().map(|i| {
         let ci = *d_ci.get(i).ok_or_else(|| anyhow::anyhow!("Casava: combo index out of bounds at read {i}"))?;
         let combo = combos.get(ci as usize).ok_or_else(|| anyhow::anyhow!("Casava: combo dict entry {} out of range at read {i}", ci))?;
         let lane = *d_ln.get(i).ok_or_else(|| anyhow::anyhow!("Casava: lane out of bounds at read {i}"))?;
-        let tile = super::read_le_u16(&d_ti, i * 2)?;
-        let x = super::read_le_u16(&d_xs, i * 2)?;
-        let y = super::read_le_u16(&d_ys, i * 2)?;
+        let tile = read_spatial(&d_ti, i)?;
+        let x = read_spatial(&d_xs, i)?;
+        let y = read_spatial(&d_ys, i)?;
 
         let comment = match &common_comment {
             Some(cc) => cc.as_str(),
@@ -870,6 +917,62 @@ mod tests {
 
         let compressed = compress_headers_columnar(&headers).unwrap();
         assert_eq!(compressed[0], 0x02);
+        let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
+        for (orig, dec) in headers.iter().zip(decompressed.iter()) {
+            assert_eq!(orig.as_bytes(), dec.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_casava_novaseq_x_wide() {
+        // NovaSeq X x/y can reach ~70k, overflowing u16. The encoder must pick
+        // v0x03 (u32 spatial fields) and the decoder must read both widths.
+        let headers = vec![
+            "@LH00001:1:22F2WLLT4:1:1101:70000:65537 1:N:0:ATCACG",
+            "@LH00001:1:22F2WLLT4:1:1101:71234:80000 1:N:0:ATCACG",
+            "@LH00001:1:22F2WLLT4:2:1102:80001:90000 1:N:0:ATCACG",
+        ];
+
+        let compressed = compress_headers_columnar(&headers).unwrap();
+        assert_eq!(compressed[0], 0x03, "wide-spatial Casava must use v0x03");
+        let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
+        for (orig, dec) in headers.iter().zip(decompressed.iter()) {
+            assert_eq!(orig.as_bytes(), dec.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_casava_mixed_widths_picks_wide() {
+        // Most rows fit u16, but ONE row overflows y. The encoder must pick
+        // v0x03 for the whole batch (the contract: per-archive width, not
+        // per-row). A future refactor that did per-row width selection would
+        // break the format silently — this test guards against it.
+        let headers = vec![
+            "@LH00001:1:22F2WLLT4:1:1101:1000:2000 1:N:0:ATCACG",
+            "@LH00001:1:22F2WLLT4:1:1101:1100:2100 1:N:0:ATCACG",
+            "@LH00001:1:22F2WLLT4:1:1101:1200:80000 1:N:0:ATCACG", // y overflows u16
+            "@LH00001:1:22F2WLLT4:1:1101:1300:2300 1:N:0:ATCACG",
+        ];
+
+        let compressed = compress_headers_columnar(&headers).unwrap();
+        assert_eq!(compressed[0], 0x03,
+            "any row overflowing u16 must promote the whole archive to v0x03");
+        let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
+        for (orig, dec) in headers.iter().zip(decompressed.iter()) {
+            assert_eq!(orig.as_bytes(), dec.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_roundtrip_sra_wide_spatial() {
+        // Same wide-spatial test for SRA-style headers — must pick v0x04.
+        let headers = vec![
+            "@ERR3239334.100 A00296:43:HCLHLDSXX:4:2174:70000:65537/1",
+            "@ERR3239334.200 A00296:43:HCLHLDSXX:4:2174:71234:80000/1",
+        ];
+
+        let compressed = compress_headers_columnar(&headers).unwrap();
+        assert_eq!(compressed[0], 0x04, "wide-spatial SRA must use v0x04");
         let decompressed = decompress_headers_columnar(&compressed, headers.len()).unwrap();
         for (orig, dec) in headers.iter().zip(decompressed.iter()) {
             assert_eq!(orig.as_bytes(), dec.as_slice());

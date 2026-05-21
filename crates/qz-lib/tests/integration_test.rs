@@ -1332,6 +1332,143 @@ fn test_compress_refuses_to_overwrite_without_force() {
 }
 
 #[test]
+fn test_decompress_detects_bit_flip_via_block_crc32() {
+    // Flip a byte deep inside a compressed BSC block (not in the header area).
+    // The new v3 per-block CRC32 must catch this with a clear "CRC32 mismatch"
+    // error instead of bubbling through libbsc as a cryptic block_info failure.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let input_fastq = temp_path.join("input.fastq");
+    // Need enough data that BSC produces a non-trivial compressed payload.
+    let mut data = String::new();
+    for i in 0..200 {
+        data.push_str(&format!(
+            "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
+        ));
+    }
+    fs::write(&input_fastq, &data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    let compress_args = CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ..CompressConfig::default()
+    };
+    qz_lib::compression::compress(&compress_args).unwrap();
+
+    // Sanity check: untouched archive must decompress cleanly.
+    let output = temp_path.join("ok.fastq");
+    qz_lib::compression::decompress(&decompress_args(archive_path.clone(), output, temp_path.clone())).unwrap();
+
+    // Flip a single byte two-thirds of the way into the archive — well inside
+    // a compressed stream payload, past all length/CRC prefixes.
+    let mut bytes = fs::read(&archive_path).unwrap();
+    let flip_pos = bytes.len() * 2 / 3;
+    bytes[flip_pos] ^= 0xFF;
+    let bad_path = temp_path.join("bad.qz");
+    fs::write(&bad_path, &bytes).unwrap();
+
+    let bad_output = temp_path.join("out.fastq");
+    let result = qz_lib::compression::decompress(&decompress_args(bad_path, bad_output, temp_path));
+    let err = result.expect_err("bit-flipped archive must error, not silently succeed");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("CRC32 mismatch"),
+        "expected CRC32 mismatch error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_decompress_rejects_v2_archive_with_helpful_message() {
+    // Construct a minimal byte buffer claiming to be a v2 archive. The decoder
+    // must refuse with a clear "please re-encode" message rather than fail
+    // somewhere deep inside the block parser.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+
+    let bad_path = temp_path.join("v2.qz");
+    // Magic "QZ", version=2, reserved=0, header_size=60 (enough to look plausible),
+    // padded with zeros so the file is large enough to pass the initial size check.
+    let mut data = vec![b'Q', b'Z', 2u8, 0u8];
+    data.extend_from_slice(&60u32.to_le_bytes());
+    data.resize(200, 0); // pad
+    fs::write(&bad_path, &data).unwrap();
+
+    let output = temp_path.join("out.fastq");
+    let result = qz_lib::compression::decompress(&decompress_args(bad_path, output, temp_path));
+    let err = result.expect_err("v2 archive must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("v2") && msg.contains("re-encode"),
+        "expected helpful v2-rejection message, got: {msg}"
+    );
+}
+
+#[test]
+fn test_dict_training_rejects_non_zstd_compressor() {
+    // dict_training only works with zstd-dict. With other compressors the dict
+    // was silently ignored on encode but the archive header still claimed
+    // dict_present=true, producing archives that fail to decompress.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, "@r1\nACGT\n+\nIIII\n").unwrap();
+
+    let archive_path = temp_path.join("out.qz");
+    let result = qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path,
+        working_dir: temp_path,
+        threads: 1,
+        advanced: AdvancedOptions {
+            dict_training: true,
+            dict_size: 4,
+            quality_compressor: QualityCompressor::Bsc,
+            ..Default::default()
+        },
+        ..CompressConfig::default()
+    });
+    let err = result.expect_err("dict_training+Bsc must be rejected, not produce a corrupt archive");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("--dict-training requires --quality-compressor zstd"),
+        "unexpected error: {msg}");
+}
+
+#[test]
+fn test_quality_modeling_rejects_fqzcomp() {
+    // quality_modeling silently substituted BSC for the model deltas when
+    // Fqzcomp was selected, but stored Fqzcomp in the header. Result: archive
+    // unreadable. Must reject at compress time instead.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, "@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n").unwrap();
+
+    let archive_path = temp_path.join("out.qz");
+    let result = qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path,
+        working_dir: temp_path,
+        threads: 1,
+        advanced: AdvancedOptions {
+            quality_modeling: true,
+            quality_compressor: QualityCompressor::Fqzcomp,
+            ..Default::default()
+        },
+        ..CompressConfig::default()
+    });
+    let err = result.expect_err("quality_modeling+Fqzcomp must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--quality-modeling is incompatible with --quality-compressor fqzcomp"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
 fn test_decompress_too_small_archive() {
     let temp_dir = TempDir::new().unwrap();
     let temp_path = temp_dir.path().to_path_buf();
@@ -1438,11 +1575,245 @@ fn test_verify_valid_archive() {
         input: archive_path,
         working_dir: temp_path,
         num_threads: 1,
+        ..Default::default()
     };
     let result = qz_lib::compression::verify(&verify_config).unwrap();
     assert_eq!(result.num_reads, 3);
     assert!(result.total_bytes > 0);
     assert!(result.crc32 != 0);
+    assert_eq!(result.mode, qz_lib::compression::VerifyMode::Deep);
+    assert_eq!(result.blocks_verified, 0); // deep mode reports 0 (uses codec, not block walker)
+}
+
+#[test]
+fn test_verify_fast_valid_archive() {
+    // Fast verify: walks per-block CRC32s without invoking BSC decompression.
+    // Must succeed cleanly on a healthy archive and report block-count metadata.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, MULTI_READ_DATA).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ..CompressConfig::default()
+    }).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: archive_path,
+        working_dir: temp_path,
+        num_threads: 1,
+        fast: true,
+    };
+    let result = qz_lib::compression::verify(&verify_config).unwrap();
+    assert_eq!(result.mode, qz_lib::compression::VerifyMode::Fast);
+    assert_eq!(result.crc32, 0); // not computed in fast mode
+    assert!(result.blocks_verified > 0, "fast verify should report block count");
+    assert!(result.total_bytes > 0);
+}
+
+#[test]
+fn test_verify_fast_refuses_ultra_archive() {
+    // Ultra-mode archives wrap streams in an outer per-chunk frame with no
+    // per-block CRC; fast verify must refuse cleanly rather than mis-walking
+    // the frame and reporting spurious "CRC mismatch" on healthy data.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, MULTI_READ_DATA).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ultra: Some(1),
+        ..CompressConfig::default()
+    }).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: archive_path,
+        working_dir: temp_path,
+        num_threads: 1,
+        fast: true,
+    };
+    let err = qz_lib::compression::verify(&verify_config)
+        .expect_err("fast verify must refuse ultra archives");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("does not support encoding_type") && msg.contains("ultra"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn test_verify_fast_skips_zstd_quality_stream() {
+    // When qualities are stored as raw zstd (no v3 framing), fast verify must
+    // skip that stream — not bail with a confusing "num_blocks=4.2 billion"
+    // error from misreading the zstd magic as a num_blocks header.
+    //
+    // The chunked path always coerces qualities to Bsc/Fqzcomp/QualityCtx; to
+    // actually produce a Zstd-quality archive we force the in-memory path via
+    // quality_delta=true (the chunked-streaming check disables it).
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, MULTI_READ_DATA).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        advanced: AdvancedOptions {
+            quality_compressor: QualityCompressor::Zstd,
+            quality_delta: true, // forces compress_in_memory path
+            ..Default::default()
+        },
+        ..CompressConfig::default()
+    }).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: archive_path,
+        working_dir: temp_path,
+        num_threads: 1,
+        fast: true,
+    };
+    let result = qz_lib::compression::verify(&verify_config).unwrap();
+    assert_eq!(result.mode, qz_lib::compression::VerifyMode::Fast);
+    assert!(result.streams_skipped >= 1, "qualities stream must be reported skipped");
+    assert!(result.blocks_verified > 0, "v3 streams (headers/sequences/nmasks) must still verify");
+}
+
+#[test]
+fn test_verify_fast_covers_rc_canon_flags_stream() {
+    // RC canon archives append a v3-framed rc_flags stream after qualities.
+    // Fast verify must walk it — otherwise corruption in the RC flags region
+    // would silently pass (the worst possible verify-tool failure mode).
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, MULTI_READ_DATA).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        advanced: AdvancedOptions { rc_canon: true, ..Default::default() },
+        ..CompressConfig::default()
+    }).unwrap();
+
+    // Flip a byte at the very end of the archive — that's inside the RC flags
+    // payload region (or its CRC), past all other streams.
+    let mut bytes = fs::read(&archive_path).unwrap();
+    let flip_pos = bytes.len() - 20; // close to end of file
+    bytes[flip_pos] ^= 0xFF;
+    let bad_path = temp_path.join("bad.qz");
+    fs::write(&bad_path, &bytes).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: bad_path,
+        working_dir: temp_path,
+        num_threads: 1,
+        fast: true,
+    };
+    let err = qz_lib::compression::verify(&verify_config)
+        .expect_err("fast verify must catch RC flags corruption");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("CRC32 mismatch") || msg.contains("rc_flags"),
+        "expected RC corruption to be caught, got: {msg}"
+    );
+}
+
+#[test]
+fn test_verify_fast_multi_block_stream() {
+    // Confirm fast verify handles streams with >1 BSC block (the per-block
+    // loop iteration logic). 25 MB of bases ≈ 1 block by default; force
+    // smaller blocks via bsc_block_size_mb=1 to guarantee >1 block.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+
+    // Generate ~3 MB of FASTQ — split across multiple 1 MB BSC blocks.
+    let mut data = String::with_capacity(3 * 1024 * 1024);
+    for i in 0..30_000 {
+        data.push_str(&format!(
+            "@r{i}\nACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT\n+\n\
+             IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
+        ));
+    }
+    fs::write(&input_fastq, &data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        advanced: AdvancedOptions { bsc_block_size_mb: 1, ..Default::default() },
+        ..CompressConfig::default()
+    }).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: archive_path,
+        working_dir: temp_path,
+        num_threads: 1,
+        fast: true,
+    };
+    let result = qz_lib::compression::verify(&verify_config).unwrap();
+    assert!(result.blocks_verified > 4,
+        "expected multiple blocks per stream; got {}", result.blocks_verified);
+}
+
+#[test]
+fn test_verify_fast_catches_bit_flip() {
+    // The same bit-flip the deep path catches must also be caught by fast verify,
+    // and faster (no BSC decompression on the bad block, just CRC check).
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    let mut data = String::new();
+    for i in 0..100 {
+        data.push_str(&format!(
+            "@r{i}\nACGTACGTACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIIIIIIIIIII\n"
+        ));
+    }
+    fs::write(&input_fastq, &data).unwrap();
+
+    let archive_path = temp_path.join("test.qz");
+    qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        ..CompressConfig::default()
+    }).unwrap();
+
+    let mut bytes = fs::read(&archive_path).unwrap();
+    let flip_pos = bytes.len() * 2 / 3;
+    bytes[flip_pos] ^= 0xFF;
+    let bad_path = temp_path.join("bad.qz");
+    fs::write(&bad_path, &bytes).unwrap();
+
+    let verify_config = qz_lib::cli::VerifyConfig {
+        input: bad_path,
+        working_dir: temp_path,
+        num_threads: 1,
+        fast: true,
+    };
+    let err = qz_lib::compression::verify(&verify_config)
+        .expect_err("fast verify must error on bit-flip");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("CRC32 mismatch"), "expected CRC32 mismatch, got: {msg}");
 }
 
 #[test]
@@ -1476,6 +1847,7 @@ fn test_verify_corrupted_archive() {
         input: corrupted_path,
         working_dir: temp_path,
         num_threads: 1,
+        ..Default::default()
     };
     let result = qz_lib::compression::verify(&verify_config);
     assert!(result.is_err(), "Verifying a corrupted archive should fail");
@@ -1507,6 +1879,7 @@ fn test_verify_truncated_archive() {
         input: truncated_path,
         working_dir: temp_path,
         num_threads: 1,
+        ..Default::default()
     };
     let result = qz_lib::compression::verify(&verify_config);
     assert!(result.is_err(), "Verifying a truncated archive should fail");

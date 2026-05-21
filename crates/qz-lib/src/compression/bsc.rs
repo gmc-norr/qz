@@ -6,6 +6,7 @@
 /// Source: https://github.com/IlyaGrebnov/libbsc
 
 use anyhow::Result;
+use flate2::Crc;
 use libc::{c_int, c_uchar};
 use std::sync::Once;
 
@@ -270,8 +271,30 @@ fn compress_mt_inner(data: &[u8], lzp_hash_size: i32, lzp_min_len: i32) -> Resul
     Ok(output)
 }
 
+/// Compute CRC32 (IEEE) of a slice using flate2's bundled CRC. Matches the
+/// algorithm bz-lib uses, so qz and bz can share verification tooling.
+///
+/// Single source of truth for the qz-v3 per-block CRC algorithm; called by
+/// every writer/reader that materializes the `[block_len][crc32][payload]`
+/// framing (bsc, openzl, columnar headers, fqzcomp, quality_ctx).
+#[inline]
+pub(crate) fn block_crc32(data: &[u8]) -> u32 {
+    let mut crc = Crc::new();
+    crc.update(data);
+    crc.sum()
+}
+
 /// Internal helper: compress data by splitting into blocks and compressing each in parallel.
 /// `block_compressor` is called on each block.
+///
+/// Wire layout (qz archive v3+):
+///   `[num_blocks: u32 LE]`
+///   then, per block: `[block_len: u32 LE][crc32: u32 LE][compressed BSC payload]`
+///
+/// The CRC32 is computed over the compressed BSC payload (post-BSC bytes) and
+/// verified on read before invoking libbsc. This catches bit-rot and disk
+/// corruption with a clear error instead of bubbling through libbsc as a
+/// cryptic "block_info failed" or producing silently wrong output.
 fn compress_parallel_with<F>(data: &[u8], block_compressor: F) -> Result<Vec<u8>>
 where
     F: Fn(&[u8]) -> Result<Vec<u8>> + Sync,
@@ -287,29 +310,34 @@ where
     // For small data, use single-block compression (no overhead)
     if data.len() <= BSC_BLOCK_SIZE {
         let compressed = block_compressor(data)?;
-        let mut output = Vec::with_capacity(4 + 4 + compressed.len());
+        let crc = block_crc32(&compressed);
+        let mut output = Vec::with_capacity(4 + 8 + compressed.len());
         output.extend_from_slice(&1u32.to_le_bytes()); // 1 block
         output.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        output.extend_from_slice(&crc.to_le_bytes());
         output.extend_from_slice(&compressed);
         return Ok(output);
     }
 
-    // Split into blocks and compress in parallel
+    // Split into blocks and compress + CRC in parallel
     let blocks: Vec<&[u8]> = data.chunks(BSC_BLOCK_SIZE).collect();
     let num_blocks = blocks.len();
 
-    let compressed_blocks: Vec<Result<Vec<u8>>> = blocks
+    let compressed_blocks: Vec<(Vec<u8>, u32)> = blocks
         .par_iter()
-        .map(|block| block_compressor(block))
-        .collect();
+        .map(|block| {
+            let compressed = block_compressor(block)?;
+            let crc = block_crc32(&compressed);
+            Ok::<_, anyhow::Error>((compressed, crc))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    // Check for errors
     let mut output = Vec::new();
     output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
 
-    for result in compressed_blocks {
-        let block = result?;
+    for (block, crc) in compressed_blocks {
         output.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        output.extend_from_slice(&crc.to_le_bytes());
         output.extend_from_slice(&block);
     }
 
@@ -333,10 +361,17 @@ pub fn compress_parallel_adaptive(data: &[u8]) -> Result<Vec<u8>> {
     compress_parallel_with(data, compress_adaptive)
 }
 
-/// Decompress multi-block BSC-compressed data (from compress_parallel).
+/// Decompress multi-block BSC-compressed data (from `compress_parallel*`).
 ///
 /// Blocks are decompressed in parallel using rayon, then concatenated in order.
-/// Format: [num_blocks: u32][block_compressed_len: u32, block_data]...
+/// Wire layout (qz archive v3+):
+///   `[num_blocks: u32 LE]`
+///   then, per block: `[block_len: u32 LE][crc32: u32 LE][BSC payload: block_len bytes]`
+///
+/// The CRC32 over each block's compressed payload is verified **before**
+/// invoking libbsc, so disk corruption is reported with a clear "Chunk CRC32
+/// mismatch" error rather than bubbling through libbsc as a cryptic
+/// `block_info failed` or producing silently wrong output.
 pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
     use rayon::prelude::*;
 
@@ -350,9 +385,9 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
 
     let num_blocks = super::read_le_u32(data, 0)? as usize;
 
-    // Each block contributes at least 4 bytes of length prefix + 1 byte of payload.
+    // Each block contributes at least 8 bytes of prefix (4 len + 4 crc) + 1 byte of payload.
     // Reject obviously malformed inputs before we Vec::with_capacity(num_blocks).
-    if num_blocks > 0 && num_blocks.saturating_mul(5) > data.len().saturating_sub(4) {
+    if num_blocks > 0 && num_blocks.saturating_mul(9) > data.len().saturating_sub(4) {
         anyhow::bail!(
             "BSC parallel: num_blocks={} exceeds remaining payload ({} bytes)",
             num_blocks,
@@ -360,27 +395,39 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
         );
     }
 
-    // First pass: collect block slices (sequential, just pointer math)
+    // First pass: collect (block_slice, expected_crc) pairs (sequential, just pointer math)
     let mut offset = 4;
-    let mut block_slices = Vec::with_capacity(num_blocks);
-    for _ in 0..num_blocks {
-        if offset + 4 > data.len() {
-            anyhow::bail!("BSC parallel: truncated block length");
+    let mut blocks: Vec<(&[u8], u32)> = Vec::with_capacity(num_blocks);
+    for idx in 0..num_blocks {
+        if offset + 8 > data.len() {
+            anyhow::bail!("BSC parallel: truncated block header for block {idx}");
         }
         let block_len = super::read_le_u32(data, offset)? as usize;
         offset += 4;
+        let expected_crc = super::read_le_u32(data, offset)?;
+        offset += 4;
 
         if offset + block_len > data.len() {
-            anyhow::bail!("BSC parallel: truncated block data");
+            anyhow::bail!("BSC parallel: truncated block data for block {idx}");
         }
-        block_slices.push(&data[offset..offset + block_len]);
+        blocks.push((&data[offset..offset + block_len], expected_crc));
         offset += block_len;
     }
 
-    // Second pass: decompress all blocks in parallel. Short-circuit on first error.
-    let decompressed_blocks: Vec<Vec<u8>> = block_slices
+    // Second pass: verify CRC + decompress each block in parallel, short-circuit on first error.
+    let decompressed_blocks: Vec<Vec<u8>> = blocks
         .par_iter()
-        .map(|block| decompress(block))
+        .enumerate()
+        .map(|(idx, (block, expected_crc))| {
+            let actual_crc = block_crc32(block);
+            if actual_crc != *expected_crc {
+                anyhow::bail!(
+                    "BSC block {idx} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                    expected_crc, actual_crc
+                );
+            }
+            decompress(block)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let total_size: usize = decompressed_blocks.iter().map(|b| b.len()).sum();
@@ -390,6 +437,51 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
     }
 
     Ok(output)
+}
+
+/// Verify all per-block CRC32s in any qz-v3 multi-block stream without
+/// invoking the inner codec. Works for BSC, OpenZL, columnar-header, fqzcomp,
+/// and quality_ctx streams because they all share the outer
+/// `[num_blocks: u32 LE]` then per block `[block_len: u32 LE][crc32: u32 LE][payload]`
+/// framing. Used by the fast `qz verify --fast` mode to catch bit-rot in
+/// O(IO + CRC) time rather than O(BWT). Returns the number of blocks verified.
+pub fn verify_parallel_crcs(data: &[u8]) -> Result<usize> {
+    if data.is_empty() {
+        return Ok(0);
+    }
+    if data.len() < 4 {
+        anyhow::bail!("BSC parallel: data too small for header");
+    }
+    let num_blocks = super::read_le_u32(data, 0)? as usize;
+    if num_blocks > 0 && num_blocks.saturating_mul(9) > data.len().saturating_sub(4) {
+        anyhow::bail!(
+            "BSC parallel: num_blocks={} exceeds remaining payload ({} bytes)",
+            num_blocks,
+            data.len() - 4,
+        );
+    }
+    let mut offset = 4;
+    for idx in 0..num_blocks {
+        if offset + 8 > data.len() {
+            anyhow::bail!("BSC parallel: truncated block header for block {idx}");
+        }
+        let block_len = super::read_le_u32(data, offset)? as usize;
+        offset += 4;
+        let expected_crc = super::read_le_u32(data, offset)?;
+        offset += 4;
+        if offset + block_len > data.len() {
+            anyhow::bail!("BSC parallel: truncated block data for block {idx}");
+        }
+        let actual_crc = block_crc32(&data[offset..offset + block_len]);
+        if actual_crc != expected_crc {
+            anyhow::bail!(
+                "BSC block {idx} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                expected_crc, actual_crc
+            );
+        }
+        offset += block_len;
+    }
+    Ok(num_blocks)
 }
 
 /// Decompress BSC-compressed data

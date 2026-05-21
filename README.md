@@ -160,13 +160,13 @@ Compressed blocks are shrunk via `shrink_to_fit()` immediately after compression
 
 **Stage 4: Block accumulation.** Compressed blocks are accumulated either in memory (`Vec<Vec<u8>>` for small inputs) or streamed to temp files (for large inputs or reorder mode). Temp files use a RAII cleanup guard (`TmpCleanup`) that deletes files on drop, including on panic or error.
 
-**Stage 5: Archive assembly.** The archive is written sequentially: v2 header, then header blocks, sequence blocks, quality blocks. No seeking is required, so output can go to stdout. The archive format is:
+**Stage 5: Archive assembly.** The archive is written sequentially: v3 header, then header blocks, sequence blocks, quality blocks. No seeking is required, so output can go to stdout. The archive format is:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  V2 prefix (8 bytes)                                             │
+│  V3 prefix (8 bytes)                                             │
 │  ┌──────────┬─────────┬──────────┬────────────────┐              │
-│  │ "QZ"     │ ver=02  │ rsvd=00  │ header_size u32│              │
+│  │ "QZ"     │ ver=03  │ rsvd=00  │ header_size u32│              │
 │  └──────────┴─────────┴──────────┴────────────────┘              │
 │                                                                  │
 │  Header body (variable length)                                   │
@@ -190,19 +190,21 @@ The header is self-describing: all compressor types, encoding modes, and stream 
 
 ### Decompression pipeline
 
-Decompression uses a streaming architecture with three parallel decompressor threads feeding a single reconstruction thread through bounded channels.
+Decompression uses three parallel per-stream decompressor threads. Each fully decodes its stream into memory before record reconstruction begins.
 
-**Header parsing.** The archive header is read and validated (magic bytes `QZ`, version `0x02`). Stream offsets are computed from the recorded lengths: headers start at `data_offset`, sequences at `data_offset + headers_len`, qualities at `data_offset + headers_len + sequences_len`.
+**Header parsing.** The archive header is read and validated (magic bytes `QZ`, version `0x03`). Stream offsets are computed from the recorded lengths: headers start at `data_offset`, sequences at `data_offset + headers_len`, qualities at `data_offset + headers_len + sequences_len`. Older v0x02 archives cannot be read directly — re-encode with `qz compress` (or use a `0.2.0` qz binary on the original input).
 
 **Parallel decompression.** Three background threads are spawned via `std::thread::scope`, each responsible for one stream:
 
 1. Seek to stream offset in the archive file
 2. Read `num_blocks` from the stream header
-3. In batches of 8: read block headers and data sequentially, decompress the batch in parallel via `rayon::par_iter`, send decompressed blocks through a bounded `SyncSender` channel
+3. In batches: read `[block_len][crc32][block_data]` triples sequentially, verify each CRC32, then decompress the batch in parallel via `rayon::par_iter` and push decompressed blocks through an `mpsc::channel`
 
-The channel capacity is 2 blocks per stream. This backpressures the decompressor threads when the reconstruction thread falls behind, bounding peak memory to ~300 MB (3 streams x ~4 blocks x 25 MB + output buffer).
+Channels are **unbounded** and `drain_channel` accumulates each stream's decompressed bytes into a contiguous `Vec<u8>` before record reconstruction. Peak memory therefore scales with the decompressed FASTQ size, not a fixed budget. For very large inputs, `decompress_to_records` (the in-memory mmap path) is more memory-efficient than the streaming path.
 
-**Record reconstruction.** The main thread reads from all three channels through `ChannelStreamBuffer` wrappers that provide varint/byte-slice reading over the channel. For each of the `num_reads` records, it reads the header length and bytes, sequence length and bytes, and quality length and packed bytes, unpacks qualities to ASCII, and writes the four FASTQ lines (`@header\nseq\n+\nqual\n`).
+**Per-block CRC32 (v3).** Each compressed block carries a `flate2::Crc` (IEEE) checksum over its payload, verified before invoking the inner codec. Disk corruption produces a clear `"BSC block N CRC32 mismatch"` error rather than a cryptic libbsc failure. `qz verify --fast` walks just the CRCs (no decompression) — see the [Verify](#verify) section.
+
+**Record reconstruction.** The main thread reads from all three drained stream buffers. For each of the `num_reads` records, it reads the header length and bytes, sequence length and bytes, and quality length and packed bytes, unpacks qualities to ASCII, and writes the four FASTQ lines (`@header\nseq\n+\nqual\n`).
 
 **Stdin input.** Since the decompressor needs to seek to three different offsets in the archive, stdin input is spooled to a temp file first, then decompressed normally.
 
@@ -318,7 +320,7 @@ Memory is the primary constraint for high-throughput genomic compression. QZ use
 - **Pipelined I/O.** Reading the next chunk overlaps with compressing the current one, hiding I/O latency without doubling memory.
 - **Block shrinking.** `shrink_to_fit()` on each BSC output block releases the unused allocation headroom (BSC allocates output = input + header).
 - **Temp file accumulation.** For large inputs, compressed blocks are streamed to disk rather than held in memory. A RAII drop guard ensures cleanup on success, error, or panic.
-- **Bounded decompression channels.** Decompressor threads send blocks through channels with capacity 2, preventing unbounded memory growth when the writer is slower than decompression.
+- **Per-block CRC32 verification before BSC decompress.** Each v3 block carries a CRC32 over its compressed payload; bit-rot is caught up front with a clear error instead of bubbling through libbsc as a cryptic block_info failure or producing silently wrong output.
 
 ## File Format
 
@@ -328,27 +330,41 @@ The QZ archive is a self-describing binary format. All integers are little-endia
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  V2 Prefix (8 bytes, fixed)                                     │
+│  V3 Prefix (8 bytes, fixed)                                     │
 │  Header Body (variable, starts at byte 8)                       │
 │  Stream Data (starts at byte header_size)                       │
-│    ├── Headers stream   (multi-block)                           │
-│    ├── Sequences stream (multi-block)                           │
+│    ├── Headers stream   (multi-block, v3 framing)               │
+│    ├── Sequences stream (multi-block, v3 framing)               │
 │    ├── N-masks stream   (multi-block, 0 bytes if unused)        │
-│    └── Qualities stream (multi-block)                           │
+│    └── Qualities stream (multi-block, v3 framing)               │
+│  RC flags stream (only when encoding_type == 6, after qualities)│
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### V2 prefix (8 bytes)
+### V3 prefix (8 bytes)
 
 ```
 Offset  Size  Type    Field         Value
 ------  ----  ------  -----------   -----
 0       2     u8[2]   magic         "QZ" (0x51 0x5A)
-2       1     u8      version       2
+2       1     u8      version       3 (v0x02 archives are no longer readable)
 3       1     u8      reserved      0
 4       4     u32     header_size   Total bytes of prefix + body.
                                     Stream data starts at this offset.
 ```
+
+### Multi-block stream layout (v3)
+
+Every multi-block stream (BSC, OpenZL, columnar headers, fqzcomp, quality_ctx)
+shares the same outer framing:
+
+```
+[num_blocks: u32 LE]
+  per block: [block_len: u32 LE][crc32: u32 LE][payload: block_len bytes]
+```
+
+`crc32` is `flate2::Crc` (IEEE) over the `payload` bytes and is verified
+before the inner codec runs. Matches bz-lib's per-chunk CRC32 design.
 
 ### Header body (variable length, starts at byte 8)
 

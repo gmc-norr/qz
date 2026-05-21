@@ -662,7 +662,9 @@ fn decode_sequences_arith(
     Ok(sequences)
 }
 
-/// Decompress BSC blocks from blob format [num_blocks: u32, [block_len: u32, data]* ]
+/// Decompress BSC blocks from blob format (qz archive v3+ per-block layout):
+///   `[num_blocks: u32 LE]` then per block `[block_len: u32 LE][crc32: u32 LE][BSC payload]`.
+/// CRC32 is verified before invoking libbsc.
 fn bsc_decompress_from_blob(data: &[u8], off: &mut usize) -> Result<Vec<u8>> {
     if *off + 4 > data.len() {
         anyhow::bail!("truncated BSC blob");
@@ -671,16 +673,26 @@ fn bsc_decompress_from_blob(data: &[u8], off: &mut usize) -> Result<Vec<u8>> {
     *off += 4;
 
     let mut result = Vec::new();
-    for _ in 0..num_blocks {
-        if *off + 4 > data.len() {
-            anyhow::bail!("truncated BSC block length");
+    for idx in 0..num_blocks {
+        if *off + 8 > data.len() {
+            anyhow::bail!("truncated BSC block header for block {idx}");
         }
         let block_len = super::read_le_u32(data, *off)? as usize;
         *off += 4;
+        let expected_crc = super::read_le_u32(data, *off)?;
+        *off += 4;
         if *off + block_len > data.len() {
-            anyhow::bail!("truncated BSC block data");
+            anyhow::bail!("truncated BSC block data for block {idx}");
         }
-        let decompressed = bsc::decompress_mt(&data[*off..*off + block_len])?;
+        let block = &data[*off..*off + block_len];
+        let actual_crc = bsc::block_crc32(block);
+        if actual_crc != expected_crc {
+            anyhow::bail!(
+                "BSC block {idx} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                expected_crc, actual_crc
+            );
+        }
+        let decompressed = bsc::decompress_mt(block)?;
         result.extend_from_slice(&decompressed);
         *off += block_len;
     }
@@ -896,7 +908,10 @@ fn compress_chunk(
                     for blocks in &compressed_blocks {
                         blob.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
                         for block in blocks {
+                            // v3 per-block prefix: [block_len: u32][crc32: u32]
+                            let crc = bsc::block_crc32(block);
                             blob.extend_from_slice(&(block.len() as u32).to_le_bytes());
+                            blob.extend_from_slice(&crc.to_le_bytes());
                             blob.extend_from_slice(block);
                         }
                     }
@@ -1005,7 +1020,10 @@ fn compress_chunk(
                     for blocks in &compressed_blocks {
                         blob.extend_from_slice(&(blocks.len() as u32).to_le_bytes());
                         for block in blocks {
+                            // v3 per-block prefix: [block_len: u32][crc32: u32]
+                            let crc = bsc::block_crc32(block);
                             blob.extend_from_slice(&(block.len() as u32).to_le_bytes());
+                            blob.extend_from_slice(&crc.to_le_bytes());
                             blob.extend_from_slice(block);
                         }
                     }
@@ -1367,8 +1385,10 @@ fn decode_chunked(seq_region: &[u8], num_reads: usize, is_delta: bool) -> Result
     })
 }
 
-/// Decompress sub-streams from blob format.
-/// Format: [num_streams: u8] [for each: num_blocks: u32, [block_len: u32, block_data]* ]
+/// Decompress sub-streams from blob format (qz archive v3+).
+/// Format: `[num_streams: u8]` then per stream
+///   `[num_blocks: u32]` then per block `[block_len: u32, crc32: u32, BSC payload]`.
+/// Per-block CRC32 is verified before invoking libbsc.
 fn decompress_streams(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     if data.is_empty() {
         return Ok((Vec::new(), 0));
@@ -1377,8 +1397,8 @@ fn decompress_streams(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
     let num_streams = data[0] as usize;
     let mut off = 1usize;
 
-    // Parse all compressed blocks for all streams
-    let mut stream_blocks: Vec<Vec<&[u8]>> = Vec::with_capacity(num_streams);
+    // Parse all (block_slice, expected_crc) tuples for all streams
+    let mut stream_blocks: Vec<Vec<(&[u8], u32)>> = Vec::with_capacity(num_streams);
     for i in 0..num_streams {
         if off + 4 > data.len() {
             anyhow::bail!("HARC: truncated stream {} num_blocks", i);
@@ -1386,34 +1406,49 @@ fn decompress_streams(data: &[u8]) -> Result<(Vec<Vec<u8>>, usize)> {
         let num_blocks = super::read_le_u32(data, off)? as usize;
         off += 4;
 
-        let mut blocks = Vec::with_capacity(num_blocks);
+        let mut blocks: Vec<(&[u8], u32)> = Vec::with_capacity(num_blocks);
         for b in 0..num_blocks {
-            if off + 4 > data.len() {
-                anyhow::bail!("HARC: truncated stream {} block {} length", i, b);
+            if off + 8 > data.len() {
+                anyhow::bail!("HARC: truncated stream {} block {} prefix", i, b);
             }
             let block_len = super::read_le_u32(data, off)? as usize;
+            off += 4;
+            let expected_crc = super::read_le_u32(data, off)?;
             off += 4;
             if off + block_len > data.len() {
                 anyhow::bail!("HARC: truncated stream {} block {} data", i, b);
             }
-            blocks.push(&data[off..off + block_len]);
+            blocks.push((&data[off..off + block_len], expected_crc));
             off += block_len;
         }
         stream_blocks.push(blocks);
     }
 
-    // Decompress all blocks in parallel, then concatenate per stream
+    // Decompress all blocks in parallel, then concatenate per stream.
     use rayon::prelude::*;
-    let decompressed: Vec<Vec<u8>> = stream_blocks.into_iter().map(|blocks| {
+    let verify_block = |block: &[u8], expected_crc: u32, stream_i: usize, block_b: usize| -> Result<()> {
+        let actual = bsc::block_crc32(block);
+        if actual != expected_crc {
+            anyhow::bail!(
+                "HARC stream {} block {} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                stream_i, block_b, expected_crc, actual
+            );
+        }
+        Ok(())
+    };
+    let decompressed: Vec<Vec<u8>> = stream_blocks.into_iter().enumerate().map(|(stream_i, blocks)| {
         if blocks.is_empty() {
             return Ok(Vec::new());
         }
         let dec_blocks: Vec<Vec<u8>> = if blocks.len() == 1 {
-            // Single block: use BSC-internal MT (parallel inverse BWT)
-            vec![bsc::decompress_mt(blocks[0])?]
+            // Single block: verify CRC then use BSC-internal MT (parallel inverse BWT)
+            let (block, expected_crc) = blocks[0];
+            verify_block(block, expected_crc, stream_i, 0)?;
+            vec![bsc::decompress_mt(block)?]
         } else {
             // Multiple blocks: rayon parallelism across blocks
-            blocks.par_iter().map(|block| {
+            blocks.par_iter().enumerate().map(|(b, (block, expected_crc))| {
+                verify_block(block, *expected_crc, stream_i, b)?;
                 bsc::decompress(block)
             }).collect::<Result<Vec<_>>>()?
         };

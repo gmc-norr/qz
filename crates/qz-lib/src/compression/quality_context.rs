@@ -1,9 +1,18 @@
-/// Context-modeled quality score compression using adaptive arithmetic coding.
-///
-/// Context = (position_in_read quantized, previous_quality quantized)
-/// Each context has its own adaptive frequency model.
-/// This exploits the strong positional and local-correlation structure
-/// in Illumina quality scores.
+//! Context-modeled quality score compression using adaptive arithmetic coding.
+//!
+//! **Bench-only — NOT part of the qz archive format.**
+//!
+//! Context = (position_in_read quantized, previous_quality quantized).
+//! Each context has its own adaptive frequency model. This exploits the
+//! positional and local-correlation structure in Illumina quality scores.
+//!
+//! The production quality codec lives in [`super::quality_ctx`] (note the
+//! different name) and uses qz-v3 multi-block framing with per-block CRC32.
+//! This module's `compress_parallel` writes a pre-v3 layout without CRC and
+//! its output must NEVER be written into a qz archive — the v3 decoder would
+//! misparse the framing. Gated behind the `experimental` feature so only
+//! `qz-bench/bench_quality_reorder` (which measures compression ratios
+//! standalone, never writes archives) can reach it.
 
 use anyhow::Result;
 

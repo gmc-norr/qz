@@ -433,11 +433,13 @@ pub(super) fn decompress_sequences_2bit_bsc(sequences: &[u8], nmasks: &[u8], num
 /// Compress qualities stream (standard mode, dispatches by compressor).
 pub(crate) fn compress_qualities_with(records: &[crate::io::FastqRecord], binning: columnar::QualityBinning, level: i32, compressor: QualityCompressor, bsc_static: bool) -> Result<Vec<u8>> {
     if compressor == QualityCompressor::Fqzcomp {
-        // Wrap in multi-block format (1 block) for consistency with chunked path
+        // Wrap in v3 multi-block format (1 block): [num_blocks=1][block_len][crc32][blob]
         let blob = compress_qualities_fqzcomp(records)?;
-        let mut out = Vec::with_capacity(8 + blob.len());
+        let crc = bsc::block_crc32(&blob);
+        let mut out = Vec::with_capacity(12 + blob.len());
         out.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
         out.extend_from_slice(&(blob.len() as u32).to_le_bytes()); // block_len
+        out.extend_from_slice(&crc.to_le_bytes()); // crc32
         out.extend_from_slice(&blob);
         return Ok(out);
     }
@@ -623,7 +625,9 @@ pub(super) fn decompress_qualities_data(compressed: &[u8], compressor: QualityCo
 
 /// Decompress multi-block fqzcomp quality data.
 ///
-/// Format: [num_blocks: u32][block_len: u32, block_data]...
+/// Format (qz archive v3+):
+/// `[num_blocks: u32][block_len: u32, crc32: u32, fqzcomp_blob]...`
+/// CRC32 covers the fqzcomp blob and is verified before decoding.
 fn decompress_qualities_fqzcomp_multiblock(compressed: &[u8]) -> Result<Vec<u8>> {
     if compressed.len() < 4 {
         anyhow::bail!("fqzcomp multi-block: data too short");
@@ -643,16 +647,26 @@ fn decompress_fqzcomp_blocks(compressed: &[u8], num_blocks: usize) -> Result<Vec
     let mut output = Vec::new();
 
     for i in 0..num_blocks {
-        if offset + 4 > compressed.len() {
-            anyhow::bail!("fqzcomp multi-block: truncated block {} header", i);
+        if offset + 8 > compressed.len() {
+            anyhow::bail!("fqzcomp multi-block: truncated block {} prefix", i);
         }
         let block_len = read_le_u32(compressed, offset)? as usize;
+        offset += 4;
+        let expected_crc = read_le_u32(compressed, offset)?;
         offset += 4;
         if offset + block_len > compressed.len() {
             anyhow::bail!("fqzcomp multi-block: truncated block {} data ({} bytes, {} available)", i, block_len, compressed.len() - offset);
         }
         let block_data = &compressed[offset..offset + block_len];
         offset += block_len;
+
+        let actual_crc = bsc::block_crc32(block_data);
+        if actual_crc != expected_crc {
+            anyhow::bail!(
+                "fqzcomp block {i} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                expected_crc, actual_crc
+            );
+        }
 
         let decompressed = decompress_qualities_fqzcomp(block_data)?;
         output.extend_from_slice(&decompressed);

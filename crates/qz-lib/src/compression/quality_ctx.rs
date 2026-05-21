@@ -442,11 +442,23 @@ pub fn decompress_qualities_ctx(
     let mut ctx_slots: Vec<u16> = vec![u16::MAX; MAX_CONTEXTS];
     let mut models = ModelArena::new(n_symbols);
 
-    // Pre-allocate result; for fixed-length reads, pre-allocate inner vecs too
+    // Pre-allocate result; for fixed-length reads, pre-allocate inner vecs too.
+    // Hard cap on the pre-allocation to defend against a corrupt header
+    // declaring `read_len * num_reads` larger than any plausible dataset —
+    // pre-allocating petabytes here would OOM the host before any decoding
+    // failure could surface.
+    const MAX_PREALLOC_BYTES: usize = 256 * 1024 * 1024 * 1024; // 256 GB
     let mut result: Vec<Vec<u8>> = if read_len > 0 {
+        let total = read_len.saturating_mul(num_reads);
+        if total > MAX_PREALLOC_BYTES {
+            anyhow::bail!(
+                "quality_ctx decode: refusing to pre-allocate {} bytes (read_len={} × num_reads={}) — archive header looks malformed",
+                total, read_len, num_reads
+            );
+        }
         vec![Vec::with_capacity(read_len); num_reads]
     } else {
-        Vec::with_capacity(num_reads)
+        Vec::with_capacity(num_reads.min(MAX_PREALLOC_BYTES / 8))
     };
 
     for i in 0..num_reads {
@@ -499,9 +511,11 @@ pub fn decompress_qualities_ctx(
 
 /// Decompress multi-block quality_ctx data.
 ///
-/// Format: `[num_blocks: u32] [block_len: u32] [quality_ctx_blob]...`
+/// Format (qz archive v3+):
+/// `[num_blocks: u32][block_len: u32, crc32: u32, quality_ctx_blob]...`
 /// Each blob is a self-describing quality_ctx archive (contains num_reads in its header).
 /// Sequences are consumed in order: first blob's num_reads from the front, etc.
+/// The CRC32 covers the `block_len` bytes of the blob and is verified before parsing.
 pub fn decompress_quality_ctx_multiblock(
     data: &[u8],
     sequences: &[Vec<u8>],
@@ -519,18 +533,21 @@ pub fn decompress_quality_ctx_multiblock(
     }
     let mut offset: usize = 4;
 
-    // Phase 1: parse block boundaries and compute sequence ranges (fast, sequential)
+    // Phase 1: parse block boundaries, verify CRCs, compute sequence ranges
     let mut block_info: Vec<(&[u8], usize, usize)> = Vec::with_capacity(num_blocks);
     let mut seq_cursor: usize = 0;
 
     for blk in 0..num_blocks {
-        let next_off = offset.checked_add(4)
-            .ok_or_else(|| anyhow::anyhow!("quality_ctx multiblock: block {blk} length offset overflow"))?;
-        if next_off > data.len() {
-            anyhow::bail!("quality_ctx multiblock: truncated block {blk} length");
+        // Read 4-byte length + 4-byte CRC32 prefix.
+        let prefix_end = offset.checked_add(8)
+            .ok_or_else(|| anyhow::anyhow!("quality_ctx multiblock: block {blk} prefix offset overflow"))?;
+        if prefix_end > data.len() {
+            anyhow::bail!("quality_ctx multiblock: truncated block {blk} prefix");
         }
         let block_len = super::read_le_u32(data, offset)? as usize;
-        offset = next_off;
+        offset += 4;
+        let expected_crc = super::read_le_u32(data, offset)?;
+        offset += 4;
 
         let blob_end = offset.checked_add(block_len)
             .ok_or_else(|| anyhow::anyhow!("quality_ctx multiblock: block {blk} data offset overflow"))?;
@@ -539,6 +556,15 @@ pub fn decompress_quality_ctx_multiblock(
         }
         let blob = &data[offset..blob_end];
         offset = blob_end;
+
+        // Verify CRC32 over the blob before parsing.
+        let actual_crc = super::bsc::block_crc32(blob);
+        if actual_crc != expected_crc {
+            anyhow::bail!(
+                "quality_ctx block {blk} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                expected_crc, actual_crc
+            );
+        }
 
         // Extract num_reads from blob header:
         // [n_symbols:1B][symbols:nB][read_len:2B][num_reads:4B]

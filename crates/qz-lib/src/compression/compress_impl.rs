@@ -336,10 +336,13 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
             h_num_blocks += write_blocks_to_tmp(result.h_blocks, h_tmp.as_mut().unwrap())?;
             s_num_blocks += write_blocks_to_tmp(result.s_blocks, s_tmp.as_mut().unwrap())?;
             if use_fqzcomp {
+                // fqzcomp path: write each non-empty quality blob with v3 block prefix.
                 for q_blob in result.q_blocks {
                     if !q_blob.is_empty() {
                         let qt = q_tmp.as_mut().unwrap();
+                        let crc = super::bsc::block_crc32(&q_blob);
                         qt.write_all(&(q_blob.len() as u32).to_le_bytes())?;
+                        qt.write_all(&crc.to_le_bytes())?;
                         qt.write_all(&q_blob)?;
                         q_num_blocks += 1;
                     }
@@ -498,11 +501,13 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
             global_const_seq_len, global_const_qual_len,
         )
     } else {
-        // Write archive directly from in-memory blocks
-        let h_data_size: usize = all_h_blocks.iter().map(|b| 4 + b.len()).sum();
-        let s_data_size: usize = all_s_blocks.iter().map(|b| 4 + b.len()).sum();
-        let q_data_size: usize = all_q_blocks.iter().map(|b| 4 + b.len()).sum();
-        let rc_data_size: usize = all_rc_blocks.iter().map(|b| 4 + b.len()).sum();
+        // Write archive directly from in-memory blocks.
+        // Per-block prefix is 8 bytes (4 length + 4 CRC32) in qz archive v3+.
+        use crate::compression::BLOCK_PREFIX_SIZE;
+        let h_data_size: usize = all_h_blocks.iter().map(|b| BLOCK_PREFIX_SIZE + b.len()).sum();
+        let s_data_size: usize = all_s_blocks.iter().map(|b| BLOCK_PREFIX_SIZE + b.len()).sum();
+        let q_data_size: usize = all_q_blocks.iter().map(|b| BLOCK_PREFIX_SIZE + b.len()).sum();
+        let rc_data_size: usize = all_rc_blocks.iter().map(|b| BLOCK_PREFIX_SIZE + b.len()).sum();
 
         let headers_len = if !all_h_blocks.is_empty() { 4 + h_data_size } else { 0 };
         let sequences_len = if !all_s_blocks.is_empty() { 4 + s_data_size } else { 0 };
@@ -531,12 +536,15 @@ pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Resu
             rc_flags_len,
         )?;
 
-        // Write streams in multi-block format: [num_blocks: u32][block_len: u32, block_data]...
+        // Write streams in multi-block format (qz archive v3+):
+        // [num_blocks: u32][block_len: u32, crc32: u32, block_data]...
         let write_blocks = |blocks: &[Vec<u8>], out: &mut dyn Write| -> Result<()> {
             if blocks.is_empty() { return Ok(()); }
             out.write_all(&(blocks.len() as u32).to_le_bytes())?;
             for block in blocks {
+                let crc = super::bsc::block_crc32(block);
                 out.write_all(&(block.len() as u32).to_le_bytes())?;
+                out.write_all(&crc.to_le_bytes())?;
                 out.write_all(block)?;
             }
             Ok(())
@@ -801,12 +809,34 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
     } else {
         args.threads
     };
-    rayon::ThreadPoolBuilder::new()
+    // KNOWN LIMITATION: rayon's global pool can only be built once per process.
+    // The first qz_lib::compression::{compress,decompress,verify} call fixes
+    // the thread count process-wide; subsequent calls with a different
+    // `args.threads` will be silently ignored. This affects qz-python
+    // (multiple compress() calls in one Python session) and any other library
+    // user calling qz-lib repeatedly. The bz-lib design moves rayon init out
+    // of the library entirely; consider doing the same for qz-lib in a
+    // future refactor.
+    let actual_threads = match rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build_global()
-        .ok(); // Ignore error if already initialized
+    {
+        Ok(()) => num_threads,
+        Err(_) => {
+            let existing = rayon::current_num_threads();
+            if existing != num_threads {
+                tracing::warn!(
+                    "Requested {} threads but the rayon pool was already \
+                     initialized to {} threads (process-wide setting; only the \
+                     first qz_lib call wins). Using {} threads.",
+                    num_threads, existing, existing
+                );
+            }
+            existing
+        }
+    };
 
-    info!("Using {} threads for compression", num_threads);
+    info!("Using {} threads for compression", actual_threads);
     info!("Compression level: {}", args.advanced.compression_level);
     info!("Input files: {:?}", args.input);
     info!("Output: {:?}", args.output);
@@ -859,6 +889,38 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
         if args.quality_mode != QualityMode::Lossless {
             anyhow::bail!("--quality-compressor quality-ctx requires lossless quality mode (default)");
         }
+    }
+
+    // Reject configurations that would silently produce unreadable archives.
+    //
+    // (a) `dict_training` only works with the zstd-dict codec — non-Zstd
+    //     compressors silently fall back to their default codec (BSC/OpenZL/
+    //     fqzcomp), but the archive header still records `dict_present=1`,
+    //     so the decompressor tries zstd-dict on non-zstd bytes and fails.
+    if args.advanced.dict_training
+        && !matches!(
+            args.advanced.quality_compressor,
+            QualityCompressor::Zstd | QualityCompressor::Auto
+        )
+    {
+        anyhow::bail!(
+            "--dict-training requires --quality-compressor zstd (selected: {:?}). \
+             Other compressors don't use the dictionary, but the archive would \
+             still claim it does and fail to decompress.",
+            args.advanced.quality_compressor
+        );
+    }
+    // (b) `quality_modeling + Fqzcomp` silently substitutes BSC for the model
+    //     deltas but the archive still advertises Fqzcomp; decompression fails
+    //     with a confusing fqzcomp error on BSC-encoded data.
+    if args.advanced.quality_modeling
+        && args.advanced.quality_compressor == QualityCompressor::Fqzcomp
+    {
+        anyhow::bail!(
+            "--quality-modeling is incompatible with --quality-compressor fqzcomp. \
+             Pick another compressor (bsc, openzl, or zstd) for the model deltas, \
+             or disable quality modeling."
+        );
     }
 
     // Validate --local-reorder / --ultra compatibility
@@ -1097,15 +1159,20 @@ fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> 
                 HeaderCompressor::Columnar => {
                     info!("Compressing headers with columnar encoding...");
                     let blob = codecs::compress_headers_columnar(&processed_records)?;
-                    // Wrap in block format to match chunked path output:
-                    // [num_blocks: u32][block_len: u32][num_reads: u32][columnar_blob]
+                    // Wrap in block format to match chunked path output (qz v3+):
+                    // [num_blocks: u32][block_len: u32, crc32: u32][num_reads: u32][columnar_blob]
+                    // CRC32 covers the [num_reads + columnar_blob] payload.
                     let num_reads_u32 = processed_records.len() as u32;
                     let block_data_len = 4 + blob.len();
-                    let mut compressed = Vec::with_capacity(8 + block_data_len);
+                    let mut payload = Vec::with_capacity(block_data_len);
+                    payload.extend_from_slice(&num_reads_u32.to_le_bytes());
+                    payload.extend_from_slice(&blob);
+                    let crc = super::bsc::block_crc32(&payload);
+                    let mut compressed = Vec::with_capacity(12 + block_data_len);
                     compressed.extend_from_slice(&1u32.to_le_bytes()); // 1 block
                     compressed.extend_from_slice(&(block_data_len as u32).to_le_bytes());
-                    compressed.extend_from_slice(&num_reads_u32.to_le_bytes());
-                    compressed.extend_from_slice(&blob);
+                    compressed.extend_from_slice(&crc.to_le_bytes());
+                    compressed.extend_from_slice(&payload);
                     let dummy_template = read_id::ReadIdTemplate {
                         prefix: String::new(),
                         has_comment: false,

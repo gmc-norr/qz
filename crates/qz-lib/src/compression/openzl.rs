@@ -80,6 +80,20 @@ pub fn compress(data: &[u8]) -> Result<Vec<u8>> {
     }
 }
 
+// ── Bench-only graph variants ───────────────────────────────────────────────
+//
+// The eight `compress_*` functions below (ACE / DNA-numeric / clustering /
+// delta-entropy / FSE / Huffman / transpose+zstd / field_lz) and their
+// `*_graph_fn` helpers are only called from `qz-bench/src/bin/bench_openzl_graphs.rs`.
+// Production code uses [`compress`] / [`compress_parallel`] only. Gated behind
+// the `experimental` feature so that they don't ship in qz-cli / qz-python
+// binaries and don't widen the supported public API. The bench crate depends
+// on `qz-lib` with `features = ["experimental"]`, so benches still compile.
+
+#[cfg(feature = "experimental")]
+mod bench_graphs {
+    use super::*;
+
 /// Graph function for ACE (Adaptive Codec Engine) training.
 /// ACE analyzes the data online and builds an optimized compression graph.
 unsafe extern "C" fn ace_graph_fn(compressor: *mut ZL_Compressor) -> ZL_GraphID {
@@ -307,6 +321,14 @@ pub fn compress_field_lz(data: &[u8]) -> Result<Vec<u8>> {
     compress_with_graph(data, Some(field_lz_graph_fn))
 }
 
+} // mod bench_graphs
+
+#[cfg(feature = "experimental")]
+pub use bench_graphs::{
+    compress_ace, compress_clustering, compress_delta_entropy, compress_dna_numeric,
+    compress_field_lz, compress_fse, compress_huffman, compress_transpose_zstd,
+};
+
 /// Decompress OpenZL-compressed data (single block)
 pub fn decompress(data: &[u8]) -> Result<Vec<u8>> {
     if data.is_empty() {
@@ -356,37 +378,47 @@ pub fn compress_parallel(data: &[u8]) -> Result<Vec<u8>> {
         return Ok(vec![]);
     }
 
-    // For small data, use single-block compression (no overhead)
+    // For small data, use single-block compression (no overhead).
+    // Wire layout matches BSC v3: [num_blocks: u32][block_len: u32, crc32: u32, data]...
+    // CRC32 over the OpenZL-compressed payload is verified on read.
     if data.len() <= OPENZL_BLOCK_SIZE {
         let compressed = compress(data)?;
-        let mut output = Vec::with_capacity(4 + 4 + compressed.len());
+        let crc = block_crc32(&compressed);
+        let mut output = Vec::with_capacity(4 + 8 + compressed.len());
         output.extend_from_slice(&1u32.to_le_bytes()); // 1 block
         output.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        output.extend_from_slice(&crc.to_le_bytes());
         output.extend_from_slice(&compressed);
         return Ok(output);
     }
 
-    // Split into blocks and compress in parallel
+    // Split into blocks and compress + CRC in parallel
     let blocks: Vec<&[u8]> = data.chunks(OPENZL_BLOCK_SIZE).collect();
     let num_blocks = blocks.len();
 
-    let compressed_blocks: Vec<Result<Vec<u8>>> = blocks
+    let compressed_blocks: Vec<(Vec<u8>, u32)> = blocks
         .par_iter()
-        .map(|block| compress(block))
-        .collect();
+        .map(|block| {
+            let compressed = compress(block)?;
+            let crc = block_crc32(&compressed);
+            Ok::<_, anyhow::Error>((compressed, crc))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    // Check for errors and assemble output
     let mut output = Vec::new();
     output.extend_from_slice(&(num_blocks as u32).to_le_bytes());
 
-    for result in compressed_blocks {
-        let block = result?;
+    for (block, crc) in compressed_blocks {
         output.extend_from_slice(&(block.len() as u32).to_le_bytes());
+        output.extend_from_slice(&crc.to_le_bytes());
         output.extend_from_slice(&block);
     }
 
     Ok(output)
 }
+
+// CRC32 helper is shared with all other codecs via `super::bsc::block_crc32`.
+use super::bsc::block_crc32;
 
 /// Decompress multi-block OpenZL-compressed data (from compress_parallel).
 ///
@@ -408,30 +440,56 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
             .map_err(|_| anyhow::anyhow!("OpenZL parallel: truncated header"))?,
     ) as usize;
 
-    // First pass: collect block slices (sequential, just pointer math)
+    // Bound `num_blocks` against the remaining payload (each block ≥ 9 bytes:
+    // 4 len + 4 crc + 1 payload). Prevents Vec::with_capacity OOM on a hostile
+    // num_blocks value before we hit the per-block truncation check.
+    if num_blocks > 0 && num_blocks.saturating_mul(9) > data.len().saturating_sub(4) {
+        anyhow::bail!(
+            "OpenZL parallel: num_blocks={} exceeds remaining payload ({} bytes)",
+            num_blocks,
+            data.len() - 4,
+        );
+    }
+
+    // First pass: collect (block_slice, expected_crc) pairs (sequential)
     let mut offset = 4;
-    let mut block_slices = Vec::with_capacity(num_blocks);
-    for _ in 0..num_blocks {
-        if offset + 4 > data.len() {
-            anyhow::bail!("OpenZL parallel: truncated block length");
+    let mut blocks: Vec<(&[u8], u32)> = Vec::with_capacity(num_blocks);
+    for idx in 0..num_blocks {
+        if offset + 8 > data.len() {
+            anyhow::bail!("OpenZL parallel: truncated block header for block {idx}");
         }
         let block_len = u32::from_le_bytes(
             data[offset..offset + 4].try_into()
                 .map_err(|_| anyhow::anyhow!("OpenZL parallel: truncated block length"))?,
         ) as usize;
         offset += 4;
+        let expected_crc = u32::from_le_bytes(
+            data[offset..offset + 4].try_into()
+                .map_err(|_| anyhow::anyhow!("OpenZL parallel: truncated block crc"))?,
+        );
+        offset += 4;
 
         if offset + block_len > data.len() {
-            anyhow::bail!("OpenZL parallel: truncated block data");
+            anyhow::bail!("OpenZL parallel: truncated block data for block {idx}");
         }
-        block_slices.push(&data[offset..offset + block_len]);
+        blocks.push((&data[offset..offset + block_len], expected_crc));
         offset += block_len;
     }
 
-    // Second pass: decompress all blocks in parallel
-    let decompressed_blocks: Vec<Result<Vec<u8>>> = block_slices
+    // Second pass: verify CRC + decompress each block in parallel.
+    let decompressed_blocks: Vec<Result<Vec<u8>>> = blocks
         .par_iter()
-        .map(|block| decompress(block))
+        .enumerate()
+        .map(|(idx, (block, expected_crc))| {
+            let actual_crc = block_crc32(block);
+            if actual_crc != *expected_crc {
+                anyhow::bail!(
+                    "OpenZL block {idx} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                    expected_crc, actual_crc
+                );
+            }
+            decompress(block)
+        })
         .collect();
 
     // Concatenate in order

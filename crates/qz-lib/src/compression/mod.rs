@@ -19,6 +19,10 @@ pub mod greedy_contig;
 #[cfg(feature = "experimental")]
 pub mod quality_context;
 pub mod openzl;
+// Template-based hybrid sequence encoder is experimental — no decompressor
+// exists, and the supporting machinery (TemplateGraph, mapping, etc.) is only
+// referenced by `compress_sequences_template_hybrid` itself and by qz-bench.
+#[cfg(feature = "experimental")]
 pub mod template;
 mod ultra;
 pub mod quality_ctx;
@@ -47,8 +51,18 @@ const MIN_READS_QUALITY_CTX: usize = 100_000;
 
 /// QZ archive magic bytes (file identification)
 const ARCHIVE_MAGIC: [u8; 2] = *b"QZ";
-/// Current archive format version
-const ARCHIVE_VERSION: u8 = 2;
+/// Current archive format version.
+///
+/// v3 adds a per-block CRC32 to the BSC and OpenZL block layouts. Each block
+/// is now `[block_len: u32 LE][crc32: u32 LE][compressed payload]` instead of
+/// `[block_len: u32 LE][compressed payload]`. The CRC is verified before
+/// invoking the underlying codec, so bit-rot is caught with a clear error
+/// instead of bubbling through libbsc as a cryptic failure or producing
+/// silently wrong output.
+///
+/// **Breaking change**: v2 archives are not readable by v3 builds. Re-encode
+/// with `qz compress` (or keep an older `qz` binary for legacy data).
+const ARCHIVE_VERSION: u8 = 3;
 /// Size of the v2 prefix: magic(2) + version(1) + reserved(1) + header_size(4)
 const V2_PREFIX_SIZE: usize = 8;
 /// I/O buffer size for reading archive files during decompression
@@ -455,13 +469,20 @@ fn compress_stream_to_bsc_blocks(data: &[u8], bsc_static: bool, block_size_mb: u
     Ok(blocks)
 }
 
-/// Write compressed blocks to a temp file in BSC multi-block body format:
-/// [block_len: u32, block_data]... (the num_blocks header is written separately).
+/// Per-block prefix size in the v3 wire format: 4-byte length + 4-byte CRC32.
+pub(crate) const BLOCK_PREFIX_SIZE: usize = 8;
+
+/// Write compressed blocks to a temp file in BSC multi-block body format
+/// (qz archive v3+): `[block_len: u32 LE][crc32: u32 LE][BSC payload]...`
+/// (the num_blocks header is written separately). The CRC32 is computed over
+/// the compressed payload and verified before BSC decompression on read.
 fn write_blocks_to_tmp(blocks: Vec<Vec<u8>>, tmp: &mut std::io::BufWriter<std::fs::File>) -> Result<u32> {
     use std::io::Write;
     let mut count = 0u32;
     for block in blocks {
+        let crc = bsc::block_crc32(&block);
         tmp.write_all(&(block.len() as u32).to_le_bytes())?;
+        tmp.write_all(&crc.to_le_bytes())?;
         tmp.write_all(&block)?;
         count += 1;
     }
@@ -666,23 +687,35 @@ fn decompress_headers_dispatch(
         }
         HeaderCompressor::Columnar => {
             use rayon::prelude::*;
-            // Columnar data is stored in block format:
-            // [num_blocks: u32][block_len: u32][num_reads: u32][columnar_blob]...
+            // Columnar data is stored in block format (qz archive v3+):
+            // [num_blocks: u32]
+            //   per block: [block_len: u32][crc32: u32][num_reads: u32][columnar_blob]
+            // The CRC32 covers the `block_len` payload bytes (chunk_reads + blob).
             if headers.len() < 4 {
                 anyhow::bail!("Columnar header data too short");
             }
             let num_blocks = read_le_u32(headers, 0)? as usize;
             let mut offset = 4;
-            // Collect (blob, chunk_reads) pairs sequentially (pointer arithmetic only)
+            // Collect (blob, chunk_reads) pairs sequentially (pointer arithmetic + CRC verify).
             let mut blocks: Vec<(&[u8], usize)> = Vec::with_capacity(num_blocks);
-            for _ in 0..num_blocks {
+            for idx in 0..num_blocks {
                 let block_len = read_le_u32(headers, offset)? as usize;
+                offset += 4;
+                let expected_crc = read_le_u32(headers, offset)?;
                 offset += 4;
                 if offset + block_len > headers.len() {
                     anyhow::bail!("Columnar header block truncated");
                 }
                 let block_data = &headers[offset..offset + block_len];
                 offset += block_len;
+                // Verify CRC32 over the whole payload before parsing chunk_reads / blob.
+                let actual_crc = bsc::block_crc32(block_data);
+                if actual_crc != expected_crc {
+                    anyhow::bail!(
+                        "Columnar header block {idx} CRC32 mismatch: stored {:08x}, computed {:08x} — archive is corrupted",
+                        expected_crc, actual_crc
+                    );
+                }
                 if block_data.len() < 4 {
                     anyhow::bail!("Columnar header block too short for num_reads");
                 }
@@ -755,7 +788,7 @@ pub fn decompress(args: &DecompressConfig) -> Result<()> {
     decompress_impl::decompress(args)
 }
 
-pub use decompress_impl::VerifyResult;
+pub use decompress_impl::{VerifyMode, VerifyResult};
 
 /// Verify a QZ archive: decompress all streams and compute CRC32.
 pub fn verify(config: &crate::cli::VerifyConfig) -> Result<VerifyResult> {
