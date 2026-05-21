@@ -897,16 +897,17 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
     //     compressors silently fall back to their default codec (BSC/OpenZL/
     //     fqzcomp), but the archive header still records `dict_present=1`,
     //     so the decompressor tries zstd-dict on non-zstd bytes and fails.
+    //     Auto is NOT acceptable here: it resolves to BSC or QualityCtx
+    //     depending on input size — both non-Zstd — and the silent corruption
+    //     bug recurs. Require an explicit `Zstd` choice.
     if args.advanced.dict_training
-        && !matches!(
-            args.advanced.quality_compressor,
-            QualityCompressor::Zstd | QualityCompressor::Auto
-        )
+        && args.advanced.quality_compressor != QualityCompressor::Zstd
     {
         anyhow::bail!(
-            "--dict-training requires --quality-compressor zstd (selected: {:?}). \
-             Other compressors don't use the dictionary, but the archive would \
-             still claim it does and fail to decompress.",
+            "--dict-training requires an explicit --quality-compressor zstd \
+             (got {:?}). Other compressors (including Auto, which resolves to \
+             BSC or QualityCtx) don't use the dictionary, but the archive \
+             would still claim it does and fail to decompress.",
             args.advanced.quality_compressor
         );
     }
@@ -920,6 +921,49 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
             "--quality-modeling is incompatible with --quality-compressor fqzcomp. \
              Pick another compressor (bsc, openzl, or zstd) for the model deltas, \
              or disable quality modeling."
+        );
+    }
+    // (c) `quality_delta` always emits raw zstd internally (the codec ignores
+    //     the configured quality_compressor), but the archive header stores
+    //     the user-typed compressor. With anything other than Zstd, the
+    //     decompressor reads the header, sees BSC/OpenZL/Fqzcomp/QualityCtx,
+    //     and tries that codec on raw zstd bytes — fast verify trips on the
+    //     same misreading. Require explicit Zstd here too.
+    if args.advanced.quality_delta
+        && args.advanced.quality_compressor != QualityCompressor::Zstd
+    {
+        anyhow::bail!(
+            "--quality-delta currently emits raw zstd and requires \
+             --quality-compressor zstd (got {:?}). Mismatched compressors \
+             would produce an archive whose header advertises the wrong \
+             codec while the quality stream is actually zstd-framed, so \
+             decompression fails.",
+            args.advanced.quality_compressor
+        );
+    }
+    // (d) `sequence_compressor=Zstd` routes through the columnar path, which
+    //     zstd-encodes sequences, n-masks AND qualities (see
+    //     compression/columnar.rs::compress_columnar). Quality modeling and
+    //     quality delta have their own dedicated buffers and override that
+    //     columnar quality output, but in the default case the columnar zstd
+    //     bytes are written verbatim — while the archive header still records
+    //     the user's `quality_compressor`. Mismatched compressors → header
+    //     says BSC/Fqzcomp/QualityCtx but bytes are raw zstd, decompression
+    //     fails, and `verify --fast` misreads the zstd magic as a v3
+    //     num_blocks header. Require zstd-on-zstd unless modeling or delta
+    //     supplies its own quality stream.
+    if args.advanced.sequence_compressor == SequenceCompressor::Zstd
+        && !args.advanced.quality_modeling
+        && !args.advanced.quality_delta
+        && args.advanced.quality_compressor != QualityCompressor::Zstd
+    {
+        anyhow::bail!(
+            "--sequence-compressor zstd uses the columnar path, which \
+             zstd-encodes qualities; --quality-compressor must therefore be \
+             zstd as well (got {:?}). Either pass `--quality-compressor zstd` \
+             or enable --quality-modeling / --quality-delta so qualities are \
+             encoded outside the columnar zstd path.",
+            args.advanced.quality_compressor
         );
     }
 

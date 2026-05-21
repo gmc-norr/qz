@@ -107,7 +107,7 @@ fn build_header_stream(records: &[crate::io::FastqRecord]) -> Result<Vec<u8>> {
 
 /// Decode varint-prefixed header strings from decompressed data.
 fn decode_header_stream(decompressed: &[u8], num_reads: usize) -> Result<Vec<Vec<u8>>> {
-    let mut headers = Vec::with_capacity(num_reads);
+    let mut headers = Vec::with_capacity(super::decompress_impl::scan_capacity(num_reads, decompressed.len()));
     let mut offset = 0;
     for _ in 0..num_reads {
         let hdr_len = read_varint(decompressed, &mut offset)
@@ -251,11 +251,12 @@ pub(super) fn decompress_sequences_raw_bsc(compressed: &[u8], num_reads: usize, 
     }
 
     // General path: variable-length or flagged reads (sequential)
-    let mut sequences = Vec::with_capacity(num_reads);
+    let cap = super::decompress_impl::scan_capacity(num_reads, decompressed.len());
+    let mut sequences = Vec::with_capacity(cap);
     let mut offset = 0;
 
     // Delta decoding needs a cache of all previously decoded sequences
-    let mut delta_reads: Vec<Vec<u8>> = if decode_delta { Vec::with_capacity(num_reads) } else { Vec::new() };
+    let mut delta_reads: Vec<Vec<u8>> = if decode_delta { Vec::with_capacity(cap) } else { Vec::new() };
 
     for _ in 0..num_reads {
         let seq_len = if const_seq_len > 0 {
@@ -341,7 +342,7 @@ pub(super) fn compress_sequences_raw_openzl(records: &[crate::io::FastqRecord]) 
 /// Decompress raw ASCII OpenZL-compressed sequences.
 pub(super) fn decompress_sequences_raw_openzl(compressed: &[u8], num_reads: usize, const_seq_len: usize) -> Result<Vec<Vec<u8>>> {
     let decompressed = openzl::decompress_parallel(compressed)?;
-    let mut sequences = Vec::with_capacity(num_reads);
+    let mut sequences = Vec::with_capacity(super::decompress_impl::scan_capacity(num_reads, decompressed.len()));
     let mut offset = 0;
 
     for _ in 0..num_reads {
@@ -390,7 +391,7 @@ pub(super) fn decompress_sequences_2bit_bsc(sequences: &[u8], nmasks: &[u8], num
     let seq_data = seq_data?;
     let nmask_data = nmask_data?;
 
-    let mut decoded = Vec::with_capacity(num_reads);
+    let mut decoded = Vec::with_capacity(super::decompress_impl::scan_capacity(num_reads, seq_data.len()));
     let mut seq_offset = 0;
     let mut nmask_offset = 0;
 

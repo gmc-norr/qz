@@ -201,7 +201,7 @@ pub fn decode_qualities_arithmetic(
     let mut decoder = DefaultAnsCoder::from_compressed(compressed_u32)
         .map_err(|e| anyhow::anyhow!("Failed to create decoder: {:?}", e))?;
     let mut model = AdaptiveQualityModel::new();
-    let mut qualities = Vec::with_capacity(num_reads);
+    let mut qualities = Vec::with_capacity(super::decompress_impl::scan_capacity(num_reads, compressed.len()));
 
     for seq_str in sequences.iter().take(num_reads) {
         let seq_bytes = seq_str.as_bytes();

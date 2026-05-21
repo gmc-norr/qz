@@ -72,10 +72,10 @@ fn main() {
     }
 
     if let Some(ref dir) = pgo_generate {
-        bsc_build.flag(&format!("-fprofile-generate={}", dir));
+        bsc_build.flag(format!("-fprofile-generate={}", dir));
     }
     if let Some(ref dir) = pgo_use {
-        bsc_build.flag(&format!("-fprofile-use={}", dir));
+        bsc_build.flag(format!("-fprofile-use={}", dir));
         bsc_build.flag("-fprofile-correction");
     }
     bsc_build.compile("libbsc");
@@ -100,10 +100,10 @@ fn main() {
         .warnings(false);
 
     if let Some(ref dir) = pgo_generate {
-        hts_build.flag(&format!("-fprofile-generate={}", dir));
+        hts_build.flag(format!("-fprofile-generate={}", dir));
     }
     if let Some(ref dir) = pgo_use {
-        hts_build.flag(&format!("-fprofile-use={}", dir));
+        hts_build.flag(format!("-fprofile-use={}", dir));
         hts_build.flag("-fprofile-correction");
     }
     hts_build.compile("htscodecs");
@@ -112,11 +112,13 @@ fn main() {
 
     // Link OpenMP for multithreading
     // Use rustc-link-search + rustc-link-lib so these propagate to dependent crates
-    for entry in std::fs::read_dir("/usr/lib/gcc/x86_64-linux-gnu").into_iter().flatten() {
-        if let Ok(e) = entry {
-            if e.path().join("libgomp.so").exists() {
-                println!("cargo:rustc-link-search=native={}", e.path().display());
-            }
+    for entry in std::fs::read_dir("/usr/lib/gcc/x86_64-linux-gnu")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry.path().join("libgomp.so").exists() {
+            println!("cargo:rustc-link-search=native={}", entry.path().display());
         }
     }
     println!("cargo:rustc-link-lib=gomp");

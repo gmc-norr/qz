@@ -1433,8 +1433,70 @@ fn test_dict_training_rejects_non_zstd_compressor() {
     });
     let err = result.expect_err("dict_training+Bsc must be rejected, not produce a corrupt archive");
     let msg = format!("{err:#}");
-    assert!(msg.contains("--dict-training requires --quality-compressor zstd"),
-        "unexpected error: {msg}");
+    assert!(
+        msg.contains("--dict-training") && msg.contains("--quality-compressor zstd"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn test_dict_training_rejects_auto_compressor() {
+    // Auto resolves to BSC or QualityCtx (both non-Zstd) so it has the same
+    // silent-corruption hazard as explicit Bsc/OpenZl/Fqzcomp. The round-3
+    // fix originally allowed Auto through — this test guards against
+    // re-introducing that gap.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, "@r1\nACGT\n+\nIIII\n").unwrap();
+
+    let result = qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: temp_path.join("out.qz"),
+        working_dir: temp_path,
+        threads: 1,
+        advanced: AdvancedOptions {
+            dict_training: true,
+            dict_size: 4,
+            quality_compressor: QualityCompressor::Auto, // the default!
+            ..Default::default()
+        },
+        ..CompressConfig::default()
+    });
+    let err = result.expect_err("dict_training + Auto must be rejected");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("explicit") && msg.contains("zstd"),
+        "expected 'explicit zstd' requirement, got: {msg}");
+}
+
+#[test]
+fn test_quality_delta_rejects_non_zstd_compressor() {
+    // quality_delta unconditionally emits raw zstd but stores the user's
+    // quality_compressor in the header. Mismatch → archive unreadable AND
+    // verify --fast misreads zstd magic as a v3 num_blocks header.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, "@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n").unwrap();
+
+    // Default quality_compressor is Auto (≠ Zstd), so this should fail.
+    let result = qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: temp_path.join("out.qz"),
+        working_dir: temp_path,
+        threads: 1,
+        advanced: AdvancedOptions {
+            quality_delta: true,
+            ..Default::default()
+        },
+        ..CompressConfig::default()
+    });
+    let err = result.expect_err("quality_delta + non-Zstd must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--quality-delta") && msg.contains("--quality-compressor zstd"),
+        "expected delta-needs-zstd error, got: {msg}"
+    );
 }
 
 #[test]
@@ -1465,6 +1527,140 @@ fn test_quality_modeling_rejects_fqzcomp() {
     assert!(
         msg.contains("--quality-modeling is incompatible with --quality-compressor fqzcomp"),
         "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn test_zstd_sequence_rejects_non_zstd_quality() {
+    // sequence_compressor=Zstd routes qualities through columnar's zstd output
+    // when modeling/delta are off, but the archive header writes the user's
+    // (resolved) quality_compressor. With anything other than Zstd, the
+    // decompressor reads the wrong codec from the header and the archive is
+    // unreadable; verify --fast misreads the zstd magic as v3 num_blocks too.
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, "@r1\nACGT\n+\nIIII\n@r2\nACGT\n+\nIIII\n").unwrap();
+
+    let result = qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: temp_path.join("out.qz"),
+        working_dir: temp_path,
+        threads: 1,
+        advanced: AdvancedOptions {
+            sequence_compressor: SequenceCompressor::Zstd,
+            quality_compressor: QualityCompressor::Bsc,
+            ..Default::default()
+        },
+        ..CompressConfig::default()
+    });
+    let err = result.expect_err("sequence=Zstd + quality=Bsc must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("--sequence-compressor zstd") && msg.contains("--quality-compressor"),
+        "expected sequence-zstd-needs-quality-zstd error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_verify_fast_handles_zstd_streams() {
+    // Round-5 fix: previously, verify --fast hardcoded sequences/nmasks as
+    // v3-framed BSC. For sequence_compressor=Zstd archives that produced a
+    // bogus "BSC parallel: num_blocks=4.25 billion" error on healthy files.
+    // The fix dispatches seq_is_v3 from hdr.sequence_compressor; the
+    // sequence/nmask streams are now skipped (counted in streams_skipped)
+    // when sequence_compressor=Zstd, matching how header/quality skips work.
+    let mut data = String::new();
+    for i in 0..50 {
+        data.push_str(&format!("@r{i}\nACGTACGTACGTACGT\n+\nIIHHJJBBCCDDEEFF\n"));
+    }
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, &data).unwrap();
+
+    let archive_path = temp_path.join("out.qz");
+    qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        advanced: AdvancedOptions {
+            sequence_compressor: SequenceCompressor::Zstd,
+            quality_compressor: QualityCompressor::Zstd,
+            header_compressor: HeaderCompressor::Zstd,
+            ..Default::default()
+        },
+        ..CompressConfig::default()
+    })
+    .expect("all-zstd compression should succeed");
+
+    let result = qz_lib::compression::verify(&qz_lib::cli::VerifyConfig {
+        input: archive_path,
+        working_dir: temp_path,
+        num_threads: 1,
+        fast: true,
+    })
+    .expect("fast verify must not falsely fail on all-zstd archive");
+    assert_eq!(
+        result.streams_skipped, 4,
+        "all 4 zstd streams (headers/seq/nmask/qual) should be skipped, got {}",
+        result.streams_skipped
+    );
+}
+
+#[test]
+fn test_verify_fast_rc_canon_truncation_fails() {
+    // Round-5 fix: verify --fast previously returned OK when an rc_canon
+    // (encoding_type=6) archive was truncated exactly before the 8-byte
+    // rc_flags length field. That stream is REQUIRED to reconstruct
+    // sequences, so missing-or-truncated is corruption, not a legitimate
+    // skip-condition. Fast verify must now bail.
+    let mut data = String::new();
+    for i in 0..50 {
+        data.push_str(&format!("@r{i}\nACGTACGTACGTACGT\n+\nIIHHJJBBCCDDEEFF\n"));
+    }
+    let temp_dir = TempDir::new().unwrap();
+    let temp_path = temp_dir.path().to_path_buf();
+    let input_fastq = temp_path.join("input.fastq");
+    fs::write(&input_fastq, &data).unwrap();
+
+    let archive_path = temp_path.join("out.qz");
+    qz_lib::compression::compress(&CompressConfig {
+        input: vec![input_fastq],
+        output: archive_path.clone(),
+        working_dir: temp_path.clone(),
+        threads: 1,
+        advanced: AdvancedOptions {
+            rc_canon: true,
+            ..Default::default()
+        },
+        ..CompressConfig::default()
+    })
+    .expect("rc_canon compression should succeed");
+
+    // Truncate the archive just enough that the rc_flags length field is
+    // missing. Read the v3 header to compute exactly where qualities end,
+    // then truncate to that offset.
+    let archive_bytes = fs::read(&archive_path).unwrap();
+    // Use the documented v3 layout: prefix(8) + body. Strip enough that the
+    // 8-byte rc_flags_len at the end is gone. We don't need a perfect cut —
+    // any size where `q_end + 8 > data.len()` triggers the new check, so
+    // cutting the trailing 9 bytes guarantees we land in the gap.
+    let truncated = &archive_bytes[..archive_bytes.len() - 9];
+    fs::write(&archive_path, truncated).unwrap();
+
+    let result = qz_lib::compression::verify(&qz_lib::cli::VerifyConfig {
+        input: archive_path,
+        working_dir: temp_path,
+        num_threads: 1,
+        fast: true,
+    });
+    let err = result.expect_err("truncated rc_canon archive must fail fast verify");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("rc_canon archive truncated") || msg.contains("rc_flags"),
+        "expected rc_canon truncation error, got: {msg}"
     );
 }
 

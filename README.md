@@ -102,8 +102,9 @@ SPRING was run without `-r` (read order preserved).
                                              │  Thread 3: Quals ────┤      │
                                              │    BSC decompress    │      │
                                              │                      │      │
-                                             │     bounded channels │      │
-                                             │     (capacity = 2)   │      │
+                                             │   verify CRC + decode│      │
+                                             │   into per-stream Vec│      │
+                                             │   (drain_channel)    │      │
                                              │          │           │      │
                                              │          ▼           │      │
                                              │  Main thread:        │      │

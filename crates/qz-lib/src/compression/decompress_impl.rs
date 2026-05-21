@@ -9,6 +9,19 @@ use crate::cli::{DecompressConfig, VerifyConfig, HeaderCompressor, QualityCompre
 use super::*;
 use super::codecs;
 
+/// Per-block compressed-size ceiling enforced by the streaming BSC
+/// decompressor and the columnar-header decompressor.
+///
+/// The compress side caps BSC input blocks at 64 MiB
+/// (`compress_impl.rs::compress()` rejects `bsc_block_size_mb > 64`). libbsc's
+/// worst-case output is `input + LIBBSC_HEADER_SIZE` (28 bytes; see
+/// `third_party/libbsc/libbsc/libbsc/libbsc.cpp:80`), and the rust wrapper
+/// pads its output buffer by another 1024 bytes. A 4 KiB margin on top of the
+/// 64 MiB input cap covers both. Without this margin a 64 MiB block of
+/// incompressible data could compress to slightly over 64 MiB and become
+/// undecompressible — see CHANGELOG round-5.
+pub(super) const BSC_MAX_BLOCK_LEN: usize = 64 * 1024 * 1024 + 4096;
+
 // ── Verify support ──────────────────────────────────────────────────────
 
 /// Writer that computes CRC32 of all bytes written, without storing them.
@@ -132,10 +145,17 @@ fn stream_decompressor_inner(
         for _ in 0..batch_size {
             file.read_exact(&mut buf4)?;
             let block_len = u32::from_le_bytes(buf4) as usize;
-            if block_len > 64 * 1024 * 1024 {
+            // 64 MiB BSC input + libbsc's 28-byte header + a 4 KiB safety
+            // margin. The compress side caps input at 64 MiB
+            // (see compress_impl.rs bsc_block_size_mb guard); BSC's worst-
+            // case output is input + LIBBSC_HEADER_SIZE (libbsc.cpp). A
+            // 4 KiB margin keeps the bound aligned with the conservative
+            // `data.len() + LIBBSC_HEADER_SIZE + 1024` allocation used by
+            // `compress_with_params`.
+            if block_len > BSC_MAX_BLOCK_LEN {
                 anyhow::bail!(
-                    "BSC block claims {} bytes (max 64 MB) — archive may be corrupt",
-                    block_len
+                    "BSC block claims {} bytes (max {} bytes) — archive may be corrupt",
+                    block_len, BSC_MAX_BLOCK_LEN
                 );
             }
             file.read_exact(&mut buf4)?;
@@ -218,10 +238,10 @@ fn stream_decompressor_columnar_inner(
         // Payload = [chunk_reads: u32][columnar_blob].
         file.read_exact(&mut buf4)?;
         let block_len = u32::from_le_bytes(buf4) as usize;
-        if block_len > 64 * 1024 * 1024 {
+        if block_len > BSC_MAX_BLOCK_LEN {
             anyhow::bail!(
-                "Columnar header block claims {} bytes (max 64 MB) — archive may be corrupt",
-                block_len
+                "Columnar header block claims {} bytes (max {} bytes) — archive may be corrupt",
+                block_len, BSC_MAX_BLOCK_LEN
             );
         }
         file.read_exact(&mut buf4)?;
@@ -521,10 +541,25 @@ fn drain_channel(
     Ok(data)
 }
 
+/// Cap the `Vec::with_capacity` hint for offset scans against the actual
+/// decompressed stream size. Each record consumes at least 1 byte (its varint
+/// length prefix), so `count > data.len()` is impossible for legitimate
+/// streams. Without this clamp a malformed `num_reads = 11 billion` (the
+/// upper bound left by the parse-time cap) would trigger a 176 GB Vec
+/// pre-allocation here.
+///
+/// Exposed `pub(super)` so codec entry points (`codecs.rs`, `read_id.rs`,
+/// `header_col.rs`, `arithmetic_*.rs`) can apply the same clamp without
+/// duplicating the invariant.
+#[inline]
+pub(super) fn scan_capacity(count: usize, data_len: usize) -> usize {
+    count.min(data_len)
+}
+
 /// Scan a varint-prefixed header stream.
 /// Returns `(data_start, data_len)` for each of `count` records.
 fn scan_header_offsets(data: &[u8], count: usize) -> Result<Vec<(usize, usize)>> {
-    let mut offsets = Vec::with_capacity(count);
+    let mut offsets = Vec::with_capacity(scan_capacity(count, data.len()));
     let mut pos = 0usize;
     for i in 0..count {
         let len = read_varint(data, &mut pos)
@@ -538,7 +573,7 @@ fn scan_header_offsets(data: &[u8], count: usize) -> Result<Vec<(usize, usize)>>
 /// Scan a variable-length sequence stream (`[varint(len)] [hint?] [seq]` per record).
 /// Returns `(seq_start, seq_len)` for each record.
 fn scan_seq_offsets(data: &[u8], count: usize, has_hints: bool) -> Result<Vec<(usize, usize)>> {
-    let mut offsets = Vec::with_capacity(count);
+    let mut offsets = Vec::with_capacity(scan_capacity(count, data.len()));
     let mut pos = 0usize;
     for i in 0..count {
         let len = read_varint(data, &mut pos)
@@ -559,7 +594,7 @@ fn scan_qual_offsets(
     count: usize,
     bits_per_qual: usize,
 ) -> Result<Vec<(usize, usize)>> {
-    let mut offsets = Vec::with_capacity(count);
+    let mut offsets = Vec::with_capacity(scan_capacity(count, data.len()));
     let mut pos = 0usize;
     for i in 0..count {
         let l_seq = read_varint(data, &mut pos)
@@ -1043,12 +1078,28 @@ fn parse_archive_header(data: &[u8]) -> Result<ArchiveHeader> {
         }
     }
     // Bound `num_reads` against the downstream pre-allocation it drives.
-    // Each per-record `Vec<u8>` allocated in the decompress path costs ~24 bytes
-    // of metadata (ptr + len + cap, all `usize`); cap the total at 256 GB so
-    // `num_reads = u64::MAX` can't OOM the host before any decoding starts.
-    // Highly compressible inputs may have num_reads >> archive size, which is
-    // legitimate (a 30 000-read FASTQ of repeated ACGT compresses to ~5 KB),
-    // so this cap is intentionally loose against the data length.
+    //
+    // Policy: any single `Vec::with_capacity(num_reads)` of per-record
+    // `Vec<u8>`-shaped metadata (24 B/elem on 64-bit) must be ≤256 GB. That
+    // ceiling matches the largest plausible decompress-time RAM budget on the
+    // production hosts qz is tuned for; archives whose declared `num_reads`
+    // would push any single allocation past it are treated as malformed.
+    //
+    // Per-allocation, not aggregate: a few sites on the post-decompression
+    // record-rebuild path additionally clamp via `scan_capacity(count,
+    // data.len())`, but in-codec scratch caches keep this looser ceiling.
+    //
+    // Highly compressible inputs may legitimately have num_reads >> archive
+    // size (a 30 000-read FASTQ of repeated ACGT compresses to ~5 KB), so the
+    // cap is intentionally loose against the file length.
+    //
+    // 64-bit assumption: the literal `256 * 1024 * 1024 * 1024` does not fit
+    // in `usize` on 32-bit. Fail the build explicitly there rather than
+    // silently overflowing the constant. (`quality_ctx.rs` has the same
+    // guard for symmetry.)
+    #[cfg(not(target_pointer_width = "64"))]
+    compile_error!("decompress_impl pre-alloc cap assumes 64-bit usize; build qz on a 64-bit target");
+
     const MAX_RECORD_PREALLOC_BYTES: usize = 256 * 1024 * 1024 * 1024;
     const PER_RECORD_OVERHEAD: usize = std::mem::size_of::<Vec<u8>>();
     let max_plausible_reads = MAX_RECORD_PREALLOC_BYTES / PER_RECORD_OVERHEAD;
@@ -1276,7 +1327,10 @@ fn decompress_to_records(input_path: &std::path::Path) -> Result<(Vec<crate::io:
                                 .context("Failed to decompress sequences (zstd)")?;
                             let nmasks_data = decompress_zstd(nmasks)
                                 .context("Failed to decompress N-masks (zstd)")?;
-                            let mut decoded = Vec::with_capacity(num_reads);
+                            // Cap capacity hint against the decompressed seq stream
+                            // to defend against a malformed num_reads claiming
+                            // billions of records (per-record Vec overhead bound).
+                            let mut decoded = Vec::with_capacity(num_reads.min(sequences_data.len()));
                             let mut seq_offset = 0;
                             let mut nmask_offset = 0;
                             for _ in 0..num_reads {
@@ -1737,7 +1791,7 @@ pub(super) fn verify(config: &VerifyConfig) -> Result<VerifyResult> {
 /// CRC, so a fast walker can't safely verify them without false positives.
 fn verify_fast(input_path: &std::path::Path, start_time: Instant) -> Result<VerifyResult> {
     use crate::compression::bsc;
-    use crate::cli::{HeaderCompressor, QualityCompressor};
+    use crate::cli::{HeaderCompressor, QualityCompressor, SequenceCompressor};
 
     info!("Verifying (fast mode: per-block CRC32 only)...");
     let input_file = std::fs::File::open(input_path)?;
@@ -1761,8 +1815,12 @@ fn verify_fast(input_path: &std::path::Path, start_time: Instant) -> Result<Veri
     // Per-stream compressor → whether v3 multi-block framing applies.
     // Zstd writes raw zstd bytes (no num_blocks/CRC framing). BSC, OpenZL,
     // Columnar (headers), Fqzcomp + QualityCtx (qualities) all use v3 framing.
+    // Sequences AND n-masks share the sequence_compressor: when it's Zstd
+    // both streams are raw zstd from the columnar path; for BSC/OpenZL both
+    // use v3 framing.
     let header_is_v3 = !matches!(hdr.header_compressor, HeaderCompressor::Zstd);
     let qual_is_v3 = !matches!(hdr.quality_compressor, QualityCompressor::Zstd);
+    let seq_is_v3 = !matches!(hdr.sequence_compressor, SequenceCompressor::Zstd);
 
     let data = &archive_data[..];
     let h_start = hdr.data_offset;
@@ -1775,11 +1833,11 @@ fn verify_fast(input_path: &std::path::Path, start_time: Instant) -> Result<Veri
     let mut total_compressed: u64 = 0;
     let mut streams_skipped: u32 = 0;
 
-    // (name, slice, is_v3) per stream. sequences + nmasks always use BSC (v3).
+    // (name, slice, is_v3) per stream.
     let streams: [(&str, &[u8], bool); 4] = [
         ("headers",   &data[h_start..h_start + hdr.headers_len], header_is_v3),
-        ("sequences", &data[s_start..s_start + hdr.sequences_len], true),
-        ("nmasks",    &data[n_start..n_start + hdr.nmasks_len],    true),
+        ("sequences", &data[s_start..s_start + hdr.sequences_len], seq_is_v3),
+        ("nmasks",    &data[n_start..n_start + hdr.nmasks_len],    seq_is_v3),
         ("qualities", &data[q_start..q_start + hdr.qualities_len], qual_is_v3),
     ];
     for (name, stream, is_v3) in streams {
@@ -1800,13 +1858,28 @@ fn verify_fast(input_path: &std::path::Path, start_time: Instant) -> Result<Veri
 
     // encoding_type=6 (rc_canon) appends a v3-framed RC flags stream after
     // qualities: `[rc_flags_len: u64 LE][num_blocks][block_len, crc, payload]...`.
-    // Skipping this would let bit-rot in RC flags slip past fast verify.
-    if hdr.encoding_type == 6 && q_end + 8 <= data.len() {
+    // The RC stream is REQUIRED for encoding_type=6 archives — without it the
+    // decompressor cannot reconstruct sequences. If the file is truncated
+    // before or inside the rc_flags region, that's archive corruption, not a
+    // legitimate skip-condition; fail instead of silently reporting OK.
+    if hdr.encoding_type == 6 {
+        if q_end + 8 > data.len() {
+            anyhow::bail!(
+                "fast verify: rc_canon archive truncated — expected 8-byte \
+                 rc_flags length field after qualities (offset {}), but file \
+                 ends at {}",
+                q_end, data.len()
+            );
+        }
         let rc_len = super::read_le_u64(data, q_end)? as usize;
         let rc_start = q_end + 8;
         let rc_end = rc_start.checked_add(rc_len)
             .filter(|&e| e <= data.len())
-            .ok_or_else(|| anyhow::anyhow!("rc_flags stream extends past archive"))?;
+            .ok_or_else(|| anyhow::anyhow!(
+                "fast verify: rc_canon archive truncated — rc_flags claims {} \
+                 bytes starting at {}, but file ends at {}",
+                rc_len, rc_start, data.len()
+            ))?;
         let rc_stream = &data[rc_start..rc_end];
         let n = bsc::verify_parallel_crcs(rc_stream)
             .with_context(|| "fast verify: rc_flags stream")?;

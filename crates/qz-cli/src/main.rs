@@ -302,7 +302,15 @@ fn run(cli: Cli) -> Result<()> {
             };
 
             eprintln!("Archive:     {}", input_display);
-            eprintln!("Status:      OK");
+            // Distinguish "OK" (all data checked) from "PARTIAL" (fast verify
+            // skipped one or more non-v3 streams). A user grepping for "OK"
+            // shouldn't mistake partial coverage for full integrity.
+            let status = if result.streams_skipped > 0 {
+                format!("PARTIAL ({} stream(s) skipped)", result.streams_skipped)
+            } else {
+                "OK".to_string()
+            };
+            eprintln!("Status:      {}", status);
             eprintln!("Mode:        {}", match result.mode {
                 qz_lib::compression::VerifyMode::Deep => "deep (full decompress + FASTQ CRC32)",
                 qz_lib::compression::VerifyMode::Fast => "fast (per-block CRC32 only)",

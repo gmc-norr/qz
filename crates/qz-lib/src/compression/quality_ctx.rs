@@ -447,6 +447,16 @@ pub fn decompress_qualities_ctx(
     // declaring `read_len * num_reads` larger than any plausible dataset —
     // pre-allocating petabytes here would OOM the host before any decoding
     // failure could surface.
+    //
+    // The cap below assumes 64-bit pointers: on 32-bit, `usize::MAX = 4 GB`
+    // is smaller than the cap, so `saturating_mul` saturates to a value below
+    // MAX_PREALLOC_BYTES and the check becomes a no-op. We don't currently
+    // support 32-bit (the qz workspace builds against `target_pointer_width = 64`
+    // toolchains in practice), but this guard makes the assumption explicit
+    // so a future 32-bit build fails fast at compile time.
+    #[cfg(not(target_pointer_width = "64"))]
+    compile_error!("quality_ctx pre-alloc cap assumes 64-bit usize; build qz on a 64-bit target");
+
     const MAX_PREALLOC_BYTES: usize = 256 * 1024 * 1024 * 1024; // 256 GB
     let mut result: Vec<Vec<u8>> = if read_len > 0 {
         let total = read_len.saturating_mul(num_reads);
@@ -620,11 +630,24 @@ pub fn decompress_quality_ctx_multiblock(
     Ok(all_qualities)
 }
 
-/// Wrap a single quality_ctx blob in multi-block format (num_blocks=1).
+/// Wrap a single quality_ctx blob in v3 multi-block format (num_blocks=1).
+///
+/// Layout matches `decompress_quality_ctx_multiblock`:
+/// `[num_blocks: u32 LE = 1][block_len: u32 LE][crc32: u32 LE][blob]`. The
+/// CRC32 covers the blob and is computed via `bsc::block_crc32` so it matches
+/// the IEEE polynomial used by every other v3 multi-block stream.
+///
+/// Before round-5 this helper wrote the pre-v3 no-CRC layout, but the
+/// corresponding reader was upgraded to v3 framing — using the helper would
+/// have produced an unreadable archive. Kept `pub` for downstream tooling that
+/// builds quality_ctx streams outside the main compress path; the v3 fix means
+/// the output now round-trips through `decompress_quality_ctx_multiblock`.
 pub fn wrap_as_multiblock(blob: Vec<u8>) -> Vec<u8> {
-    let mut result = Vec::with_capacity(8 + blob.len());
+    let crc = super::bsc::block_crc32(&blob);
+    let mut result = Vec::with_capacity(12 + blob.len());
     result.extend_from_slice(&1u32.to_le_bytes()); // num_blocks = 1
     result.extend_from_slice(&(blob.len() as u32).to_le_bytes()); // block_len
+    result.extend_from_slice(&crc.to_le_bytes()); // crc32 over blob
     result.extend(blob);
     result
 }

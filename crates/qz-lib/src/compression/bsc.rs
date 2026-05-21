@@ -130,6 +130,12 @@ unsafe extern "C" {
 /// Init does NOT include `LIBBSC_FEATURE_MULTITHREADING` — that would pin process-wide
 /// OpenMP state and break the project's "rayon owns parallelism" invariant
 /// (CLAUDE.md). Per-call enablement on the few MT entry points works without it.
+///
+/// `cuda_feature()` evaluates to `LIBBSC_FEATURE_CUDA` only when the `cuda`
+/// Cargo feature is enabled at compile time (zero otherwise). Users opt in to
+/// GPU acceleration via the build flag, so initializing the CUDA path at
+/// startup is the intended behavior for CUDA builds. Non-CUDA builds pay no
+/// cost — the flag literal is `0`.
 static BSC_INIT: Once = Once::new();
 static BSC_INIT_RESULT: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(i32::MIN);
@@ -439,12 +445,21 @@ pub fn decompress_parallel(data: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
-/// Verify all per-block CRC32s in any qz-v3 multi-block stream without
-/// invoking the inner codec. Works for BSC, OpenZL, columnar-header, fqzcomp,
-/// and quality_ctx streams because they all share the outer
-/// `[num_blocks: u32 LE]` then per block `[block_len: u32 LE][crc32: u32 LE][payload]`
-/// framing. Used by the fast `qz verify --fast` mode to catch bit-rot in
-/// O(IO + CRC) time rather than O(BWT). Returns the number of blocks verified.
+/// Verify all per-block CRC32s in a qz-v3 multi-block stream **whose outer
+/// framing is `[num_blocks: u32 LE]` then per block
+/// `[block_len: u32 LE][crc32: u32 LE][payload: block_len bytes]`** —
+/// without invoking the inner codec.
+///
+/// This framing is shared by qz-v3 BSC, OpenZL, columnar-header, fqzcomp, and
+/// quality_ctx multi-block streams, so a single walker covers all of them.
+/// It does **not** apply to:
+/// - Raw-zstd streams (no outer length/num_blocks header — just a zstd frame).
+/// - The outer per-chunk wrapper used by encoding_type 8/9 (ultra/local-reorder),
+///   which is `[num_chunks][chunk_len, chunk_data]...` with no per-block CRC.
+///
+/// Callers (e.g. `verify_fast`) must dispatch by archive compressor/encoding
+/// before calling this helper. Returns the number of blocks verified.
+/// Used by `qz verify --fast` to catch bit-rot in O(IO + CRC) time.
 pub fn verify_parallel_crcs(data: &[u8]) -> Result<usize> {
     if data.is_empty() {
         return Ok(0);

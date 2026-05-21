@@ -184,7 +184,7 @@ pub fn decode_sequences_arithmetic(
         .map_err(|e| anyhow::anyhow!("Failed to create decoder: {:?}", e))?;
 
     let mut model = AdaptiveSequenceModel::new();
-    let mut sequences = Vec::with_capacity(num_reads);
+    let mut sequences = Vec::with_capacity(super::decompress_impl::scan_capacity(num_reads, compressed.len()));
 
     for read_idx in 0..num_reads {
         let read_length = read_lengths[read_idx];

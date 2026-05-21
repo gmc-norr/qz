@@ -303,7 +303,10 @@ pub fn decode_read_ids(
     num_reads: usize,
 ) -> Result<Vec<String>> {
     let mut cursor = Cursor::new(encoded_data);
-    let mut read_ids = Vec::with_capacity(num_reads);
+    // Defense in depth: clamp the hint to `encoded_data.len()` so a malformed
+    // `num_reads = 11 billion` doesn't pre-allocate hundreds of GB before the
+    // first record is even read.
+    let mut read_ids = Vec::with_capacity(super::decompress_impl::scan_capacity(num_reads, encoded_data.len()));
 
     if template.prefix.is_empty() {
         // No template compression, read raw IDs

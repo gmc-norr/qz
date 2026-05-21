@@ -161,6 +161,10 @@ fn parse_sra_row(header: &str) -> Option<SraRow<'_>> {
 /// `0x04` SRA v0x04 / `0x03` Casava v0x03 → u32 fields). Encoders pick the
 /// narrower version whenever values fit, so existing Illumina datasets stay
 /// byte-identical to pre-widening output.
+///
+/// Empty input returns `true` (vacuously — no value overflows). Callers can
+/// safely choose the narrow format for a 0-read archive: no spatial bytes are
+/// written either way, and decoders never read spatial data with num_reads=0.
 fn fits_in_u16(values: &[u32]) -> bool {
     values.iter().all(|&v| v <= u16::MAX as u32)
 }
@@ -790,7 +794,7 @@ fn compress_raw_fallback(headers: &[&str]) -> Result<Vec<u8>> {
 
 fn decompress_raw_fallback(data: &[u8], num_reads: usize) -> Result<Vec<String>> {
     let decompressed = bsc::decompress_parallel(data)?;
-    let mut headers = Vec::with_capacity(num_reads);
+    let mut headers = Vec::with_capacity(super::decompress_impl::scan_capacity(num_reads, decompressed.len()));
     let mut offset = 0;
 
     for i in 0..num_reads {
