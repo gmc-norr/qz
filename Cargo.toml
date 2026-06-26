@@ -1,18 +1,34 @@
 [workspace]
-members = ["crates/qz-lib", "crates/qz-cli", "crates/qz-python", "crates/qz-bench", "crates/bz-lib", "crates/bz-cli"]
+members = ["crates/qz-lib", "crates/qz-cli", "crates/qz-python", "crates/qz-bench", "crates/bz-lib", "crates/bz-cli", "crates/strobealign", "crates/numa-core"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["QZ Contributors"]
 license = "SEE LICENSE FILE"
+
+# Clippy configuration. These lints are deliberately allowed: this is a
+# performance-focused compression codebase where index-based loops over parallel
+# arrays (entropy coders, packers) are intentional, and the per-record
+# encode/reconstruct functions genuinely take many positional fields. `cargo
+# clippy --workspace --all-targets` is otherwise expected to pass clean.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
 
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
+# Unwind (not abort) so the qz-python cdylib can convert a Rust panic into a
+# catchable Python exception instead of aborting the interpreter, and so drop
+# guards (e.g. temp-file cleanup) run on panic. Cargo cannot set `panic`
+# per-package, so this applies workspace-wide. A panic that escapes across an
+# `extern "C"` callback (e.g. an FFI compression callback) still aborts at the
+# FFI boundary by default, which is safe.
+panic = "unwind"
 strip = true
 
 [profile.release-with-debug]
@@ -25,9 +41,7 @@ anyhow = "1.0"
 rayon = "1.10"
 flate2 = "1.0"
 gzp = { version = "0.11", default-features = false, features = ["deflate_default"] }
-zstd = "0.13"
-constriction = "0.4"
-openzl-sys = "0.1"
+zstd = { version = "0.13", features = ["zstdmt"] }
 rustc-hash = "2"
 minimizer-iter = "1.2"
 syncmers = "0.1"
@@ -41,7 +55,14 @@ cc = "1.0"
 memmap2 = "0.9"
 qz-lib = { path = "crates/qz-lib" }
 bz-lib = { path = "crates/bz-lib" }
+numa-core = { path = "crates/numa-core" }
 noodles = { version = "0.104", features = ["bam", "sam", "bgzf"] }
+# Direct dep solely to enable the `libdeflate` feature on the shared noodles-bgzf
+# v0.45.0 instance (the umbrella crate exposes no passthrough). Cargo feature
+# unification flips `noodles::bgzf`'s deflate impl from the pure-Rust miniz_oxide
+# (flate2) backend to libdeflate (the C library htslib/samtools also use), making
+# BGZF (de)compression on the BAM I/O path substantially faster.
+noodles-bgzf = { version = "0.45.0", features = ["libdeflate"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_repr = "0.1"

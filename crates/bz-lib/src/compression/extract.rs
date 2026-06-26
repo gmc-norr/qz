@@ -25,6 +25,18 @@ const NIBBLE_TO_BASE: [u8; 16] = *b"=ACMGRSVTWYHKDBN";
 /// W(9)↔W(9), H(12)↔D(13), N(15)↔N(15), =(0)↔=(0)
 const COMPLEMENT_NIBBLE: [u8; 16] = [0, 8, 4, 11, 2, 10, 6, 14, 1, 9, 5, 3, 13, 12, 7, 15];
 
+/// Convert a single BAM quality byte to FASTQ ASCII.
+///
+/// 0xFF (quality unavailable) maps to '!' (Phred 0). Otherwise add the Phred+33
+/// offset with **wrapping** arithmetic: `extract` runs on arbitrary,
+/// unverified BAM, and a corrupt/out-of-range quality byte (>= 223) would
+/// overflow `q + 33` — a panic in debug builds (overflow checks) and a silent
+/// wrap in release. Wrapping matches the compress path's `bam_qual_to_ascii`.
+#[inline]
+fn bam_qual_byte_to_ascii(q: u8) -> u8 {
+    if q == 0xFF { b'!' } else { q.wrapping_add(33) }
+}
+
 /// Convert a BAM record to FASTQ fields: (header, sequence, quality).
 /// Handles reverse-complement for reads mapped to the reverse strand.
 fn bam_record_to_fastq(record: &RawBamRecord) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
@@ -51,9 +63,7 @@ fn bam_record_to_fastq(record: &RawBamRecord) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut qual = Vec::with_capacity(l_seq);
         for i in (0..l_seq).rev() {
             seq.push(NIBBLE_TO_BASE[COMPLEMENT_NIBBLE[nibbles[i] as usize] as usize]);
-            let q = qual_bytes[i];
-            // 0xFF means quality unavailable in BAM → Phred 0
-            qual.push(if q == 0xFF { b'!' } else { q + 33 });
+            qual.push(bam_qual_byte_to_ascii(qual_bytes[i]));
         }
         (header, seq, qual)
     } else {
@@ -62,8 +72,7 @@ fn bam_record_to_fastq(record: &RawBamRecord) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut qual = Vec::with_capacity(l_seq);
         for i in 0..l_seq {
             seq.push(NIBBLE_TO_BASE[nibbles[i] as usize]);
-            let q = qual_bytes[i];
-            qual.push(if q == 0xFF { b'!' } else { q + 33 });
+            qual.push(bam_qual_byte_to_ascii(qual_bytes[i]));
         }
         (header, seq, qual)
     }
@@ -95,17 +104,32 @@ pub fn extract(config: &ExtractConfig) -> Result<()> {
 fn extract_inner(config: &ExtractConfig) -> Result<()> {
     let start = std::time::Instant::now();
 
-    // Open BAM
-    let worker_count = NonZeroUsize::new(4).unwrap();
+    // Open BAM. Match the BGZF-reader worker count used by `compress`: scale to the
+    // machine, capped at 16 (BGZF inflate plateaus there). The previous hard-coded 4
+    // was the lone reader that ignored available cores; reader count never affects output.
+    let worker_count = std::thread::available_parallelism()
+        .unwrap_or(NonZeroUsize::new(1).unwrap())
+        .min(NonZeroUsize::new(16).unwrap());
     let mut reader = crate::io::bam::RawBamReader::from_path_mt(&config.input, worker_count)
         .with_context(|| format!("Failed to open BAM file: {:?}", config.input))?;
 
     info!("Reading BAM file: {:?}", config.input);
 
-    // First pass: determine if paired-end and extract reads
-    let tmp_r1_path = config.working_dir.join(".qz_extract_R1.fastq.tmp");
-    let tmp_r2_path = config.working_dir.join(".qz_extract_R2.fastq.tmp");
-    let tmp_se_path = config.working_dir.join(".qz_extract_SE.fastq.tmp");
+    // First pass: determine if paired-end and extract reads.
+    // Temp names carry the pid + a process-unique nonce so two concurrent
+    // `bz extract` runs sharing a --working-dir (default `.`) don't interleave
+    // writes into the same files and corrupt each other's output.
+    static EXTRACT_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = EXTRACT_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp_name = |mate: &str| {
+        config
+            .working_dir
+            .join(format!(".qz_extract_{mate}_{pid}_{nonce}.fastq.tmp"))
+    };
+    let tmp_r1_path = tmp_name("R1");
+    let tmp_r2_path = tmp_name("R2");
+    let tmp_se_path = tmp_name("SE");
 
     // Guard for temp file cleanup
     struct TmpCleanup<'a>(&'a [PathBuf]);
@@ -116,21 +140,24 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
             }
         }
     }
-    let tmp_paths = vec![tmp_r1_path.clone(), tmp_r2_path.clone(), tmp_se_path.clone()];
+    let tmp_paths = vec![
+        tmp_r1_path.clone(),
+        tmp_r2_path.clone(),
+        tmp_se_path.clone(),
+    ];
     let _cleanup = TmpCleanup(&tmp_paths);
 
-    let mut r1_writer = BufWriter::with_capacity(
-        4 * 1024 * 1024,
-        std::fs::File::create(&tmp_r1_path)?,
-    );
-    let mut r2_writer = BufWriter::with_capacity(
-        4 * 1024 * 1024,
-        std::fs::File::create(&tmp_r2_path)?,
-    );
-    let mut se_writer = BufWriter::with_capacity(
-        4 * 1024 * 1024,
-        std::fs::File::create(&tmp_se_path)?,
-    );
+    // create_new (O_EXCL): never clobber a pre-existing temp (the unique name
+    // makes a real collision a bug worth surfacing rather than silently truncating).
+    let create_tmp = |p: &std::path::Path| -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(p)
+    };
+    let mut r1_writer = BufWriter::with_capacity(4 * 1024 * 1024, create_tmp(&tmp_r1_path)?);
+    let mut r2_writer = BufWriter::with_capacity(4 * 1024 * 1024, create_tmp(&tmp_r2_path)?);
+    let mut se_writer = BufWriter::with_capacity(4 * 1024 * 1024, create_tmp(&tmp_se_path)?);
 
     // HashMap for pairing: read_name → (Option<(header, seq, qual)>, Option<(header, seq, qual)>)
     // Using (R1, R2) slots
@@ -144,6 +171,10 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
     let mut single_count: u64 = 0;
     let mut is_paired_end = false;
     let mut pairs_written: u64 = 0;
+    // Count primary reads dropped because a same-QNAME, same-mate read already
+    // occupied the pairing slot (duplicate-QNAME primaries in a malformed BAM):
+    // the prior read's bases/quality would otherwise be silently lost.
+    let mut dup_dropped: u64 = 0;
 
     loop {
         let record = match reader.next_record()? {
@@ -174,19 +205,32 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
 
             if !is_r1 && !is_r2 {
                 // Paired but no R1/R2 flag — treat as R1
-                warn!("Paired read without R1/R2 flag: {:?}", String::from_utf8_lossy(&name));
+                warn!(
+                    "Paired read without R1/R2 flag: {:?}",
+                    String::from_utf8_lossy(&name)
+                );
             }
 
             let entry = pair_buffer.entry(name).or_insert((None, None));
-            if is_r2 {
-                entry.1 = Some((header, seq, qual));
-            } else {
-                entry.0 = Some((header, seq, qual));
+            let slot = if is_r2 { &mut entry.1 } else { &mut entry.0 };
+            if slot.is_some() {
+                // A read already occupies this mate slot for this QNAME — a
+                // duplicate primary (the BAM is malformed). Don't silently drop the
+                // earlier read without telling the user; warn (rate-limited) and
+                // count it. The incoming read replaces it (previous behavior).
+                dup_dropped += 1;
+                if dup_dropped <= 10 {
+                    warn!(
+                        "Duplicate-QNAME primary read overwrites a buffered mate (dropping the earlier copy): {:?}",
+                        String::from_utf8_lossy(&header[1..])
+                    );
+                }
             }
+            *slot = Some((header, seq, qual));
 
             // Check if pair is complete — write immediately (coordinate order)
-            if entry.0.is_some() && entry.1.is_some() {
-                let name_key = entry.0.as_ref().unwrap().0[1..].to_vec();
+            if let (Some((h0, ..)), Some(_)) = (&entry.0, &entry.1) {
+                let name_key = h0[1..].to_vec();
                 let (r1, r2) = pair_buffer.remove(&name_key).unwrap();
                 let (h1, s1, q1) = r1.unwrap();
                 let (h2, s2, q2) = r2.unwrap();
@@ -199,10 +243,12 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
             write_fastq_record(&mut se_writer, &header, &seq, &qual)?;
         }
 
-        if total_records % 10_000_000 == 0 {
+        if total_records.is_multiple_of(10_000_000) {
             info!(
                 "Processed {} records ({} pairs written, {} buffered)",
-                total_records, pairs_written, pair_buffer.len()
+                total_records,
+                pairs_written,
+                pair_buffer.len()
             );
         }
 
@@ -223,7 +269,8 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
                 "Pair buffer exceeded {} unpaired reads ({} processed so far). \
                  Input BAM is likely not query-name-sorted or is missing mates. \
                  Re-sort with `samtools sort -n` before extracting.",
-                PAIR_BUFFER_HARD_CAP, total_records,
+                PAIR_BUFFER_HARD_CAP,
+                total_records,
             );
         }
     }
@@ -257,7 +304,12 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
     let read_time = start.elapsed();
     info!(
         "BAM reading complete in {:.1}s: {} total records, {} paired, {} single-end, {} pairs written, {} secondary/supplementary skipped",
-        read_time.as_secs_f64(), total_records, paired_count, single_count, pairs_written, skipped_secondary
+        read_time.as_secs_f64(),
+        total_records,
+        paired_count,
+        single_count,
+        pairs_written,
+        skipped_secondary
     );
 
     if is_paired_end && pairs_written > 0 {
@@ -271,9 +323,9 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
         );
 
         info!("Compressing R1...");
-        compress_fastq_to_qz(&tmp_r1_path, &r1_output, &config.working_dir)?;
+        compress_fastq_to_qz(&tmp_r1_path, &r1_output, &config.working_dir, config.force)?;
         info!("Compressing R2...");
-        compress_fastq_to_qz(&tmp_r2_path, &r2_output, &config.working_dir)?;
+        compress_fastq_to_qz(&tmp_r2_path, &r2_output, &config.working_dir, config.force)?;
     }
 
     if single_count > 0 {
@@ -283,7 +335,19 @@ fn extract_inner(config: &ExtractConfig) -> Result<()> {
             "Compressing {} single-end reads to {}",
             single_count, output_path
         );
-        compress_fastq_to_qz(&tmp_se_path, &output_path, &config.working_dir)?;
+        compress_fastq_to_qz(
+            &tmp_se_path,
+            &output_path,
+            &config.working_dir,
+            config.force,
+        )?;
+    }
+
+    if dup_dropped > 0 {
+        warn!(
+            "{dup_dropped} read(s) dropped due to duplicate-QNAME primaries sharing a mate slot \
+             (the BAM has non-unique primary read names); the extracted FASTQ is missing them."
+        );
     }
 
     if pairs_written == 0 && single_count == 0 {
@@ -301,13 +365,33 @@ fn compress_fastq_to_qz(
     input: &std::path::Path,
     output: &str,
     working_dir: &std::path::Path,
+    force: bool,
 ) -> Result<()> {
     let config = qz_lib::cli::CompressConfig {
         input: vec![input.to_path_buf()],
         output: PathBuf::from(output),
         working_dir: working_dir.to_path_buf(),
+        force,
         ..Default::default()
     };
     qz_lib::compression::compress(&config)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bam_qual_byte_to_ascii;
+
+    #[test]
+    fn test_bam_qual_byte_to_ascii() {
+        // Normal range: Phred + 33 offset.
+        assert_eq!(bam_qual_byte_to_ascii(0), b'!');
+        assert_eq!(bam_qual_byte_to_ascii(40), b'I');
+        // 0xFF (unavailable) maps to '!'.
+        assert_eq!(bam_qual_byte_to_ascii(0xFF), b'!');
+        // Out-of-range bytes must wrap, not panic (extract runs on untrusted
+        // BAM; q + 33 would overflow-panic in debug builds for q >= 223).
+        assert_eq!(bam_qual_byte_to_ascii(230), 230u8.wrapping_add(33));
+        assert_eq!(bam_qual_byte_to_ascii(250), 250u8.wrapping_add(33));
+    }
 }

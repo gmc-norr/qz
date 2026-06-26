@@ -1,843 +1,1321 @@
 //! Compression orchestrators: chunked pipelined compression with disk-backed block storage.
 
+use super::codecs;
+use super::*;
+use crate::cli::{CompressConfig, QualityCompressor, QualityMode};
 use anyhow::Result;
 use std::time::Instant;
 use tracing::info;
-use crate::cli::{CompressConfig, QualityCompressor, QualityMode};
-use super::*;
-use super::codecs;
 
 // ---------------------------------------------------------------------------
-// Per-chunk compression helpers
+// Per-stream BSC / fqz block helpers (shared by the streaming engine + reference)
 // ---------------------------------------------------------------------------
 
-/// All compression parameters that a chunk worker thread needs.
-/// Every field is Copy/Clone so this can be freely moved into spawned threads.
-#[derive(Clone, Copy)]
-struct ChunkParams {
-    use_columnar_headers: bool,
-    bsc_static: bool,
-    bsc_block_mb: usize,
-    quality_mode: QualityMode,
-    stream_quality_binning: QualityBinning,
-    skip_quality_in_stream: bool,
-    sequence_hints: bool,
-    sequence_delta: bool,
-    rc_canon: bool,
-    global_const_seq_len: usize,
-    global_const_qual_len: usize,
-    use_fqzcomp: bool,
-    use_quality_ctx: bool,
-    no_quality: bool,
-    quality_ctx_block_size: usize,
+/// Compress quality strings into one fqzcomp blob; if it exceeds `cap`,
+/// recursively bisect by record count until every emitted blob is `<= cap`.
+/// Hard-errors if a single record's blob still exceeds the cap (pathological;
+/// real reads are bounded). Order-preserving. Returns framed `(record_count, blob)`.
+///
+/// This is the **byte-capped** quality splitter used by reference mode (which
+/// bisects by output size, not record count). Every element must be a real
+/// quality string. It operates on borrowed quality strings so reference mode can
+/// encode quality without building throwaway records.
+pub(crate) fn fqz_blocks_capped_quals(quals: &[&[u8]], cap: usize) -> Result<Vec<(u32, Vec<u8>)>> {
+    let blob = codecs::compress_qualities_fqzcomp_quals(quals)?;
+    if blob.len() <= cap {
+        return Ok(vec![(quals.len() as u32, blob)]);
+    }
+    if quals.len() <= 1 {
+        anyhow::bail!(
+            "fqzcomp: single-record quality blob {} B exceeds block cap {} B",
+            blob.len(),
+            cap
+        );
+    }
+    let mid = quals.len() / 2;
+    let mut out = fqz_blocks_capped_quals(&quals[..mid], cap)?;
+    out.extend(fqz_blocks_capped_quals(&quals[mid..], cap)?);
+    Ok(out)
 }
 
-/// Compressed output from a single chunk.
-struct ChunkCompressResult {
-    h_blocks: Vec<Vec<u8>>,
-    s_blocks: Vec<Vec<u8>>,
-    q_blocks: Vec<Vec<u8>>,
-    rc_blocks: Vec<Vec<u8>>,
+/// Columnar-encode `headers` into framed `(record_count, payload)` blocks where
+/// each payload is `[count u32][columnar_blob]` and each block stays `<= cap` bytes
+/// on disk (the block-stream framing rejects any block over `streams::MAX_BLOCK`).
+///
+/// The common case — the chunk's columnar blob fits under `cap` — returns a SINGLE
+/// block byte-identical to the pre-cap encoder, so every existing archive is
+/// unchanged and there is no ratio cost. Only when a chunk's columnar blob would
+/// exceed the 64 MiB block cap (reachable at large `chunk_records` with long,
+/// high-entropy read IDs) does this bisect by record count and recurse, so every
+/// emitted block is independently decodable — without the cap such a chunk produced
+/// an archive that failed its own decode/verify. Bails if a single header's payload
+/// still exceeds `cap` (pathological; real read IDs are bounded). Order-preserving.
+///
+/// Mirrors [`fqz_blocks_capped_quals`]: same cap-triggered bisection, same framing.
+/// All three columnar-header consumers handle the resulting N blocks: the single-end
+/// producer (`bounded_columnar_header_producer`) and the paired/reference decoder
+/// (`paired::decode_columnar_headers`) decode each block independently and
+/// concatenate in block order.
+/// Records per columnar header sub-block. The header path was historically the only
+/// stream still operating at whole-chunk granularity (sequence/quality are split into
+/// many block-sized jobs), which made each 2.5M-record chunk's columnar header one
+/// coarse ~5s unit that straggled at the end of compress while most workers sat idle.
+/// Splitting it into independent sub-range blocks (compressed in parallel, the decoders
+/// already concatenate N blocks in order) collapses that tail. 250K is the measured
+/// sweet spot: header-job ~4.4× faster for ~+0.15% archive size (each sub-range loses a
+/// little cross-boundary columnar context + rebuilds its own combo dict). `QZ_HEADER_SUB`
+/// overrides for tuning (0 = whole-chunk, the legacy single-unit behavior).
+pub(crate) const HEADER_SUB_BLOCK_RECORDS: usize = 250_000;
+
+pub(crate) fn columnar_blocks_capped(headers: &[&[u8]], cap: usize) -> Result<Vec<(u32, Vec<u8>)>> {
+    let sub = std::env::var("QZ_HEADER_SUB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(HEADER_SUB_BLOCK_RECORDS);
+    if sub == 0 || headers.len() <= sub {
+        return columnar_blocks_capped_one(headers, cap);
+    }
+    use rayon::prelude::*;
+    let ranges: Vec<&[&[u8]]> = headers.chunks(sub).collect();
+    let parts: Vec<Result<Vec<(u32, Vec<u8>)>>> = ranges
+        .par_iter()
+        .map(|r| columnar_blocks_capped_one(r, cap))
+        .collect();
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend(p?);
+    }
+    Ok(out)
 }
 
-/// Compress one chunk of records.  Runs entirely on the calling thread (or a
-/// spawned thread) and uses the global rayon pool for block-level parallelism.
-fn compress_one_chunk(
-    records: Vec<crate::io::FastqRecord>,
-    p: &ChunkParams,
-    chunk_idx: usize,
-) -> Result<ChunkCompressResult> {
-    let chunk_t0 = Instant::now();
-
-    // Build the three byte streams from records (serial, ~75–200 ms per 2.5 M reads)
-    let (h_data, s_data, q_data, rc_data) = records_to_streams(
-        &records, p.quality_mode, p.stream_quality_binning, p.skip_quality_in_stream,
-        p.sequence_hints, p.sequence_delta, p.rc_canon,
-        p.global_const_seq_len, p.global_const_qual_len,
-    )?;
-
-    // Parallel compress: headers ‖ (sequences ‖ qualities)
-    let (h_result, (s_result, q_result)) = rayon::join(
-        || -> Result<Vec<Vec<u8>>> {
-            let t = Instant::now();
-            let r = if p.use_columnar_headers {
-                let header_strs: Vec<String> = records.iter()
-                    .map(|r| String::from_utf8_lossy(&r.id).into_owned())
-                    .collect();
-                let header_refs: Vec<&str> = header_strs.iter().map(|s| s.as_str()).collect();
-                let blob = header_col::compress_headers_columnar(&header_refs)?;
-                let mut prefixed = Vec::with_capacity(4 + blob.len());
-                prefixed.extend_from_slice(&(header_refs.len() as u32).to_le_bytes());
-                prefixed.extend_from_slice(&blob);
-                info!("  [chunk {}] Columnar headers: {:.2}s", chunk_idx, t.elapsed().as_secs_f64());
-                Ok(vec![prefixed])
-            } else {
-                let r = compress_stream_to_bsc_blocks(&h_data, p.bsc_static, p.bsc_block_mb);
-                info!("  [chunk {}] BSC headers: {:.2}s", chunk_idx, t.elapsed().as_secs_f64());
-                r
-            };
-            r
-        },
-        || rayon::join(
-            || -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
-                let t = Instant::now();
-                let s_blocks = compress_stream_to_bsc_blocks(&s_data, p.bsc_static, p.bsc_block_mb)?;
-                info!("  [chunk {}] BSC sequences: {:.2}s", chunk_idx, t.elapsed().as_secs_f64());
-                let rc_blocks = if rc_data.is_empty() {
-                    Vec::new()
-                } else {
-                    compress_stream_to_bsc_blocks(&rc_data, p.bsc_static, p.bsc_block_mb)?
-                };
-                Ok((s_blocks, rc_blocks))
-            },
-            || -> Result<Vec<Vec<u8>>> {
-                let qt = Instant::now();
-                let qr = if p.no_quality || (q_data.is_empty() && !p.use_fqzcomp && !p.use_quality_ctx) {
-                    Ok(Vec::new())
-                } else if p.use_fqzcomp {
-                    let q_blob = codecs::compress_qualities_fqzcomp(&records)?;
-                    Ok(vec![q_blob])
-                } else if p.use_quality_ctx {
-                    use rayon::prelude::*;
-                    let qual_refs: Vec<&[u8]> = records.iter()
-                        .map(|r| r.quality.as_deref().unwrap_or(&[]))
-                        .collect();
-                    let seq_refs: Vec<&[u8]> = records.iter()
-                        .map(|r| r.sequence.as_slice())
-                        .collect();
-                    let n = qual_refs.len();
-                    let sub = p.quality_ctx_block_size;
-                    if n <= sub {
-                        let blob = quality_ctx::compress_qualities_ctx(&qual_refs, &seq_refs)?;
-                        Ok(vec![blob])
-                    } else {
-                        let num_sub = (n + sub - 1) / sub;
-                        let blobs: Vec<Vec<u8>> = (0..num_sub)
-                            .into_par_iter()
-                            .map(|i| {
-                                let start = i * sub;
-                                let end = (start + sub).min(n);
-                                quality_ctx::compress_qualities_ctx(
-                                    &qual_refs[start..end], &seq_refs[start..end],
-                                )
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok(blobs)
-                    }
-                } else {
-                    compress_stream_to_bsc_blocks(&q_data, p.bsc_static, p.bsc_block_mb)
-                };
-                info!("  [chunk {}] Quality: {:.2}s", chunk_idx, qt.elapsed().as_secs_f64());
-                qr
-            },
-        ),
-    );
-
-    let h_blocks = h_result?;
-    let (s_blocks, rc_blocks) = s_result?;
-    let q_blocks = q_result?;
-
-    info!("  [chunk {}] Total compress: {:.2}s", chunk_idx, chunk_t0.elapsed().as_secs_f64());
-    Ok(ChunkCompressResult { h_blocks, s_blocks, q_blocks, rc_blocks })
+/// Compress one (sub-)range of headers as columnar, bisecting only if the compressed
+/// payload exceeds `cap` (the original `columnar_blocks_capped` behavior).
+fn columnar_blocks_capped_one(headers: &[&[u8]], cap: usize) -> Result<Vec<(u32, Vec<u8>)>> {
+    let blob = header_col::compress_headers_columnar_bytes(headers)?;
+    let mut payload = Vec::with_capacity(4 + blob.len());
+    payload.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&blob);
+    if payload.len() <= cap {
+        return Ok(vec![(headers.len() as u32, payload)]);
+    }
+    if headers.len() <= 1 {
+        anyhow::bail!(
+            "columnar headers: single-record block {} B exceeds block cap {} B",
+            payload.len(),
+            cap
+        );
+    }
+    let mid = headers.len() / 2;
+    let mut out = columnar_blocks_capped_one(&headers[..mid], cap)?;
+    out.extend(columnar_blocks_capped_one(&headers[mid..], cap)?);
+    Ok(out)
 }
 
 /// Unified chunked compression pipeline.
 ///
 /// Replaces the former compress_chunked_bsc, compress_chunked_bsc_reorder_local,
-/// and compress_chunked_fqzcomp with a single function parameterised by `sort_chunks`.
-///
-/// - `sort_chunks=false`: 2.5M chunk size, in-memory block accumulation (default path)
-/// - `sort_chunks=true`: 5M chunk size, temp-file block storage (local reorder path)
+/// and compress_chunked_fqzcomp with a single function parameterised by `mode`.
 ///
 /// Quality strategy is auto-detected:
-/// - Fqzcomp: if quality_compressor == Fqzcomp
-/// - QualityCtx: if explicit or auto-detected (lossless + ≥100K reads)
+/// - Fqzcomp: lossless + ≥100K reads (explicit Fqzcomp, or Auto)
 /// - BSC: otherwise
 ///
 /// Features: pipelined I/O (read next chunk while compressing current), parallel
 /// h||s||q compression, constant-length detection, cross-chunk validation.
-pub(super) fn compress_chunked(args: &CompressConfig, sort_chunks: bool) -> Result<()> {
-    use std::io::Write;
+/// How `compress_chunked` is parameterised.
+///
+/// - `Default`: 2.5M-record chunks, ≤64 MiB blocks, RawWithHints/Raw encoding.
+/// - `Ultra`: big blocks (≤750 MiB), `UltraBigBlock` encoding, raw BSC, no reorder.
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum ChunkedMode {
+    Default,
+    Ultra {
+        bsc_block_mb: usize,
+        chunk_records: usize,
+        quality_sub_block: usize,
+        compress_window: usize,
+    },
+}
 
-    // Warn early if GPU VRAM is too small for the BSC block size
-    super::bsc::check_cuda_vram(args.advanced.bsc_block_size_mb * 1024 * 1024);
-
-    let chunk_size: usize = if sort_chunks {
-        args.advanced.chunk_records * 2
-    } else {
-        args.advanced.chunk_records
-    };
-    let bsc_block_mb = args.advanced.bsc_block_size_mb;
-    let start_time = Instant::now();
-    let input_path = &args.input[0];
-    let bsc_static = args.advanced.bsc_static;
-    let no_quality = args.no_quality;
-    let quality_mode = args.quality_mode;
-    let sequence_hints = args.advanced.sequence_hints;
-    let sequence_delta = args.advanced.sequence_delta;
-    let rc_canon = args.advanced.rc_canon;
-    let quality_binning = if no_quality {
-        QualityBinning::None
-    } else {
-        quality_mode_to_binning(quality_mode)
-    };
-    if sort_chunks {
-        info!("Chunked compression (sorted): {} records per chunk", chunk_size);
-    } else {
-        info!("Chunked compression: {} records per chunk", chunk_size);
+/// Write one stream's blocks for a chunk to `output_file`, appending a directory
+/// entry per block. `offset`/`length` in each entry describe the **full v5 block
+/// frame** (12-byte prefix + payload), and `byte_cursor` tracks the absolute output
+/// position so the next frame's offset is correct. Used by the v5 chunk-major
+/// non-sort pipeline. (Top-level `fn` rather than a closure so the borrow checker
+/// does not fight capturing `output_file`/`byte_cursor`/`directory` while these
+/// are also live across the FIFO-drain loop.)
+// Generic over the writer (`W: Write + ?Sized`) so it serves BOTH the legacy path's
+// `Box<dyn Write>` and the streaming writer's `Box<dyn Write + Send>` (the latter
+// moved into a spawned thread). `Box<dyn Write>` and `Box<dyn Write + Send>` both
+// implement `Write`, so legacy call sites (`&mut output_file`) compile unchanged and
+// the framing/CRC/offset math stays byte-identical across both engines.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_role_blocks<W: std::io::Write + ?Sized>(
+    blocks: &[(u32, Vec<u8>)],
+    role: crate::compression::chunk_directory::StreamRole,
+    mate: u8,
+    codec: u8,
+    chunk_index: u32,
+    output_file: &mut W,
+    byte_cursor: &mut u64,
+    directory: &mut Vec<crate::compression::chunk_directory::ChunkDirEntry>,
+) -> Result<()> {
+    use crate::compression::BLOCK_PREFIX_SIZE;
+    let mut framing = Vec::with_capacity(BLOCK_PREFIX_SIZE);
+    for (record_count, block) in blocks {
+        framing.clear();
+        super::bsc::write_block_frame_header(&mut framing, block.len() as u32, *record_count, block);
+        let frame_offset = *byte_cursor;
+        let frame_len = (framing.len() + block.len()) as u64;
+        output_file.write_all(&framing)?;
+        output_file.write_all(block)?;
+        directory.push(crate::compression::chunk_directory::ChunkDirEntry {
+            chunk_index,
+            role,
+            mate,
+            codec,
+            offset: frame_offset,
+            length: frame_len,
+            record_count: *record_count as u64,
+        });
+        *byte_cursor += frame_len;
     }
+    Ok(())
+}
 
-    let mut reader = crate::io::FastqReader::from_path_or_stdin(input_path, args.fasta)?;
+/// Paired physical contract: one ChunkDirEntry whose payload is a `write_block_stream`
+/// blob (`[num_blocks][framed blocks…]`) for the whole (mate,role) segment. `record_count`
+/// is the chunk's pair count (NOT per-block). Seek-free.
+#[allow(clippy::too_many_arguments)]
+fn write_segment_blob<W: std::io::Write + ?Sized>(
+    blocks: &[(u32, Vec<u8>)],
+    role: crate::compression::chunk_directory::StreamRole,
+    mate: u8,
+    codec: u8,
+    record_count: u64,
+    chunk_index: u32,
+    output_file: &mut W,
+    byte_cursor: &mut u64,
+    directory: &mut Vec<crate::compression::chunk_directory::ChunkDirEntry>,
+) -> Result<()> {
+    let mut blob = Vec::new();
+    crate::compression::paired::streams::write_block_stream(&mut blob, blocks);
+    output_file.write_all(&blob)?;
+    directory.push(crate::compression::chunk_directory::ChunkDirEntry {
+        chunk_index,
+        role,
+        mate,
+        codec,
+        offset: *byte_cursor,
+        length: blob.len() as u64,
+        record_count,
+    });
+    *byte_cursor += blob.len() as u64;
+    Ok(())
+}
 
-    // Read first chunk
-    let (mut cur_records, mut cur_bases, mut cur_orig) =
-        read_chunk_records(&mut reader, chunk_size)?;
+pub(super) fn compress_chunked(args: &CompressConfig, mode: ChunkedMode) -> Result<()> {
+    compress_chunked_streaming(args, mode)
+}
 
-    if cur_records.is_empty() {
-        anyhow::bail!("Empty input file");
+// ===========================================================================
+// Block-granular streaming single-end compress engine
+// ===========================================================================
+//
+// Producer (this thread) frames records, stages per-role raw blocks, and dispatches
+// them to a bounded worker pool. Workers compress and forward results to a single
+// writer thread, which orders blocks by chunk and writes the per-chunk role sequence
+// + ChunkDecodedSizes global + footer/locator.
+
+use crate::compression::chunk_directory::StreamRole;
+use crate::compression::stream_compress::{
+    ArchivePlan, BlockResult, ChunkManifest, CompletedSegment, CompressJob, HeaderColStager,
+    JobOutput, OrderedBlockBuffer, QualStager, SeqQualHeaderStager, compress_job,
+    compress_worker_count, resolve_archive_plan,
+};
+use std::sync::mpsc::SyncSender;
+
+/// Selects the per-mode physical write contract in `write_ordered` (spec §6).
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum CompressMode {
+    /// One ChunkDirEntry PER BLOCK (H/S/Q/RC), mate 0, + ChunkDecodedSizes global.
+    Single,
+    /// One ChunkDirEntry per (mate,role) SEGMENT (write_block_stream blob), no
+    /// ChunkDecodedSizes; validate_paired_directory before the footer.
+    Paired,
+}
+
+/// Messages on the single results channel the writer drains. `Manifest` is sent by
+/// the producer (per chunk close); `Block`/`Segment`/`Err` by workers.
+pub(crate) enum WorkerMsg {
+    Manifest(ChunkManifest),
+    Block(BlockResult),
+    Segment(CompletedSegment),
+    Err(String),
+}
+
+/// What the writer thread returns on a clean finish — the per-role compressed byte
+/// totals + original size + metadata size for the final stats log line.
+pub(crate) struct WriterDone {
+    pub original_size: usize,
+    pub headers_len: usize,
+    pub sequences_len: usize,
+    pub qualities_len: usize,
+    pub rc_flags_len: usize,
+    pub metadata_size: usize,
+}
+
+/// Validate one record's lengths against the chunk-0 global const-length profile.
+/// Mirrors legacy `validate_const_lengths` semantics for a single record: when a
+/// global const length is set (non-zero), every subsequent record MUST match it, or
+/// const-length framing (no per-record varint) would silently mis-slice on decode.
+fn validate_const_one(
+    rec: &crate::io::FastqRecord,
+    const_seq_len: usize,
+    const_qual_len: usize,
+    no_quality: bool,
+    chunk_index: u32,
+) -> Result<()> {
+    if const_seq_len > 0 && rec.sequence.len() != const_seq_len {
+        anyhow::bail!(
+            "Constant sequence length mismatch: chunk 0 had {} but chunk {} has {} (or variable).",
+            const_seq_len,
+            chunk_index,
+            rec.sequence.len()
+        );
     }
-
-    // Resolve Auto -> concrete compressor based on first chunk size. We use the
-    // first chunk's record count as a proxy: it equals the total when the input
-    // fits in one chunk, and is otherwise large enough to justify QualityCtx.
-    let resolved_quality_compressor = super::resolve_quality_compressor(
-        args.advanced.quality_compressor,
-        cur_records.len(),
-        quality_mode,
-        no_quality,
-    );
-    let use_fqzcomp = resolved_quality_compressor == QualityCompressor::Fqzcomp;
-
-    // Decide quality strategy. Note: with the explicit Auto variant, this no
-    // longer silently overrides an explicit Bsc choice — Bsc means Bsc.
-    let collect_for_ctx = !no_quality && quality_mode == QualityMode::Lossless && !use_fqzcomp;
-    let use_quality_ctx = collect_for_ctx
-        && resolved_quality_compressor == QualityCompressor::QualityCtx;
-
-    // Detect constant lengths from first chunk
-    // const_qual_len only applies to BSC quality path (fqzcomp/quality_ctx have their own framing)
-    let uses_packed_quality = !use_fqzcomp && !use_quality_ctx;
-    let (global_const_seq_len, global_const_qual_len) = if !sort_chunks && !sequence_delta {
-        let (seq, qual) = detect_const_lengths(&cur_records, no_quality);
-        (seq, if uses_packed_quality { qual } else { 0 })
-    } else {
-        (0, 0) // reorder path doesn't use const-length (records get reordered across chunks)
-    };
-    if global_const_seq_len > 0 {
-        info!("Constant sequence length detected: {} bp", global_const_seq_len);
-    }
-    if global_const_qual_len > 0 {
-        info!("Constant quality length detected: {} bp", global_const_qual_len);
-    }
-    let quality_compressor_used = if use_fqzcomp {
-        QualityCompressor::Fqzcomp
-    } else if use_quality_ctx {
-        info!("Using context-adaptive quality compression (quality_ctx)");
-        QualityCompressor::QualityCtx
-    } else {
-        QualityCompressor::Bsc
-    };
-
-    // For fqzcomp/quality_ctx, skip quality in records_to_streams (compressed separately)
-    let skip_quality_in_stream = no_quality || use_fqzcomp || use_quality_ctx;
-    // Quality binning for stream building (fqzcomp uses raw ASCII, quality_ctx uses raw bytes)
-    let stream_quality_binning = if use_fqzcomp { QualityBinning::None } else { quality_binning };
-
-    // Block accumulation: in-memory for non-sorted, temp files for sorted
-    let mut all_h_blocks: Vec<Vec<u8>> = Vec::new();
-    let mut all_s_blocks: Vec<Vec<u8>> = Vec::new();
-    let mut all_q_blocks: Vec<Vec<u8>> = Vec::new();
-    let mut all_rc_blocks: Vec<Vec<u8>> = Vec::new();
-
-    // Temp file infrastructure (only used when sort_chunks=true)
-    struct TmpCleanup(Vec<std::path::PathBuf>);
-    impl Drop for TmpCleanup {
-        fn drop(&mut self) { for p in &self.0 { let _ = std::fs::remove_file(p); } }
-    }
-    let working_dir = &args.working_dir;
-    let pid = std::process::id();
-    let h_tmp_path = working_dir.join(format!(".qz_chunked_h_{pid}.tmp"));
-    let s_tmp_path = working_dir.join(format!(".qz_chunked_s_{pid}.tmp"));
-    let q_tmp_path = working_dir.join(format!(".qz_chunked_q_{pid}.tmp"));
-    let rc_tmp_path = working_dir.join(format!(".qz_chunked_rc_{pid}.tmp"));
-
-    let (mut h_tmp, mut s_tmp, mut q_tmp, mut rc_tmp, _cleanup);
-    let (mut h_num_blocks, mut s_num_blocks, mut q_num_blocks, mut rc_num_blocks) = (0u32, 0u32, 0u32, 0u32);
-
-    if sort_chunks {
-        let mut tmp_paths = vec![h_tmp_path.clone(), s_tmp_path.clone(), q_tmp_path.clone()];
-        if rc_canon { tmp_paths.push(rc_tmp_path.clone()); }
-        _cleanup = Some(TmpCleanup(tmp_paths));
-        h_tmp = Some(std::io::BufWriter::new(std::fs::File::create(&h_tmp_path)?));
-        s_tmp = Some(std::io::BufWriter::new(std::fs::File::create(&s_tmp_path)?));
-        q_tmp = Some(std::io::BufWriter::new(std::fs::File::create(&q_tmp_path)?));
-        rc_tmp = if rc_canon { Some(std::io::BufWriter::new(std::fs::File::create(&rc_tmp_path)?)) } else { None };
-    } else {
-        _cleanup = None;
-        h_tmp = None;
-        s_tmp = None;
-        q_tmp = None;
-        rc_tmp = None;
-    }
-
-    let mut num_reads: usize = 0;
-    let mut total_bases: usize = 0;
-    let mut original_size: usize = 0;
-    let mut chunk_idx: usize = 0;
-
-    // Build the per-chunk params bundle (all Copy, safe to move into spawned threads)
-    let params = ChunkParams {
-        use_columnar_headers: args.advanced.header_compressor == HeaderCompressor::Columnar,
-        bsc_static,
-        bsc_block_mb,
-        quality_mode,
-        stream_quality_binning,
-        skip_quality_in_stream,
-        sequence_hints,
-        sequence_delta,
-        rc_canon,
-        global_const_seq_len,
-        global_const_qual_len,
-        use_fqzcomp,
-        use_quality_ctx,
-        no_quality,
-        quality_ctx_block_size: args.advanced.quality_ctx_block_size,
-    };
-
-    if sort_chunks {
-        // ── SORT PATH ─────────────────────────────────────────────────────────
-        // Keep the original single-chunk pipeline: the sort step itself uses
-        // rayon internally, and concurrent sorts would fight over the pool.
-        while !cur_records.is_empty() {
-            let cur_reads = cur_records.len();
-            info!("Chunk {}: {} reads, sorting...", chunk_idx, cur_reads);
-            let sort_start = Instant::now();
-            cur_records = sort_records_by_key(cur_records);
-            info!("  Sorted in {:.2}s", sort_start.elapsed().as_secs_f64());
-
-            let (next_result, compress_result) = std::thread::scope(|scope| {
-                let records = std::mem::take(&mut cur_records);
-                let p = params;
-                let idx = chunk_idx;
-                let compress_handle = scope.spawn(move || compress_one_chunk(records, &p, idx));
-
-                let io_t = Instant::now();
-                let next = read_chunk_records(&mut reader, chunk_size);
-                info!("  I/O read: {:.2}s", io_t.elapsed().as_secs_f64());
-
-                let compressed = match compress_handle.join() {
-                    Ok(v) => v,
-                    Err(e) => std::panic::resume_unwind(e),
-                };
-                (next, compressed)
-            });
-
-            let result = compress_result?;
-            h_num_blocks += write_blocks_to_tmp(result.h_blocks, h_tmp.as_mut().unwrap())?;
-            s_num_blocks += write_blocks_to_tmp(result.s_blocks, s_tmp.as_mut().unwrap())?;
-            if use_fqzcomp {
-                // fqzcomp path: write each non-empty quality blob with v3 block prefix.
-                for q_blob in result.q_blocks {
-                    if !q_blob.is_empty() {
-                        let qt = q_tmp.as_mut().unwrap();
-                        let crc = super::bsc::block_crc32(&q_blob);
-                        qt.write_all(&(q_blob.len() as u32).to_le_bytes())?;
-                        qt.write_all(&crc.to_le_bytes())?;
-                        qt.write_all(&q_blob)?;
-                        q_num_blocks += 1;
-                    }
-                }
-            } else {
-                q_num_blocks += write_blocks_to_tmp(result.q_blocks, q_tmp.as_mut().unwrap())?;
-            }
-            if let Some(ref mut rc_file) = rc_tmp {
-                rc_num_blocks += write_blocks_to_tmp(result.rc_blocks, rc_file)?;
-            }
-
-            num_reads += cur_reads;
-            total_bases += cur_bases;
-            original_size += cur_orig;
-            chunk_idx += 1;
-
-            let (nr, nb, no) = next_result?;
-            cur_records = nr;
-            cur_bases = nb;
-            cur_orig = no;
+    if const_qual_len > 0 && !no_quality {
+        let qlen = rec.quality.as_ref().map_or(0, |q| q.len());
+        if qlen != const_qual_len {
+            anyhow::bail!(
+                "Constant quality length mismatch: chunk 0 had {} but chunk {} has {} (or variable).",
+                const_qual_len,
+                chunk_index,
+                qlen
+            );
         }
-    } else {
-        // ── NON-SORT PATH: sliding-window parallel chunk pipeline ──────────────
-        //
-        // Keep `pipeline_window` chunks compressing simultaneously via separate
-        // OS threads sharing the global rayon pool.  With 2.5 M reads × 150 bp:
-        //   window=1 → ~35 BSC tasks on 72 cores = 49 % utilisation
-        //   window=2 → ~70 BSC tasks on 72 cores = 97 % utilisation → ~1.9× speedup
-        //
-        // Results are collected in FIFO order, so archive byte order is preserved.
-        let pipeline_window = args.advanced.compress_window.max(1);
-        if pipeline_window > 1 {
-            info!("Parallel chunk pipeline: window={} chunks compressing simultaneously", pipeline_window);
-        }
+    }
+    Ok(())
+}
 
-        // Each entry: (JoinHandle, reads_in_chunk, bases_in_chunk, orig_bytes)
-        type Handle = std::thread::JoinHandle<Result<ChunkCompressResult>>;
-        let mut pending: std::collections::VecDeque<(Handle, usize, usize, usize)> =
-            std::collections::VecDeque::new();
+/// Lightweight discriminant for `QualStager`, copied out before staging so we don't
+/// hold a `match &mut self.qual` borrow while calling its mutating methods.
+#[derive(Clone, Copy)]
+enum QualKind {
+    Fqz,
+    Bsc,
+    None,
+}
 
-        // Spawn one compression thread and push into pending.
-        // Takes ownership of cur_records, leaving it empty.
-        let spawn_cur = |cur_records: &mut Vec<_>,
-                              cur_bases: usize,
-                              cur_orig: usize,
-                              chunk_idx: usize,
-                              pending: &mut std::collections::VecDeque<(Handle, usize, usize, usize)>| {
-            let reads = cur_records.len();
-            info!("Chunk {}: {} reads (dispatched)", chunk_idx, reads);
-            let records = std::mem::take(cur_records);
-            let p = params;
-            let handle: Handle = std::thread::spawn(move || compress_one_chunk(records, &p, chunk_idx));
-            pending.push_back((handle, reads, cur_bases, cur_orig));
+/// Per-chunk staging + dispatch. Owns the three (+rc) stagers and the per-chunk
+/// manifest accumulators. Makes the same framing/role decisions as the
+/// chunk-at-a-time path used to, but flushes blocks as they fill rather than
+/// per-chunk.
+struct ProducerState<'a> {
+    plan: &'a ArchivePlan,
+    seq: SeqQualHeaderStager,
+    // Exactly one of these two is active, per `use_columnar_headers`.
+    hdr_bsc: Option<SeqQualHeaderStager>,
+    hdr_col: Option<HeaderColStager>,
+    qual: QualStager,
+    rc: Option<SeqQualHeaderStager>,
+    // Scratch framing buffers, cleared per record.
+    fh: Vec<u8>,
+    fs: Vec<u8>,
+    fq: Vec<u8>,
+    frc: Vec<u8>,
+    // Per-chunk accumulators (all reset at chunk close). The writer sums the
+    // per-chunk records/total_bases/original_size across chunks, mirroring legacy's
+    // `num_reads += reads` / `original_size += orig` per FIFO drain.
+    chunk_index: u32,
+    sequence_blocks: u32,
+    header_blocks: u32,
+    qual_blocks: u32,
+    rc_blocks: u32,
+    decoded_output_bytes: u64,
+    chunk_records: u64,       // records staged in the current (open) chunk
+    chunk_total_bases: u64,   // Σ sequence bases in the current chunk
+    chunk_original_size: u64, // raw FASTQ bytes in the current chunk (log-only)
+    /// Running total of records across ALL chunks — used only as a stable record
+    /// index in error messages (mirrors legacy `records_to_streams`' diagnostics).
+    records_seen: u64,
+}
+
+impl<'a> ProducerState<'a> {
+    fn new(plan: &'a ArchivePlan, target: usize) -> Self {
+        let (hdr_bsc, hdr_col) = if plan.use_columnar_headers {
+            (None, Some(HeaderColStager::new(0)))
+        } else {
+            (Some(SeqQualHeaderStager::new(StreamRole::Headers, 0, target)), None)
         };
-
-        // ── Prime the pipeline ──
-        // Dispatch the first chunk immediately, then read + dispatch up to
-        // (pipeline_window - 1) more before entering the steady-state loop.
-        spawn_cur(&mut cur_records, cur_bases, cur_orig, chunk_idx, &mut pending);
-        chunk_idx += 1;
-
-        for _ in 1..pipeline_window {
-            let (nr, nb, no) = read_chunk_records(&mut reader, chunk_size)?;
-            cur_records = nr;
-            cur_bases = nb;
-            cur_orig = no;
-            if cur_records.is_empty() { break; }
-            spawn_cur(&mut cur_records, cur_bases, cur_orig, chunk_idx, &mut pending);
-            chunk_idx += 1;
-        }
-
-        // ── Steady-state: drain head, read next, dispatch next ──
-        while let Some((handle, reads, bases, orig)) = pending.pop_front() {
-            // Read the next chunk on the main thread.  This I/O overlaps with
-            // all remaining compression threads in `pending`.
-            let io_t = Instant::now();
-            let (nr, nb, no) = read_chunk_records(&mut reader, chunk_size)?;
-            info!("  I/O read: {:.2}s", io_t.elapsed().as_secs_f64());
-
-            // Block until the oldest chunk finishes.
-            let result = match handle.join() {
-                Ok(v) => v?,
-                Err(e) => std::panic::resume_unwind(e),
-            };
-
-            // Accumulate
-            all_h_blocks.extend(result.h_blocks);
-            all_s_blocks.extend(result.s_blocks);
-            all_q_blocks.extend(result.q_blocks);
-            if rc_canon { all_rc_blocks.extend(result.rc_blocks); }
-            num_reads += reads;
-            total_bases += bases;
-            original_size += orig;
-
-            // Validate const-length consistency and dispatch next chunk
-            cur_records = nr;
-            cur_bases = nb;
-            cur_orig = no;
-            if !cur_records.is_empty() {
-                let (chunk_const_seq, chunk_const_qual) =
-                    detect_const_lengths(&cur_records, no_quality);
-                if global_const_seq_len > 0 && chunk_const_seq != global_const_seq_len {
-                    anyhow::bail!(
-                        "Constant sequence length mismatch: chunk 0 had {} but chunk {} has {} (or variable).",
-                        global_const_seq_len, chunk_idx, chunk_const_seq
-                    );
-                }
-                if global_const_qual_len > 0 && chunk_const_qual != global_const_qual_len {
-                    anyhow::bail!(
-                        "Constant quality length mismatch: chunk 0 had {} but chunk {} has {} (or variable).",
-                        global_const_qual_len, chunk_idx, chunk_const_qual
-                    );
-                }
-                spawn_cur(&mut cur_records, cur_bases, cur_orig, chunk_idx, &mut pending);
-                chunk_idx += 1;
-            }
-        }
-    }
-
-    let encoding_type: u8 = if rc_canon { 6 } else if sequence_delta { 5 } else if sequence_hints { 4 } else { 0 };
-
-    info!("Read {} records in {} chunks ({} bases)", num_reads, chunk_idx, total_bases);
-
-    if sort_chunks {
-        // Flush and close temp files, then write archive
-        for tmp in [h_tmp.as_mut(), s_tmp.as_mut(), q_tmp.as_mut()] {
-            if let Some(t) = tmp { t.flush()?; }
-        }
-        if let Some(ref mut rc_file) = rc_tmp {
-            rc_file.flush()?;
-        }
-        drop(h_tmp); drop(s_tmp); drop(q_tmp); drop(rc_tmp);
-
-        let h_tmp_size = std::fs::metadata(&h_tmp_path)?.len() as usize;
-        let s_tmp_size = std::fs::metadata(&s_tmp_path)?.len() as usize;
-        let q_tmp_size = std::fs::metadata(&q_tmp_path)?.len() as usize;
-        let rc_tmp_size = if rc_canon { std::fs::metadata(&rc_tmp_path)?.len() as usize } else { 0 };
-
-        let headers_len = if h_num_blocks > 0 { 4 + h_tmp_size } else { 0 };
-        let sequences_len = if s_num_blocks > 0 { 4 + s_tmp_size } else { 0 };
-        let qualities_len = if q_num_blocks > 0 { 4 + q_tmp_size } else { 0 };
-        let rc_flags_len = if rc_num_blocks > 0 { 4 + rc_tmp_size } else { 0 };
-
-        let rc_stream = if rc_canon {
-            Some(RcStreamParams { flags_len: rc_flags_len, num_blocks: rc_num_blocks, tmp_path: &rc_tmp_path })
+        let qual = if plan.no_quality {
+            QualStager::None
+        } else if plan.use_fqzcomp {
+            QualStager::fqz(plan.quality_ctx_block_size, 0)
+        } else {
+            QualStager::bsc(0, target)
+        };
+        let rc = if plan.rc_canon {
+            Some(SeqQualHeaderStager::new(StreamRole::RcFlags, 0, target))
         } else {
             None
         };
-        write_chunked_archive(
-            &args.output, stream_quality_binning, quality_compressor_used,
-            args.advanced.header_compressor, no_quality, encoding_type,
-            num_reads, headers_len, sequences_len, qualities_len,
-            h_num_blocks, s_num_blocks, q_num_blocks,
-            &h_tmp_path, &s_tmp_path, &q_tmp_path,
-            original_size, start_time, rc_stream,
-            global_const_seq_len, global_const_qual_len,
+        Self {
+            plan,
+            seq: SeqQualHeaderStager::new(StreamRole::Sequence, 0, target),
+            hdr_bsc,
+            hdr_col,
+            qual,
+            rc,
+            fh: Vec::new(),
+            fs: Vec::new(),
+            fq: Vec::new(),
+            frc: Vec::new(),
+            chunk_index: 0,
+            sequence_blocks: 0,
+            header_blocks: 0,
+            qual_blocks: 0,
+            rc_blocks: 0,
+            decoded_output_bytes: 0,
+            chunk_records: 0,
+            chunk_total_bases: 0,
+            chunk_original_size: 0,
+            records_seen: 0,
+        }
+    }
+
+    fn dispatch_job(job_tx: &SyncSender<CompressJob>, job: CompressJob) -> Result<()> {
+        // A send error means the pool aborted; the real cause is already queued to the
+        // writer (first-error-wins), so this secondary error is harmless.
+        job_tx
+            .send(job)
+            .map_err(|_| anyhow::anyhow!("compress workers exited"))
+    }
+
+    fn stage_one(
+        &mut self,
+        rec: &crate::io::FastqRecord,
+        job_tx: &SyncSender<CompressJob>,
+    ) -> Result<()> {
+        let p = self.plan;
+        self.fh.clear();
+        self.fs.clear();
+        self.fq.clear();
+        self.frc.clear();
+        // Legacy passes `skip_quality_in_stream` (= no_quality || use_fqzcomp) as
+        // `records_to_streams`' `no_quality` arg, so fqz/no-quality records emit NO
+        // quality into the framed stream (fqz compresses quality separately). Mirror
+        // that exactly — `p.no_quality` alone would leave quality in `fq` for fqz.
+        crate::compression::frame_record(
+            rec,
+            p.quality_mode,
+            p.stream_quality_binning,
+            p.skip_quality_in_stream,
+            p.sequence_hints,
+            p.rc_canon,
+            p.const_seq_len,
+            p.const_qual_len,
+            !p.use_columnar_headers, // build_header_stream only for the BSC header path
+            &mut self.fh,
+            &mut self.fs,
+            &mut self.fq,
+            &mut self.frc,
         )
-    } else {
-        // Write archive directly from in-memory blocks.
-        // Per-block prefix is 8 bytes (4 length + 4 CRC32) in qz archive v3+.
-        use crate::compression::BLOCK_PREFIX_SIZE;
-        let h_data_size: usize = all_h_blocks.iter().map(|b| BLOCK_PREFIX_SIZE + b.len()).sum();
-        let s_data_size: usize = all_s_blocks.iter().map(|b| BLOCK_PREFIX_SIZE + b.len()).sum();
-        let q_data_size: usize = all_q_blocks.iter().map(|b| BLOCK_PREFIX_SIZE + b.len()).sum();
-        let rc_data_size: usize = all_rc_blocks.iter().map(|b| BLOCK_PREFIX_SIZE + b.len()).sum();
+        .map_err(|e| anyhow::anyhow!("FASTQ record {}: {e}", self.records_seen))?;
 
-        let headers_len = if !all_h_blocks.is_empty() { 4 + h_data_size } else { 0 };
-        let sequences_len = if !all_s_blocks.is_empty() { 4 + s_data_size } else { 0 };
-        let qualities_len = if !all_q_blocks.is_empty() { 4 + q_data_size } else { 0 };
-        let rc_flags_len = if !all_rc_blocks.is_empty() { 4 + rc_data_size } else { 0 };
-
-        info!("Compressed blocks: headers={} ({}) seq={} ({}) qual={} ({})",
-            all_h_blocks.len(), humanize_bytes(h_data_size),
-            all_s_blocks.len(), humanize_bytes(s_data_size),
-            all_q_blocks.len(), humanize_bytes(q_data_size));
-        if rc_canon {
-            info!("  RC flags: {} ({})", all_rc_blocks.len(), humanize_bytes(rc_data_size));
+        // Sequence: always BSC-staged.
+        if let Some(b) = self.seq.stage_record_bytes(self.chunk_index, &self.fs) {
+            Self::dispatch_job(job_tx, CompressJob::Bsc(b))?;
+            self.sequence_blocks += 1;
         }
 
-        info!("Writing output file...");
-        let mut output_file: Box<dyn Write> = if crate::cli::is_stdio_path(&args.output) {
-            Box::new(std::io::BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout().lock()))
-        } else {
-            Box::new(std::io::BufWriter::new(std::fs::File::create(&args.output)?))
+        // Headers: columnar buffers the id; BSC routes framed header bytes.
+        if let Some(col) = self.hdr_col.as_mut() {
+            col.stage(&rec.id);
+        } else if let Some(hs) = self.hdr_bsc.as_mut()
+            && let Some(b) = hs.stage_record_bytes(self.chunk_index, &self.fh)
+        {
+            Self::dispatch_job(job_tx, CompressJob::Bsc(b))?;
+            self.header_blocks += 1;
+        }
+
+        // Quality: fqz stages raw ASCII; BSC routes framed (binned) quality bytes;
+        // no_quality stages nothing.
+        let qual_kind = match self.qual {
+            QualStager::Fqz { .. } => QualKind::Fqz,
+            QualStager::Bsc(_) => QualKind::Bsc,
+            QualStager::None => QualKind::None,
         };
-
-        let metadata_size = write_archive_header(
-            &mut output_file, encoding_type, stream_quality_binning, quality_compressor_used,
-            args.advanced.header_compressor, no_quality, num_reads, headers_len,
-            sequences_len, qualities_len, global_const_seq_len, global_const_qual_len,
-            rc_flags_len,
-        )?;
-
-        // Write streams in multi-block format (qz archive v3+):
-        // [num_blocks: u32][block_len: u32, crc32: u32, block_data]...
-        let write_blocks = |blocks: &[Vec<u8>], out: &mut dyn Write| -> Result<()> {
-            if blocks.is_empty() { return Ok(()); }
-            out.write_all(&(blocks.len() as u32).to_le_bytes())?;
-            for block in blocks {
-                let crc = super::bsc::block_crc32(block);
-                out.write_all(&(block.len() as u32).to_le_bytes())?;
-                out.write_all(&crc.to_le_bytes())?;
-                out.write_all(block)?;
+        match qual_kind {
+            QualKind::Fqz => {
+                // Mirrors the legacy fqz guard (compress_impl.rs:202): every record must
+                // carry quality, else the framed record_count desyncs the decoder.
+                let q = rec.quality.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "fqzcomp quality encode: every record must carry quality \
+                         (record_count framing requires it)"
+                    )
+                })?;
+                if let Some(b) = self.qual.stage_fqz(self.chunk_index, q) {
+                    Self::dispatch_job(job_tx, CompressJob::Fqz(b))?;
+                    self.qual_blocks += 1;
+                }
             }
-            Ok(())
-        };
-
-        write_blocks(&all_h_blocks, &mut *output_file)?;
-        write_blocks(&all_s_blocks, &mut *output_file)?;
-        write_blocks(&all_q_blocks, &mut *output_file)?;
-
-        if !all_rc_blocks.is_empty() {
-            output_file.write_all(&(rc_flags_len as u64).to_le_bytes())?;
-            write_blocks(&all_rc_blocks, &mut *output_file)?;
+            QualKind::Bsc => {
+                // `fq` is empty when the record has no quality — staging it appends nothing.
+                let chunk_index = self.chunk_index;
+                let block = self
+                    .qual
+                    .bsc_stager()
+                    .and_then(|s| s.stage_record_bytes(chunk_index, &self.fq));
+                if let Some(b) = block {
+                    Self::dispatch_job(job_tx, CompressJob::Bsc(b))?;
+                    self.qual_blocks += 1;
+                }
+            }
+            QualKind::None => {}
         }
-        output_file.flush()?;
 
-        log_compression_stats(original_size, headers_len, sequences_len, qualities_len, rc_flags_len, metadata_size, start_time.elapsed());
+        // rc_flags: one byte per record (from frame_record's rc buffer).
+        if let Some(rc) = self.rc.as_mut()
+            && let Some(b) = rc.stage_record_bytes(self.chunk_index, &self.frc)
+        {
+            Self::dispatch_job(job_tx, CompressJob::Bsc(b))?;
+            self.rc_blocks += 1;
+        }
 
+        // Accumulators (mirror read_chunk_records).
+        // Two different quality lengths, deliberately:
+        //  - decoded_qual_len drives decoded_output_bytes (the ChunkDecodedSizes global,
+        //    an ARCHIVE byte) and is 0 under no_quality because the reconstructed FASTQ
+        //    carries no quality — this MUST stay guarded for byte-identity vs legacy.
+        //  - actual_qual_len drives chunk_original_size (the raw-input-size stat, log-only)
+        //    and counts the quality bytes present in the INPUT even under no_quality,
+        //    matching legacy read_chunk_records (mod.rs).
+        let actual_qual_len = rec.quality.as_ref().map_or(0, |q| q.len());
+        let decoded_qual_len = if p.no_quality { 0 } else { actual_qual_len };
+        let add = crate::compression::decompress_impl::fastq_output_len(
+            p.fasta,
+            rec.id.len(),
+            rec.sequence.len(),
+            decoded_qual_len,
+        );
+        self.decoded_output_bytes = self
+            .decoded_output_bytes
+            .checked_add(add)
+            .ok_or_else(|| anyhow::anyhow!("decoded size overflow in chunk {}", self.chunk_index))?;
+        self.chunk_records += 1;
+        self.records_seen += 1;
+        self.chunk_total_bases += rec.sequence.len() as u64;
+        self.chunk_original_size += (rec.id.len() + rec.sequence.len() + actual_qual_len + 3) as u64;
         Ok(())
     }
+
+    fn maybe_close_chunk(
+        &mut self,
+        chunk_size: usize,
+        job_tx: &SyncSender<CompressJob>,
+        manifest_tx: &SyncSender<WorkerMsg>,
+    ) -> Result<()> {
+        if self.chunk_records as usize >= chunk_size {
+            self.close_chunk(job_tx, manifest_tx)?;
+        }
+        Ok(())
+    }
+
+    /// Flush all stagers for the current chunk, emit the manifest, and reset for the
+    /// next chunk. A chunk with zero staged records emits NO manifest and NO blocks
+    /// (matches legacy's empty-trailing-chunk behaviour).
+    fn close_chunk(
+        &mut self,
+        job_tx: &SyncSender<CompressJob>,
+        manifest_tx: &SyncSender<WorkerMsg>,
+    ) -> Result<()> {
+        if self.chunk_records == 0 {
+            return Ok(());
+        }
+
+        // Build the segment list in physical write order: Headers → Sequence → Qual → RcFlags.
+        // The DISPATCH order of jobs is irrelevant (the writer reorders by segment order);
+        // only `segments` order drives the writer. The single-end goldens are the gate.
+        use crate::compression::codec_ids::{
+            CODEC_COLUMNAR, header_compressor_to_codec_id, quality_compressor_to_codec_id,
+            sequence_compressor_to_codec_id,
+        };
+        use crate::compression::stream_compress::{SegSource, SegmentSpec};
+        let seq_codec = sequence_compressor_to_codec_id(SequenceCompressor::Bsc);
+        let qual_codec = quality_compressor_to_codec_id(self.plan.quality_compressor_used);
+        let mut segments: Vec<SegmentSpec> = Vec::with_capacity(4);
+
+        // Headers flush / columnar dispatch.
+        if let Some(col) = self.hdr_col.as_mut() {
+            if let Some(job) = col.take_chunk_job(self.chunk_index) {
+                Self::dispatch_job(job_tx, CompressJob::Columnar(job))?;
+            }
+            segments.push(SegmentSpec {
+                mate: 0,
+                role: StreamRole::Headers,
+                codec: CODEC_COLUMNAR,
+                source: SegSource::HeaderSegment,
+            });
+        } else {
+            let hs = self.hdr_bsc.as_mut().expect("bsc header stager present");
+            if let Some(b) = hs.flush(self.chunk_index) {
+                Self::dispatch_job(job_tx, CompressJob::Bsc(b))?;
+                self.header_blocks += 1;
+            }
+            let hdr_codec = header_compressor_to_codec_id(self.plan.header_compressor);
+            segments.push(SegmentSpec {
+                mate: 0,
+                role: StreamRole::Headers,
+                codec: hdr_codec,
+                source: SegSource::Blocks(self.header_blocks),
+            });
+        }
+
+        // Sequence flush.
+        if let Some(b) = self.seq.flush(self.chunk_index) {
+            Self::dispatch_job(job_tx, CompressJob::Bsc(b))?;
+            self.sequence_blocks += 1;
+        }
+        segments.push(SegmentSpec {
+            mate: 0,
+            role: StreamRole::Sequence,
+            codec: seq_codec,
+            source: SegSource::Blocks(self.sequence_blocks),
+        });
+
+        // Quality flush.
+        let qual_kind = match self.qual {
+            QualStager::Fqz { .. } => QualKind::Fqz,
+            QualStager::Bsc(_) => QualKind::Bsc,
+            QualStager::None => QualKind::None,
+        };
+        match qual_kind {
+            QualKind::Fqz => {
+                if let Some(b) = self.qual.flush_fqz(self.chunk_index) {
+                    Self::dispatch_job(job_tx, CompressJob::Fqz(b))?;
+                    self.qual_blocks += 1;
+                }
+            }
+            QualKind::Bsc => {
+                let chunk_index = self.chunk_index;
+                let block = self.qual.bsc_stager().and_then(|s| s.flush(chunk_index));
+                if let Some(b) = block {
+                    Self::dispatch_job(job_tx, CompressJob::Bsc(b))?;
+                    self.qual_blocks += 1;
+                }
+            }
+            QualKind::None => {}
+        }
+        segments.push(SegmentSpec {
+            mate: 0,
+            role: StreamRole::Qual,
+            codec: qual_codec,
+            source: SegSource::Blocks(self.qual_blocks),
+        });
+
+        // rc flush.
+        if let Some(rc) = self.rc.as_mut()
+            && let Some(b) = rc.flush(self.chunk_index)
+        {
+            Self::dispatch_job(job_tx, CompressJob::Bsc(b))?;
+            self.rc_blocks += 1;
+        }
+        if self.plan.rc_canon {
+            segments.push(SegmentSpec {
+                mate: 0,
+                role: StreamRole::RcFlags,
+                codec: seq_codec,
+                source: SegSource::Blocks(self.rc_blocks),
+            });
+        }
+
+        let manifest = ChunkManifest {
+            chunk_index: self.chunk_index,
+            segments,
+            // Single-end: mate 0 only; mate 1 is unused (0).
+            decoded_output_bytes: [self.decoded_output_bytes, 0],
+            records: self.chunk_records,
+            total_bases: self.chunk_total_bases,
+            original_size: self.chunk_original_size,
+        };
+        manifest_tx
+            .send(WorkerMsg::Manifest(manifest))
+            .map_err(|_| anyhow::anyhow!("writer exited"))?;
+
+        // Reset stagers + per-chunk accumulators/counters.
+        self.seq.reset_for_next_chunk();
+        if let Some(hs) = self.hdr_bsc.as_mut() {
+            hs.reset_for_next_chunk();
+        }
+        self.qual.reset_for_next_chunk();
+        if let Some(rc) = self.rc.as_mut() {
+            rc.reset_for_next_chunk();
+        }
+        self.sequence_blocks = 0;
+        self.header_blocks = 0;
+        self.qual_blocks = 0;
+        self.rc_blocks = 0;
+        self.decoded_output_bytes = 0;
+        self.chunk_records = 0;
+        self.chunk_total_bases = 0;
+        self.chunk_original_size = 0;
+        self.chunk_index += 1;
+        Ok(())
+    }
+
+    fn close_final_chunk(
+        &mut self,
+        job_tx: &SyncSender<CompressJob>,
+        manifest_tx: &SyncSender<WorkerMsg>,
+    ) -> Result<()> {
+        self.close_chunk(job_tx, manifest_tx)
+    }
 }
 
-/// Global reorder: two-pass bucket sort with bounded memory per bucket.
+/// Generic bounded worker pool. Spawns `n_workers` rayon-style threads into `scope`, each
+/// pulling jobs of type `J` under `job_rx`'s mutex, running `work`, and forwarding the
+/// resulting `R`s on `res_tx`. A semantic `Err` or a caught panic sets `abort` (first-error
+/// -wins) and routes a single `R` built via `on_error`. The work/error closures are SHARED
+/// across every scoped thread via an `Arc` (refcount clone), so they outlive this frame
+/// (which returns before the caller's `scope` joins the threads) — they're `Send + Sync`.
 ///
-/// Pass 1: Stream through FASTQ, compute sort key for each record, write to one of 256
-/// bucket temp files based on top bits of the sort key.
-/// Pass 2: For each bucket in order, read all records, sort by full key, build streams,
-/// compress to BSC blocks, and write to output temp files.
+/// Worker loop (identical to the old `spawn_compress_workers`): check `abort`; lock + `recv`
+/// (break on disconnect); `catch_unwind(work(job))`:
+///   - `Ok(Ok(results))` → send each `r`; if a send fails (consumer gone) return.
+///   - `Ok(Err(e))`      → set `abort`, send `on_error(e.to_string())`, return.
+///   - `Err(panic)`      → set `abort`, send `on_error("compress worker panicked: <msg>")`, return.
 ///
-/// Memory is bounded by the largest bucket (~input_size/256 + BSC working memory).
-pub(super) fn compress_global_reorder_bsc(args: &CompressConfig) -> Result<()> {
-    use std::io::{Write, Read as IoRead, BufWriter, BufReader};
-    const NUM_BUCKETS: usize = 256;
+/// `on_error` receives the RAW message on the semantic-`Err` path; on the PANIC path the pool
+/// itself prepends the fixed `"compress worker panicked: "` prefix (shared by every consumer, so
+/// the historic single/paired panic text is byte-for-byte preserved) before calling `on_error`.
+/// `on_error` just wraps whatever string it receives into the mode's error result.
+/// The standard scoped-thread lifetime shape: `scope` is `&'scope Scope<'scope, 'env>`,
+/// `abort` is borrowed `'env` (caller-owned), and the `Arc`-wrapped closures are `'env`.
+pub(crate) fn spawn_worker_pool<'scope, 'env: 'scope, J: Send + 'env, R: Send + 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    n_workers: usize,
+    job_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<J>>>,
+    res_tx: &std::sync::mpsc::SyncSender<R>,
+    abort: &'env std::sync::atomic::AtomicBool,
+    work: impl Fn(J) -> anyhow::Result<Vec<R>> + Send + Sync + 'env,
+    on_error: impl Fn(String) -> R + Send + Sync + 'env,
+) {
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    // `work`/`on_error` are SHARED by every scoped thread via an `Arc` (each thread owns a
+    // refcount, so the closures live as long as the threads — they cannot be borrowed from
+    // this frame, which returns before the caller's `scope` joins the threads). `job_rx`/
+    // `res_tx` are CLONED per worker (Arc / SyncSender) — NOT borrowed for `'env` — so the
+    // caller can `drop` its own clones right after spawning (the producer-unblock-on-
+    // -disconnect shutdown contract). `abort` is borrowed `'env` (caller-owned, not dropped).
+    let work = Arc::new(work);
+    let on_error = Arc::new(on_error);
+    for _ in 0..n_workers {
+        let job_rx = job_rx.clone();
+        let res_tx = res_tx.clone();
+        let work = work.clone();
+        let on_error = on_error.clone();
+        scope.spawn(move || {
+            loop {
+                if abort.load(Ordering::Relaxed) {
+                    break;
+                }
+                let job = {
+                    let g = job_rx.lock().unwrap();
+                    g.recv()
+                };
+                let Ok(job) = job else { break }; // job_tx dropped → done
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(job)));
+                match outcome {
+                    Ok(Ok(results)) => {
+                        for r in results {
+                            if res_tx.send(r).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        abort.store(true, Ordering::Relaxed);
+                        let _ = res_tx.send(on_error(e.to_string()));
+                        return;
+                    }
+                    Err(p) => {
+                        // Same panic-message downcast as the old inline loop, so worker-panic
+                        // text is unchanged: `compress worker panicked: <payload>`.
+                        let msg = p
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| p.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<opaque panic>".to_string());
+                        abort.store(true, Ordering::Relaxed);
+                        let _ = res_tx.send(on_error(format!("compress worker panicked: {msg}")));
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Map a `compress_job` `JobOutput` into the writer-channel `WorkerMsg`s, in the SAME order
+/// the old inline worker loop emitted them: `Blocks` → one `WorkerMsg::Block` per element,
+/// `Segments` → one `WorkerMsg::Segment` per element.
+fn job_output_to_worker_msgs(out: JobOutput) -> Vec<WorkerMsg> {
+    match out {
+        JobOutput::Blocks(results) => results.into_iter().map(WorkerMsg::Block).collect(),
+        JobOutput::Segments(segs) => segs.into_iter().map(WorkerMsg::Segment).collect(),
+    }
+}
+
+/// Spawn `n_workers` rayon-style threads into `scope`, each pulling `CompressJob`s under
+/// `job_rx`'s mutex, compressing via `compress_job`, and forwarding `WorkerMsg`s. A worker
+/// panic or semantic error is caught and routed as a first-error-wins `WorkerMsg::Err`.
+/// Shared by single & paired orchestrators. A thin wrapper over the generic
+/// `spawn_worker_pool`: `compress_job(_, plan)` is the work; its `JobOutput` is fanned out
+/// via `job_output_to_worker_msgs`; `WorkerMsg::Err` builds the error message.
+pub(crate) fn spawn_compress_workers<'scope, 'env: 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    n_workers: usize,
+    job_rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<CompressJob>>>,
+    res_tx: &std::sync::mpsc::SyncSender<WorkerMsg>,
+    plan: &'env ArchivePlan,
+    abort: &'env std::sync::atomic::AtomicBool,
+) {
+    spawn_worker_pool(
+        scope,
+        n_workers,
+        job_rx,
+        res_tx,
+        abort,
+        move |job| Ok(job_output_to_worker_msgs(compress_job(job, plan)?)),
+        WorkerMsg::Err,
+    );
+}
+
+fn compress_chunked_streaming(args: &CompressConfig, mode: ChunkedMode) -> Result<()> {
+    // Clamp to >= 1 so a library caller passing `chunk_records == 0` reads one record per
+    // chunk instead of producing an empty first chunk and a misleading "Empty input file"
+    // error (the paired producer already clamps; this matches it). The CLI sets a sane default.
+    let chunk_size: usize = match mode {
+        ChunkedMode::Ultra { chunk_records, .. } => chunk_records,
+        ChunkedMode::Default => args.advanced.chunk_records,
+    }
+    .max(1);
+    let mut reader = crate::io::FastqReader::from_path_or_stdin(&args.input[0], args.fasta)?;
+    let (first_chunk, _b, _o) = read_chunk_records(&mut reader, chunk_size)?;
+    if first_chunk.is_empty() {
+        anyhow::bail!("Empty input file");
+    }
+    let plan = resolve_archive_plan(args, mode, &first_chunk)?;
+    run_streaming_compress(args, mode, plan, first_chunk, reader, false)
+}
+
+/// Shared streaming-compress body used by BOTH the whole-file path
+/// (`compress_chunked_streaming`) and the NUMA byte-range path
+/// (`compress_byte_range`). Takes an already-resolved `plan` and the already-read
+/// `first_chunk` + the live `reader` (positioned just after it).
+///
+/// `validate_first_chunk` is the spec §5.1.3 switch: the whole-file path passes
+/// `false` (its first chunk DEFINED the const lengths), the NUMA path passes `true`
+/// (its first chunk came from the parent's head — a different record set — so its
+/// lengths must be checked against the pinned const lengths or const-length framing
+/// would silently mis-slice on decode).
+pub(super) fn run_streaming_compress<R: std::io::BufRead>(
+    args: &CompressConfig,
+    mode: ChunkedMode,
+    plan: ArchivePlan,
+    first_chunk: Vec<crate::io::FastqRecord>,
+    mut reader: crate::io::FastqReader<R>,
+    validate_first_chunk: bool,
+) -> Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::sync_channel;
+    use std::sync::{Arc, Mutex};
 
     let start_time = Instant::now();
-    let input_path = &args.input[0];
-    let bsc_static = args.advanced.bsc_static;
-    let bsc_block_mb = args.advanced.bsc_block_size_mb;
-    let no_quality = args.no_quality;
-    let quality_mode = args.quality_mode;
-    let quality_binning = if no_quality {
-        QualityBinning::None
-    } else {
-        quality_mode_to_binning(quality_mode)
+    let chunk_size: usize = match mode {
+        ChunkedMode::Ultra { chunk_records, .. } => chunk_records,
+        ChunkedMode::Default => args.advanced.chunk_records,
     };
+    let bsc_block_mb = match mode {
+        ChunkedMode::Ultra { bsc_block_mb, .. } => bsc_block_mb,
+        ChunkedMode::Default => args.advanced.bsc_block_size_mb,
+    };
+    super::bsc::check_cuda_vram(bsc_block_mb * 1024 * 1024);
+    info!("Chunked compression (streaming): {} records per chunk", chunk_size);
 
-    info!("Global reorder mode: two-pass bucket sort with {} buckets", NUM_BUCKETS);
+    if plan.const_seq_len > 0 {
+        info!("Constant sequence length detected: {} bp", plan.const_seq_len);
+    }
+    if plan.const_qual_len > 0 {
+        info!("Constant quality length detected: {} bp", plan.const_qual_len);
+    }
 
-    let working_dir = &args.working_dir;
-    let pid = std::process::id();
-
-    // --- Temp file setup ---
-    // Bucket files for pass 1
-    let bucket_paths: Vec<std::path::PathBuf> = (0..NUM_BUCKETS)
-        .map(|i| working_dir.join(format!(".qz_bucket_{pid}_{i:03}.tmp")))
-        .collect();
-    // Output stream temp files (same as chunked mode)
-    let h_tmp_path = working_dir.join(format!(".qz_reorder_h_{pid}.tmp"));
-    let s_tmp_path = working_dir.join(format!(".qz_reorder_s_{pid}.tmp"));
-    let q_tmp_path = working_dir.join(format!(".qz_reorder_q_{pid}.tmp"));
-
-    // Cleanup guard for ALL temp files
-    struct TmpCleanup(Vec<std::path::PathBuf>);
+    // Atomic output: stream to a sibling O_EXCL `.tmp` and rename on success, so an
+    // aborted compress (producer/worker error, panic) never leaves a usable partial
+    // archive at the final path — the drop guard removes the temp on any early return.
+    // Stdout bypasses this. Mirrors the decode side (decompress_impl).
+    let is_stdout = crate::cli::is_stdio_path(&args.output);
+    struct TmpCleanup(std::path::PathBuf);
     impl Drop for TmpCleanup {
         fn drop(&mut self) {
-            for p in &self.0 {
-                let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let tmp_output = if is_stdout {
+        None
+    } else {
+        let mut name = args
+            .output
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("output path has no file name: {:?}", args.output))?
+            .to_os_string();
+        name.push(super::atomic_tmp_suffix());
+        Some(args.output.with_file_name(name))
+    };
+    let tmp_guard = tmp_output.as_ref().map(|p| TmpCleanup(p.clone()));
+    let write_path = tmp_output.as_deref().unwrap_or(args.output.as_path());
+
+    // Front header (byte-identical to legacy). `Send` writer handle so it can move into
+    // the writer thread (use the Send `Stdout`, NOT the !Send `stdout().lock()` guard).
+    let mut output_file: Box<dyn Write + Send> = if is_stdout {
+        Box::new(std::io::BufWriter::with_capacity(4 << 20, std::io::stdout()))
+    } else {
+        Box::new(std::io::BufWriter::new(super::create_new_for_write(write_path)?))
+    };
+    // const_seq_len/const_qual_len are usize — write_v5_archive_header takes usize (NO `as u32`).
+    let header_size = super::write_v5_archive_header(
+        &mut output_file,
+        plan.encoding_type,
+        plan.stream_quality_binning,
+        plan.quality_compressor_used,
+        plan.header_compressor,
+        plan.fasta,
+        plan.const_seq_len,
+        plan.const_qual_len,
+        0, // archive_type: single-end
+    )?;
+
+    // Codecs now travel in the manifest segments (derived in `ProducerState::close_chunk`),
+    // so the orchestrator no longer needs per-codec locals for the writer.
+    let target = plan.bsc_block_mb * 1024 * 1024;
+
+    // ── Worker pool follows the thread setting (`-t`) — the user's parallelism / RAM
+    // dial — capped by a memory safety budget so a huge `-t` can't OOM. Peak RSS scales
+    // with the pool's working set (≈ workers × block × ~7 libsais workspace) and is
+    // constant in read count. Ultra runs ONE block at a time (big-block internal MT-BWT;
+    // concurrent forward-BWT blows up libsais memory). fqz quality blocks are larger than
+    // a BSC block but FEW (one per sub-chunk, ~1:5 with BSC blocks), so their raw hold is
+    // bounded by `queue_depth` and does not dominate RSS. `QZ_COMPRESS_WORKERS` overrides
+    // the count entirely (tuning/benchmarking). ──
+    let is_ultra = matches!(mode, ChunkedMode::Ultra { .. });
+    let n_workers = std::env::var("QZ_COMPRESS_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| {
+            compress_worker_count(rayon::current_num_threads().max(1), target, is_ultra)
+        });
+    // Ultra MUST run one block at a time even when QZ_COMPRESS_WORKERS is set: ultra's
+    // big blocks parallelise internally via libbsc's MT-BWT, and running concurrent
+    // forward-BWTs blows up libsais memory (see finding_ultra_mt_bwt_big_blocks). The env
+    // override is a tuning dial for the default 25 MB-block path only.
+    let n_workers = if is_ultra { 1 } else { n_workers };
+    // queue_depth == n_workers (≤ queue_depth queued + n_workers in-flight raw blocks).
+    let queue_depth = n_workers;
+    let (job_tx, job_rx) = sync_channel::<CompressJob>(queue_depth);
+    let (res_tx, res_rx) = sync_channel::<WorkerMsg>(queue_depth.max(1) * 2);
+    let job_rx = Arc::new(Mutex::new(job_rx));
+    let abort = Arc::new(AtomicBool::new(false));
+
+    std::thread::scope(|scope| -> Result<()> {
+        // ── Workers: pull → compress → emit. On error: set abort + send Err + exit. ──
+        // `&*abort` derefs the `Arc<AtomicBool>` to the `&AtomicBool` the pool borrows for
+        // `'env`; the Arc itself is still owned here for the producer's own `abort` checks.
+        spawn_compress_workers(scope, n_workers, &job_rx, &res_tx, &plan, &abort);
+
+        // CORRECTION 1: drop the main thread's `job_rx` clone NOW so the ONLY receivers
+        // live inside the workers. Otherwise, on a worker error the surviving workers see
+        // `abort` and exit WITHOUT draining the queue; the producer, blocked on a full
+        // `job_tx.send()`, would never reach its next abort check, and because the main
+        // thread still held a `job_rx` the channel would never disconnect → permanent
+        // hang. With this drop, once all workers exit the last receiver drops, the channel
+        // disconnects, and the producer's blocked send returns Err (→ "compress workers
+        // exited", a harmless secondary error — the writer keeps the FIRST error).
+        drop(job_rx);
+
+        // Producer's OWN results-channel sender for manifests. Dropping the original
+        // `res_tx` here means `res_rx` closes only once every worker AND the producer have
+        // dropped their clone — no premature close, no hang.
+        let manifest_tx = res_tx.clone();
+        drop(res_tx);
+
+        // ── Writer thread: sole error aggregator. Returns Err if it saw any
+        // WorkerMsg::Err (producer or worker root cause), else finalizes Ok(WriterDone).
+        // Codecs now travel in the manifest segments, so the writer needs none of the
+        // per-codec locals — only the mode + header size. ──
+        let writer = scope.spawn(move || -> Result<WriterDone> {
+            write_ordered(output_file, CompressMode::Single, header_size, res_rx)
+        });
+
+        // ── Producer body (this thread). On its OWN error: funnel to the writer as a
+        // WorkerMsg::Err (the writer is the single decision point), set abort, stop.
+        // Check `abort` each iteration so a worker error halts production promptly. ──
+        let prod_res: Result<()> = (|| {
+            let mut state = ProducerState::new(&plan, target);
+            // Whole-file path (`validate_first_chunk == false`): the first_chunk records
+            // DEFINED the const lengths → NOT re-validated. NUMA byte-range path
+            // (`validate_first_chunk == true`): the first chunk came from THIS shard's
+            // head but the const lengths were pinned by the PARENT (a different record
+            // set), so every record must be checked or const-length framing would
+            // silently mis-slice on decode (spec §5.1.3).
+            for rec in &first_chunk {
+                if abort.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                if validate_first_chunk {
+                    validate_const_one(
+                        rec,
+                        plan.const_seq_len,
+                        plan.const_qual_len,
+                        plan.no_quality,
+                        state.chunk_index,
+                    )?;
+                }
+                state.stage_one(rec, &job_tx)?;
+                state.maybe_close_chunk(chunk_size, &job_tx, &manifest_tx)?;
             }
-        }
-    }
-    let mut cleanup_paths: Vec<std::path::PathBuf> = bucket_paths.clone();
-    cleanup_paths.push(h_tmp_path.clone());
-    cleanup_paths.push(s_tmp_path.clone());
-    cleanup_paths.push(q_tmp_path.clone());
-    let _cleanup = TmpCleanup(cleanup_paths);
-
-    // --- Pass 1: bucket records by sort key ---
-    info!("Pass 1: bucketing records by sort key...");
-    let pass1_start = Instant::now();
-
-    let mut bucket_writers: Vec<BufWriter<std::fs::File>> = bucket_paths.iter()
-        .map(|p| Ok(BufWriter::new(std::fs::File::create(p)?)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut bucket_counts = vec![0usize; NUM_BUCKETS];
-    let mut num_reads: usize = 0;
-    let mut total_bases: usize = 0;
-    let mut original_size: usize = 0;
-
-    {
-        let mut reader = crate::io::FastqReader::from_path_or_stdin(input_path, args.fasta)?;
-        while let Some(record) = reader.next()? {
-            let qual_bytes = record.quality.as_ref().map(|q| q.as_slice()).unwrap_or(&[]);
-            let key = dna_utils::reorder_sort_key(&record.sequence, qual_bytes);
-            let bucket = (key >> 56) as usize % NUM_BUCKETS;
-
-            // Write record to bucket file: [key:16][id_len:u32][id][seq_len:u32][seq][qual_len:u32][qual]
-            let w = &mut bucket_writers[bucket];
-            w.write_all(&key.to_le_bytes())?;
-
-            w.write_all(&(record.id.len() as u32).to_le_bytes())?;
-            w.write_all(&record.id)?;
-
-            w.write_all(&(record.sequence.len() as u32).to_le_bytes())?;
-            w.write_all(&record.sequence)?;
-
-            let qual_len = record.quality.as_ref().map(|q| q.len()).unwrap_or(0);
-            w.write_all(&(qual_len as u32).to_le_bytes())?;
-            if let Some(ref q) = record.quality {
-                w.write_all(q)?;
+            drop(first_chunk);
+            while let Some(rec) = reader.next()? {
+                if abort.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                validate_const_one(
+                    &rec,
+                    plan.const_seq_len,
+                    plan.const_qual_len,
+                    plan.no_quality,
+                    state.chunk_index,
+                )?;
+                state.stage_one(&rec, &job_tx)?;
+                state.maybe_close_chunk(chunk_size, &job_tx, &manifest_tx)?;
             }
-
-            total_bases += record.sequence.len();
-            original_size += record.id.len() + record.sequence.len() + qual_len + 3;
-            bucket_counts[bucket] += 1;
-            num_reads += 1;
-        }
-    }
-
-    // Flush and close bucket writers
-    for w in &mut bucket_writers {
-        w.flush()?;
-    }
-    drop(bucket_writers);
-
-    let non_empty_buckets = bucket_counts.iter().filter(|&&c| c > 0).count();
-    let max_bucket = bucket_counts.iter().max().copied().unwrap_or(0);
-    info!("Pass 1 done in {:.2}s: {} reads into {} non-empty buckets (max bucket: {} reads)",
-        pass1_start.elapsed().as_secs_f64(), num_reads, non_empty_buckets, max_bucket);
-
-    // --- Pass 2: sort each bucket, compress ---
-    info!("Pass 2: sorting buckets and compressing...");
-    let pass2_start = Instant::now();
-
-    let mut h_tmp = BufWriter::new(std::fs::File::create(&h_tmp_path)?);
-    let mut s_tmp = BufWriter::new(std::fs::File::create(&s_tmp_path)?);
-    let mut q_tmp = BufWriter::new(std::fs::File::create(&q_tmp_path)?);
-
-    let mut h_num_blocks: u32 = 0;
-    let mut s_num_blocks: u32 = 0;
-    let mut q_num_blocks: u32 = 0;
-
-    for bucket_idx in 0..NUM_BUCKETS {
-        let count = bucket_counts[bucket_idx];
-        if count == 0 {
-            continue;
-        }
-
-        // Read all records from this bucket file
-        let mut keyed_records: Vec<(u128, crate::io::FastqRecord)> = Vec::with_capacity(count);
-        {
-            let file = std::fs::File::open(&bucket_paths[bucket_idx])?;
-            let mut br = BufReader::new(file);
-
-            for _ in 0..count {
-                let mut key_buf = [0u8; 16];
-                br.read_exact(&mut key_buf)?;
-                let key = u128::from_le_bytes(key_buf);
-
-                let mut len_buf = [0u8; 4];
-
-                br.read_exact(&mut len_buf)?;
-                let id_len = u32::from_le_bytes(len_buf) as usize;
-                let mut id_bytes = vec![0u8; id_len];
-                br.read_exact(&mut id_bytes)?;
-
-                br.read_exact(&mut len_buf)?;
-                let seq_len = u32::from_le_bytes(len_buf) as usize;
-                let mut seq_bytes = vec![0u8; seq_len];
-                br.read_exact(&mut seq_bytes)?;
-
-                br.read_exact(&mut len_buf)?;
-                let qual_len = u32::from_le_bytes(len_buf) as usize;
-                let quality = if qual_len > 0 {
-                    let mut qual_bytes = vec![0u8; qual_len];
-                    br.read_exact(&mut qual_bytes)?;
-                    Some(qual_bytes)
-                } else {
-                    None
-                };
-
-                keyed_records.push((key, crate::io::FastqRecord {
-                    id: id_bytes,
-                    sequence: seq_bytes,
-                    quality,
-                }));
+            if !abort.load(Ordering::Relaxed) {
+                state.close_final_chunk(&job_tx, &manifest_tx)?;
             }
+            Ok(())
+        })();
+        if let Err(e) = &prod_res {
+            abort.store(true, Ordering::Relaxed);
+            let _ = manifest_tx.send(WorkerMsg::Err(e.to_string())); // writer records the first error
         }
+        drop(job_tx); // workers drain remaining jobs and exit
+        drop(manifest_tx); // last non-worker sender gone → res_rx closes after workers finish
 
-        // Sort by full key within bucket
-        keyed_records.sort_unstable_by_key(|(k, _)| *k);
+        // The writer's Result is authoritative (it carries producer/worker root causes
+        // via WorkerMsg::Err). Don't `prod_res?` — that would mask the real error with a
+        // secondary "workers exited" send error.
+        let done = writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("writer thread panicked"))??;
+        log_compression_stats(
+            done.original_size,
+            done.headers_len,
+            done.sequences_len,
+            done.qualities_len,
+            done.rc_flags_len,
+            done.metadata_size,
+            start_time.elapsed(),
+        );
+        Ok(())
+    })?; // any producer/worker/writer error: tmp_guard drops here → temp removed
 
-        // Build streams and compress (sequential: h -> s -> q)
-        let records: Vec<crate::io::FastqRecord> = keyed_records.into_iter().map(|(_, r)| r).collect();
-        let (h_data, s_data, q_data, _rc_unused) = records_to_streams(&records, quality_mode, quality_binning, no_quality, args.advanced.sequence_hints, args.advanced.sequence_delta, false, 0, 0)?;
-        drop(records);
-
-        let h_blocks = compress_stream_to_bsc_blocks(&h_data, bsc_static, bsc_block_mb)?;
-        drop(h_data);
-        h_num_blocks += write_blocks_to_tmp(h_blocks, &mut h_tmp)?;
-
-        let s_blocks = compress_stream_to_bsc_blocks(&s_data, bsc_static, bsc_block_mb)?;
-        drop(s_data);
-        s_num_blocks += write_blocks_to_tmp(s_blocks, &mut s_tmp)?;
-
-        if !no_quality && !q_data.is_empty() {
-            let q_blocks = compress_stream_to_bsc_blocks(&q_data, bsc_static, bsc_block_mb)?;
-            q_num_blocks += write_blocks_to_tmp(q_blocks, &mut q_tmp)?;
+    // Success: disarm the cleanup guard and atomically publish the temp file.
+    if let (Some(tmp), Some(guard)) = (tmp_output.as_ref(), tmp_guard) {
+        std::mem::forget(guard);
+        if let Err(e) = std::fs::rename(tmp, &args.output) {
+            let _ = std::fs::remove_file(tmp);
+            anyhow::bail!("Failed to rename temp file to {:?}: {}", args.output, e);
         }
-
-        // Delete bucket file immediately to free disk space
-        let _ = std::fs::remove_file(&bucket_paths[bucket_idx]);
     }
-
-    info!("Pass 2 done in {:.2}s", pass2_start.elapsed().as_secs_f64());
-
-    // Flush and close output temp files
-    h_tmp.flush()?;
-    s_tmp.flush()?;
-    q_tmp.flush()?;
-    drop(h_tmp);
-    drop(s_tmp);
-    drop(q_tmp);
-
-    let h_tmp_size = std::fs::metadata(&h_tmp_path)?.len() as usize;
-    let s_tmp_size = std::fs::metadata(&s_tmp_path)?.len() as usize;
-    let q_tmp_size = std::fs::metadata(&q_tmp_path)?.len() as usize;
-
-    let headers_len = if h_num_blocks > 0 { 4 + h_tmp_size } else { 0 };
-    let sequences_len = if s_num_blocks > 0 { 4 + s_tmp_size } else { 0 };
-    let qualities_len = if q_num_blocks > 0 { 4 + q_tmp_size } else { 0 };
-
-    info!("Read {} records in {} non-empty buckets ({} bases)", num_reads, non_empty_buckets, total_bases);
-
-    // Write final output (identical archive format)
-    let encoding_type: u8 = if args.advanced.sequence_delta { 5 } else if args.advanced.sequence_hints { 4 } else { 0 };
-    write_chunked_archive(
-        &args.output, quality_binning, QualityCompressor::Bsc,
-        HeaderCompressor::Bsc, no_quality, encoding_type,
-        num_reads, headers_len, sequences_len, qualities_len,
-        h_num_blocks, s_num_blocks, q_num_blocks,
-        &h_tmp_path, &s_tmp_path, &q_tmp_path,
-        original_size, start_time, None,
-        0, 0, // const_seq_len, const_qual_len: bucket reorder path uses records_to_streams with varints
-    )
+    Ok(())
 }
-pub(super) fn compress(args: &CompressConfig) -> Result<()> {
-    let start_time = Instant::now();
 
-    // Cap bsc_block_size_mb at 64. The streaming decompressor refuses any
+/// The writer thread: the SOLE error aggregator. Drains `res_rx`, orders blocks by
+/// chunk via `OrderedBlockBuffer`, and writes the per-chunk segments per the active
+/// `CompressMode` (§6): Single = per-block entries (Headers → Sequence → Qual → RcFlags)
+/// plus the ChunkDecodedSizes global; Paired = per-(mate,role) `write_block_stream` blobs,
+/// no ChunkDecodedSizes, `validate_paired_directory` before the footer. First
+/// WorkerMsg::Err wins.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_ordered(
+    mut output_file: Box<dyn std::io::Write + Send>,
+    mode: CompressMode,
+    header_size: usize,
+    res_rx: std::sync::mpsc::Receiver<WorkerMsg>,
+) -> Result<WriterDone> {
+    use crate::compression::chunk_directory::{
+        ChunkDirEntry, ChunkDirectory, GLOBAL_SENTINEL, StreamRole, encode_decoded_sizes,
+        write_footer_and_locator,
+    };
+    use std::io::Write;
+
+    let mut cursor: u64 = header_size as u64;
+    let mut dir: Vec<ChunkDirEntry> = Vec::new();
+    let mut decoded_sizes: Vec<u64> = Vec::new();
+    let mut buf = OrderedBlockBuffer::new();
+    let mut num_chunks: u32 = 0;
+    let mut num_reads: u64 = 0;
+    let mut original_size: u64 = 0;
+    let mut total_bases: u64 = 0; // log-only; does NOT affect archive bytes
+
+    for msg in res_rx {
+        match msg {
+            WorkerMsg::Manifest(m) => {
+                num_chunks = num_chunks.max(m.chunk_index + 1);
+                num_reads += m.records;
+                original_size += m.original_size;
+                total_bases += m.total_bases;
+                buf.set_manifest(m);
+            }
+            WorkerMsg::Block(r) => {
+                buf.add_block(r)?;
+            }
+            WorkerMsg::Segment(s) => {
+                buf.add_header_segment(s.chunk_index, s.mate, s.role, s.codec, s.blocks)?;
+            }
+            WorkerMsg::Err(e) => {
+                // First-error-wins. Dropping `res_rx` (by returning) makes any blocked
+                // worker/producer send error out so they exit; the scope still joins them.
+                return Err(anyhow::anyhow!(e));
+            }
+        }
+        for cc in buf.drain_ready() {
+            match mode {
+                CompressMode::Single => {
+                    for seg in &cc.segments {
+                        write_role_blocks(
+                            &seg.blocks,
+                            seg.role,
+                            seg.mate,
+                            seg.codec,
+                            cc.chunk_index,
+                            &mut output_file,
+                            &mut cursor,
+                            &mut dir,
+                        )?;
+                    }
+                    decoded_sizes.push(cc.decoded_output_bytes[0]);
+                }
+                CompressMode::Paired => {
+                    for seg in &cc.segments {
+                        write_segment_blob(
+                            &seg.blocks,
+                            seg.role,
+                            seg.mate,
+                            seg.codec,
+                            cc.records,
+                            cc.chunk_index,
+                            &mut output_file,
+                            &mut cursor,
+                            &mut dir,
+                        )?;
+                    }
+                    // Per-mate decoded sizes, row-major (sizes[chunk*2 + mate]), for the
+                    // ChunkDecodedSizes(n_mates=2) global that feeds paired direct-write.
+                    decoded_sizes.push(cc.decoded_output_bytes[0]);
+                    decoded_sizes.push(cc.decoded_output_bytes[1]);
+                }
+            }
+        }
+    }
+
+    // Clean close (all senders dropped, no Err seen). Assert the buffer fully drained,
+    // converting a count-mismatch hang/truncation into a clean error.
+    if !buf.all_emitted(num_chunks) {
+        anyhow::bail!(
+            "streaming writer: ordered buffer did not fully drain ({} chunks expected) — \
+             a block was lost or mis-routed",
+            num_chunks
+        );
+    }
+    info!(
+        "Read {} records in {} chunks ({} bases)",
+        num_reads, num_chunks, total_bases
+    );
+
+    // Per-role compressed totals (frame bytes) for the stats line, computed BEFORE
+    // moving `dir` into the footer struct.
+    let role_bytes = |want: StreamRole| -> usize {
+        dir.iter()
+            .filter(|e| e.role == want)
+            .map(|e| e.length as usize)
+            .sum()
+    };
+    let headers_len = role_bytes(StreamRole::Headers);
+    let sequences_len = role_bytes(StreamRole::Sequence);
+    let qualities_len = role_bytes(StreamRole::Qual);
+    let rc_flags_len = role_bytes(StreamRole::RcFlags);
+
+    // ChunkDecodedSizes global: single-end emits n_mates=1 (one size/chunk), paired emits
+    // n_mates=2 (R1,R2 row-major). Both feed the NUMA direct-write decode pre-sizing. The
+    // block's record_count is num_chunks (NOT the size count) for both — `read_chunk_layout`
+    // cross-checks it against the footer chunk count. Single's bytes are unchanged: for
+    // single decoded_sizes.len() == num_chunks, so this is byte-identical to the old emit.
+    {
+        let n_mates: u8 = if mode == CompressMode::Paired { 2 } else { 1 };
+        debug_assert_eq!(decoded_sizes.len(), num_chunks as usize * n_mates as usize);
+        // Debug-only test hook: undersize the last entry so direct-write decode exercises
+        // the overrun → integrity → auto-fallback path (single and paired alike).
+        #[cfg(debug_assertions)]
+        if std::env::var_os("QZ_NUMA_FAKE_UNDERSIZE").is_some()
+            && let Some(last) = decoded_sizes.last_mut()
+        {
+            *last = last.saturating_sub(1);
+        }
+        let dsz = encode_decoded_sizes(n_mates, num_chunks, &decoded_sizes);
+        write_role_blocks(
+            &[(num_chunks, dsz)],
+            StreamRole::ChunkDecodedSizes,
+            0, // mate (global)
+            0, // codec (raw metadata)
+            GLOBAL_SENTINEL,
+            &mut output_file,
+            &mut cursor,
+            &mut dir,
+        )?;
+    }
+
+    if mode == CompressMode::Paired {
+        let directory = ChunkDirectory {
+            num_reads,
+            num_chunks,
+            entries: dir,
+        };
+        crate::compression::paired::format::validate_paired_directory(&directory)?;
+        let footer_len = write_footer_and_locator(output_file.as_mut(), &directory)?;
+        output_file.flush()?;
+        let metadata_size = header_size + footer_len + 20;
+        return Ok(WriterDone {
+            original_size: original_size as usize,
+            headers_len,
+            sequences_len,
+            qualities_len,
+            rc_flags_len,
+            metadata_size,
+        });
+    }
+
+    let directory = ChunkDirectory {
+        num_reads,
+        num_chunks,
+        entries: dir,
+    };
+    let footer_len = write_footer_and_locator(output_file.as_mut(), &directory)?;
+    output_file.flush()?;
+
+    let metadata_size = header_size + footer_len + 20;
+    Ok(WriterDone {
+        original_size: original_size as usize,
+        headers_len,
+        sequences_len,
+        qualities_len,
+        rc_flags_len,
+        metadata_size,
+    })
+}
+
+/// Reject configurations that would silently produce an unreadable/corrupt
+/// archive, or silently ignore a requested option. This is the single home for
+/// every cross-option compression guard — adding a new constraint means adding
+/// it here (and a test), rather than threading another `bail!` into the middle
+/// of `compress()`. Pure: depends only on `args`, runs before any work.
+fn validate_compress_config(args: &CompressConfig) -> Result<()> {
+    // Cap bsc_block_size_mb. The default streaming decompressor refuses any
     // compressed block > 64 MiB (corruption guard), and BSC output never
     // exceeds input + header — so capping input at 64 MiB guarantees the
-    // archive is always decompressible.
-    if args.advanced.bsc_block_size_mb == 0 || args.advanced.bsc_block_size_mb > 64 {
+    // archive is always decompressible. The ultra (UltraBigBlock) decode path
+    // lifts that to 768 MiB, so the ultra *encoder* input is capped at 750 MiB
+    // — strictly below the decode cap, leaving margin for an incompressible
+    // block whose BSC output exceeds its input.
+    let is_ultra_path = args.ultra.is_some();
+    let max_block_mb = if is_ultra_path { 750 } else { 64 };
+    if args.advanced.bsc_block_size_mb == 0 || args.advanced.bsc_block_size_mb > max_block_mb {
         anyhow::bail!(
-            "bsc_block_size_mb must be in 1..=64 (got {})",
+            "bsc_block_size_mb must be in 1..={} (got {})",
+            max_block_mb,
             args.advanced.bsc_block_size_mb
         );
     }
 
-    // Set up thread pool
-    let num_threads = if args.threads == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8)
-    } else {
-        args.threads
-    };
-    // KNOWN LIMITATION: rayon's global pool can only be built once per process.
-    // The first qz_lib::compression::{compress,decompress,verify} call fixes
-    // the thread count process-wide; subsequent calls with a different
-    // `args.threads` will be silently ignored. This affects qz-python
-    // (multiple compress() calls in one Python session) and any other library
-    // user calling qz-lib repeatedly. The bz-lib design moves rayon init out
-    // of the library entirely; consider doing the same for qz-lib in a
-    // future refactor.
-    let actual_threads = match rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads)
-        .build_global()
-    {
-        Ok(()) => num_threads,
-        Err(_) => {
-            let existing = rayon::current_num_threads();
-            if existing != num_threads {
-                tracing::warn!(
-                    "Requested {} threads but the rayon pool was already \
-                     initialized to {} threads (process-wide setting; only the \
-                     first qz_lib call wins). Using {} threads.",
-                    num_threads, existing, existing
-                );
-            }
-            existing
+    // Validate rc_canon compatibility.
+    //
+    // The encoding-type selection is a priority chain (ultra > rc_canon >
+    // hints), so rc_canon wins and the archive is tagged `RcCanon` (type 6).
+    // But `records_to_streams` emits the hint byte whenever `sequence_hints` is
+    // set, INDEPENDENT of the chosen type — and the type-6 decoder reports
+    // `has_sequence_hints()==false`, so it never strips that extra byte and reads
+    // it as sequence data. The combo therefore silently corrupts every sequence.
+    // Reject it.
+    if args.advanced.rc_canon && args.advanced.sequence_hints {
+        anyhow::bail!(
+            "--rc-canon cannot be combined with --sequence-hints \
+             (it would inject bytes the rc-canon decoder does not strip)"
+        );
+    }
+
+    // Validate --quality-compressor fqzcomp.
+    // The fqz encode path feeds raw quality ASCII to fqzcomp and forces
+    // `stream_quality_binning = None` (it has no lossy/binned path), so an explicit
+    // Fqzcomp + a lossy quality mode would SILENTLY store full-resolution qualities
+    // — ignoring the requested reduction — and an explicit Fqzcomp + --no-quality
+    // ignores the codec choice entirely (no quality stream is written). Reject both
+    // rather than silently honor only part of the request. (Unreachable in
+    // production: the CLI and Python binding leave quality_compressor = Auto, and
+    // Auto resolves lossy / no-quality to BSC. This guards direct library callers.)
+    if args.advanced.quality_compressor == QualityCompressor::Fqzcomp {
+        if args.no_quality {
+            anyhow::bail!("--quality-compressor fqzcomp cannot be used with --no-quality");
         }
-    };
+        if args.quality_mode != QualityMode::Lossless {
+            anyhow::bail!(
+                "--quality-compressor fqzcomp requires lossless quality mode (default); \
+                 it has no lossy/binned path and would silently store full-resolution qualities"
+            );
+        }
+    }
+
+    // Validate --ultra options.
+    let has_ultra = args.ultra.is_some();
+    if has_ultra {
+        let mode_name = "--ultra";
+        if args.advanced.sequence_hints || args.advanced.rc_canon {
+            anyhow::bail!("{mode_name} cannot be combined with other encoding options");
+        }
+    }
+
+    if args.input.len() != 1 {
+        anyhow::bail!("Expected exactly 1 input file, got {}", args.input.len());
+    }
+
+    Ok(())
+}
+
+pub(super) fn compress(args: &CompressConfig) -> Result<()> {
+    // Reject invalid / silently-lossy config combinations before any work.
+    validate_compress_config(args)?;
+
+    // Honor -t. Idempotent: the top-level `compress()` already built the global
+    // pool before dispatch; this also covers direct callers (e.g. the stdout
+    // path) and keeps `actual_threads` for logging. See
+    // `super::ensure_global_thread_pool` for why the global pool (not an owned
+    // pool + install()) is the right mechanism here.
+    let actual_threads = super::ensure_global_thread_pool(args.threads);
 
     info!("Using {} threads for compression", actual_threads);
-    info!("Compression level: {}", args.advanced.compression_level);
     info!("Input files: {:?}", args.input);
     info!("Output: {:?}", args.output);
 
@@ -866,522 +1344,372 @@ pub(super) fn compress(args: &CompressConfig) -> Result<()> {
         );
     }
 
-    // Validate --sequence-hints compatibility
-    if args.advanced.sequence_hints && args.advanced.sequence_compressor != SequenceCompressor::Bsc {
-        anyhow::bail!("--sequence-hints requires BSC sequence compressor (default)");
-    }
-
-    // Validate --sequence-delta compatibility
-    if args.advanced.sequence_delta {
-        if args.advanced.sequence_hints {
-            anyhow::bail!("--sequence-delta cannot be combined with --sequence-hints");
-        }
-        if args.advanced.sequence_compressor != SequenceCompressor::Bsc {
-            anyhow::bail!("--sequence-delta requires BSC sequence compressor (default)");
-        }
-    }
-
-    // Validate --quality-compressor quality-ctx
-    if args.advanced.quality_compressor == QualityCompressor::QualityCtx {
-        if args.no_quality {
-            anyhow::bail!("--quality-compressor quality-ctx cannot be used with --no-quality");
-        }
-        if args.quality_mode != QualityMode::Lossless {
-            anyhow::bail!("--quality-compressor quality-ctx requires lossless quality mode (default)");
-        }
-    }
-
-    // Reject configurations that would silently produce unreadable archives.
-    //
-    // (a) `dict_training` only works with the zstd-dict codec — non-Zstd
-    //     compressors silently fall back to their default codec (BSC/OpenZL/
-    //     fqzcomp), but the archive header still records `dict_present=1`,
-    //     so the decompressor tries zstd-dict on non-zstd bytes and fails.
-    //     Auto is NOT acceptable here: it resolves to BSC or QualityCtx
-    //     depending on input size — both non-Zstd — and the silent corruption
-    //     bug recurs. Require an explicit `Zstd` choice.
-    if args.advanced.dict_training
-        && args.advanced.quality_compressor != QualityCompressor::Zstd
-    {
-        anyhow::bail!(
-            "--dict-training requires an explicit --quality-compressor zstd \
-             (got {:?}). Other compressors (including Auto, which resolves to \
-             BSC or QualityCtx) don't use the dictionary, but the archive \
-             would still claim it does and fail to decompress.",
-            args.advanced.quality_compressor
-        );
-    }
-    // (b) `quality_modeling + Fqzcomp` silently substitutes BSC for the model
-    //     deltas but the archive still advertises Fqzcomp; decompression fails
-    //     with a confusing fqzcomp error on BSC-encoded data.
-    if args.advanced.quality_modeling
-        && args.advanced.quality_compressor == QualityCompressor::Fqzcomp
-    {
-        anyhow::bail!(
-            "--quality-modeling is incompatible with --quality-compressor fqzcomp. \
-             Pick another compressor (bsc, openzl, or zstd) for the model deltas, \
-             or disable quality modeling."
-        );
-    }
-    // (c) `quality_delta` always emits raw zstd internally (the codec ignores
-    //     the configured quality_compressor), but the archive header stores
-    //     the user-typed compressor. With anything other than Zstd, the
-    //     decompressor reads the header, sees BSC/OpenZL/Fqzcomp/QualityCtx,
-    //     and tries that codec on raw zstd bytes — fast verify trips on the
-    //     same misreading. Require explicit Zstd here too.
-    if args.advanced.quality_delta
-        && args.advanced.quality_compressor != QualityCompressor::Zstd
-    {
-        anyhow::bail!(
-            "--quality-delta currently emits raw zstd and requires \
-             --quality-compressor zstd (got {:?}). Mismatched compressors \
-             would produce an archive whose header advertises the wrong \
-             codec while the quality stream is actually zstd-framed, so \
-             decompression fails.",
-            args.advanced.quality_compressor
-        );
-    }
-    // (d) `sequence_compressor=Zstd` routes through the columnar path, which
-    //     zstd-encodes sequences, n-masks AND qualities (see
-    //     compression/columnar.rs::compress_columnar). Quality modeling and
-    //     quality delta have their own dedicated buffers and override that
-    //     columnar quality output, but in the default case the columnar zstd
-    //     bytes are written verbatim — while the archive header still records
-    //     the user's `quality_compressor`. Mismatched compressors → header
-    //     says BSC/Fqzcomp/QualityCtx but bytes are raw zstd, decompression
-    //     fails, and `verify --fast` misreads the zstd magic as a v3
-    //     num_blocks header. Require zstd-on-zstd unless modeling or delta
-    //     supplies its own quality stream.
-    if args.advanced.sequence_compressor == SequenceCompressor::Zstd
-        && !args.advanced.quality_modeling
-        && !args.advanced.quality_delta
-        && args.advanced.quality_compressor != QualityCompressor::Zstd
-    {
-        anyhow::bail!(
-            "--sequence-compressor zstd uses the columnar path, which \
-             zstd-encodes qualities; --quality-compressor must therefore be \
-             zstd as well (got {:?}). Either pass `--quality-compressor zstd` \
-             or enable --quality-modeling / --quality-delta so qualities are \
-             encoded outside the columnar zstd path.",
-            args.advanced.quality_compressor
-        );
-    }
-
-    // Validate --local-reorder / --ultra compatibility
-    let has_ultra = args.ultra.is_some();
-    if args.advanced.local_reorder || has_ultra {
-        let mode_name = if args.advanced.local_reorder { "--local-reorder" } else { "--ultra" };
-        if (args.advanced.local_reorder as u8 + has_ultra as u8) > 1 {
-            anyhow::bail!("--local-reorder and --ultra cannot be combined");
-        }
-        if args.advanced.sequence_hints || args.advanced.sequence_delta || args.advanced.rc_canon {
-            anyhow::bail!("{mode_name} cannot be combined with other encoding options");
-        }
-        if args.advanced.sequence_compressor != SequenceCompressor::Bsc {
-            anyhow::bail!("{mode_name} requires BSC sequence compressor (default)");
-        }
-        if args.advanced.header_compressor != HeaderCompressor::Bsc
-            && args.advanced.header_compressor != HeaderCompressor::Columnar {
-            anyhow::bail!("{mode_name} requires BSC or Columnar header compressor (default)");
-        }
-    }
-
-    if args.input.len() != 1 {
-        anyhow::bail!("Expected exactly 1 input file, got {}", args.input.len());
-    }
-
-    // Chunked pipeline: BSC/Columnar for headers, BSC for sequences, no advanced quality encoding
-    let can_stream = args.advanced.sequence_compressor == SequenceCompressor::Bsc
-        && (args.advanced.header_compressor == HeaderCompressor::Bsc
-            || args.advanced.header_compressor == HeaderCompressor::Columnar)
-        && !args.advanced.quality_modeling
-        && !args.advanced.quality_delta
-        && !args.advanced.dict_training
-        && !args.advanced.twobit
-        && !args.advanced.header_template;
-
-    // Reorder modes require the chunked pipeline
-    if let Some(mode) = args.advanced.reorder {
-        if !can_stream {
-            anyhow::bail!("--reorder requires BSC compressors for headers/sequences and no advanced encoding options");
-        }
-        return match mode {
-            crate::cli::ReorderMode::Local => compress_chunked(args, true),
-            crate::cli::ReorderMode::Global => compress_global_reorder_bsc(args),
-        };
-    }
-
-    // Local reorder mode: uses ReorderLocal (same as ultra) with auto-selected level
-    if args.advanced.local_reorder {
-        let level = ultra::resolve_ultra_level(0);
-        return ultra::compress_reorder_local_with_level(args, level);
-    }
-
     // Ultra mode: level-based compression with auto-tuning
     if let Some(requested_level) = args.ultra {
-        let level = ultra::resolve_ultra_level(requested_level);
-        return ultra::compress_reorder_local_with_level(args, level);
+        let level = ultra::resolve_ultra_level(requested_level)?;
+        return ultra::compress_ultra(args, level);
     }
 
-    // Unified chunked pipeline handles BSC, fqzcomp, and quality_ctx quality
-    if can_stream {
-        return compress_chunked(args, false);
-    }
-
-    // Non-streaming mode: read all records into memory first
-    // (required for advanced quality encoding, non-BSC compressors)
-    compress_in_memory(args, start_time)
+    // Single archive architecture: the unified chunked v5 pipeline handles every
+    // supported configuration (BSC/Columnar headers, BSC sequences, BSC/fqzcomp
+    // quality). `validate_compress_config` has already rejected any unsupported
+    // option, so there is no in-memory fallback.
+    compress_chunked(args, ChunkedMode::Default)
 }
 
-/// In-memory compression path for advanced quality encodings and non-BSC compressors.
-///
-/// Reads all records into memory, applies optional delta/RLE/debruijn/arithmetic encoding,
-/// then compresses all three streams (headers, sequences, qualities) in parallel.
-fn compress_in_memory(args: &CompressConfig, start_time: Instant) -> Result<()> {
-    use crate::io::{FastqReader, FastqRecord};
-    use std::io::Write;
+#[cfg(test)]
+mod config_guard_tests {
+    use super::*;
+    use crate::cli::{CompressConfig, QualityCompressor, QualityMode};
+    use std::path::PathBuf;
 
-    info!("Reading FASTQ file...");
-    let input_path = &args.input[0];
-    let mut reader = FastqReader::from_path_or_stdin(input_path, args.fasta)?;
-    let mut records = Vec::new();
-
-    while let Some(record) = reader.next()? {
-        records.push(record);
+    fn base() -> CompressConfig {
+        CompressConfig {
+            input: vec![PathBuf::from("in.fastq")],
+            ..CompressConfig::default()
+        }
     }
 
-    info!("Read {} records", records.len());
+    #[test]
+    fn explicit_fqzcomp_lossless_is_accepted() {
+        let mut a = base();
+        a.advanced.quality_compressor = QualityCompressor::Fqzcomp;
+        a.quality_mode = QualityMode::Lossless;
+        assert!(validate_compress_config(&a).is_ok());
+    }
 
-    // Resolve Auto -> concrete compressor. The in-memory path doesn't support
-    // QualityCtx (advanced encodings here pre-empt it), so Auto effectively
-    // means Bsc in this code path.
-    let resolved_quality_compressor = super::resolve_quality_compressor(
-        args.advanced.quality_compressor,
-        records.len(),
-        args.quality_mode,
-        args.no_quality,
-    );
+    #[test]
+    fn explicit_fqzcomp_lossy_is_rejected() {
+        // The fqz encode path forces stream_quality_binning = None, so a lossy mode
+        // would silently store full-resolution qualities — reject, never ignore.
+        for mode in [
+            QualityMode::IlluminaBin,
+            QualityMode::Illumina4,
+            QualityMode::Binary,
+        ] {
+            let mut a = base();
+            a.advanced.quality_compressor = QualityCompressor::Fqzcomp;
+            a.quality_mode = mode;
+            assert!(
+                validate_compress_config(&a).is_err(),
+                "explicit fqzcomp + {mode:?} must be rejected"
+            );
+        }
+    }
 
-    // Apply quality quantization if needed (skip for lossless — avoids ~1.5 GB clone)
-    let processed_records: Vec<FastqRecord> = if !args.no_quality && args.quality_mode != QualityMode::Lossless {
-        records
-            .into_iter()
-            .map(|mut record| {
-                if let Some(qual) = &record.quality {
-                    record.quality = Some(quality::quantize_quality(qual, args.quality_mode).into_owned());
-                }
-                record
-            })
+    #[test]
+    fn explicit_fqzcomp_no_quality_is_rejected() {
+        let mut a = base();
+        a.advanced.quality_compressor = QualityCompressor::Fqzcomp;
+        a.no_quality = true;
+        assert!(validate_compress_config(&a).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fqzcomp_subblock_tests {
+    use super::*;
+
+    /// Distinct per-record quality strings (the byte-capped splitter used by
+    /// reference mode operates on borrowed quality slices).
+    fn sample_quals(n: u8) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| vec![b'I', b'5', b'#', b'0' + (i % 9)])
             .collect()
-    } else {
-        records
-    };
+    }
 
-    // Determine encoding type and quality binning
-    let encoding_type: u8 = if args.advanced.sequence_hints {
-        4 // Sequence hints for BWT clustering
-    } else if args.advanced.sequence_delta {
-        5 // Inline delta encoding
-    } else {
-        0 // No special encoding
-    };
-
-    let quality_binning = if args.no_quality {
-        QualityBinning::None
-    } else {
-        quality_mode_to_binning(args.quality_mode)
-    };
-
-    // Quality pre-computation (must complete before parallel compression block)
-    // Train quality dictionary if requested
-    let quality_dict_opt = if args.advanced.dict_training && !args.no_quality {
-        info!("Training zstd dictionary for quality scores...");
-        let quality_strings: Vec<Vec<u8>> = processed_records
+    #[test]
+    fn fqz_blocks_capped_quals_enforces_cap() {
+        let quals = sample_quals(64);
+        let refs: Vec<&[u8]> = quals.iter().map(|q| q.as_slice()).collect();
+        // Largest single-record blob: cap == this guarantees recursion terminates
+        // (each leaf is one record and fits), and forces splitting iff full > cap.
+        let max_single = refs
             .iter()
-            .filter_map(|r| r.quality.clone())
-            .collect();
+            .map(|q| {
+                codecs::compress_qualities_fqzcomp_quals(std::slice::from_ref(q))
+                    .unwrap()
+                    .len()
+            })
+            .max()
+            .unwrap();
+        let full = codecs::compress_qualities_fqzcomp_quals(&refs).unwrap().len();
+        assert!(
+            full > max_single,
+            "64-record blob must exceed a single-record blob"
+        );
+        let cap = max_single;
 
-        if !quality_strings.is_empty() {
-            let dict_size_bytes = args.advanced.dict_size * 1024; // Convert KB to bytes
-            let dict = zstd_dict::train_from_quality_scores(&quality_strings, dict_size_bytes, 0.1)?;
-            Some(dict)
-        } else {
-            None
+        let blocks = fqz_blocks_capped_quals(&refs, cap).unwrap();
+        assert!(
+            blocks.len() > 1,
+            "cap == single-record size must force splitting"
+        );
+        assert!(
+            blocks.iter().all(|(_, b)| b.len() <= cap),
+            "every block within cap"
+        );
+        assert_eq!(
+            blocks.iter().map(|(c, _)| *c).sum::<u32>(),
+            64,
+            "counts sum to input"
+        );
+    }
+
+    #[test]
+    fn fqz_blocks_capped_quals_errors_below_single_record() {
+        let quals = sample_quals(8);
+        let refs: Vec<&[u8]> = quals.iter().map(|q| q.as_slice()).collect();
+        let min_single = refs
+            .iter()
+            .map(|q| {
+                codecs::compress_qualities_fqzcomp_quals(std::slice::from_ref(q))
+                    .unwrap()
+                    .len()
+            })
+            .min()
+            .unwrap();
+        // A cap below the smallest single-record blob cannot be satisfied → Err, not panic.
+        let res = fqz_blocks_capped_quals(&refs, min_single.saturating_sub(1));
+        assert!(res.is_err(), "sub-single-record cap must return Err");
+    }
+}
+
+#[cfg(test)]
+mod columnar_cap_tests {
+    use super::*;
+
+    /// Distinct, mildly-compressible read IDs (grow the columnar blob with count).
+    fn sample_headers(n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|i| format!("@SRR{:08}.{} read_{}/1", i, i * 7 + 3, i).into_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn columnar_blocks_capped_single_block_under_cap() {
+        let hdrs = sample_headers(64);
+        let refs: Vec<&[u8]> = hdrs.iter().map(|h| h.as_slice()).collect();
+        // Generous cap → exactly one block, byte-identical to the pre-cap encoder
+        // (`[count u32][columnar_blob]`). This guarantees existing archives are unchanged.
+        let blocks = columnar_blocks_capped(&refs, usize::MAX).unwrap();
+        assert_eq!(blocks.len(), 1, "fits under cap → single block");
+        let blob = header_col::compress_headers_columnar_bytes(&refs).unwrap();
+        let mut expect = (refs.len() as u32).to_le_bytes().to_vec();
+        expect.extend_from_slice(&blob);
+        assert_eq!(blocks[0].0, 64, "framed record_count == header count");
+        assert_eq!(
+            blocks[0].1, expect,
+            "single-block payload byte-identical to old path"
+        );
+    }
+
+    #[test]
+    fn columnar_blocks_capped_splits_over_cap_and_reassembles() {
+        let hdrs = sample_headers(256);
+        let refs: Vec<&[u8]> = hdrs.iter().map(|h| h.as_slice()).collect();
+        let full_len = columnar_blocks_capped(&refs, usize::MAX).unwrap()[0]
+            .1
+            .len();
+        // Cap forces multiple blocks but stays well above any single-header payload,
+        // so recursion terminates without hitting the single-record bail.
+        let cap = full_len / 3;
+        let blocks = columnar_blocks_capped(&refs, cap).unwrap();
+        assert!(blocks.len() > 1, "cap below full size must split");
+        assert!(
+            blocks.iter().all(|(_, p)| p.len() <= cap),
+            "every emitted block within cap"
+        );
+        assert_eq!(
+            blocks.iter().map(|(c, _)| *c as usize).sum::<usize>(),
+            256,
+            "framed counts sum to input"
+        );
+        // Each block is a self-contained columnar encoding; decoding each and
+        // concatenating in block order reconstructs every id in input order.
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for (rc, payload) in &blocks {
+            let count = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+            assert_eq!(count, *rc, "payload count prefix == framed record_count");
+            let ids =
+                header_col::decompress_headers_columnar(&payload[4..], count as usize).unwrap();
+            got.extend(ids);
         }
-    } else {
-        None
-    };
+        assert_eq!(got, hdrs, "reassembled ids match input");
+    }
 
-    // Determine quality compression strategy
-    // Priority: delta > modeling > standard
-    let (quality_delta_opt, quality_model_opt) = if args.advanced.quality_delta && !args.no_quality {
-        info!("Applying quality delta encoding...");
-        let qual_compressed = if let Some(ref dict) = quality_dict_opt {
-            codecs::compress_qualities_with_delta_and_dict(&processed_records, dict, args.advanced.compression_level)?
-        } else {
-            codecs::compress_qualities_with_delta(&processed_records, args.advanced.compression_level)?
+    #[test]
+    fn columnar_blocks_capped_errors_on_unsatisfiable_cap() {
+        let hdrs = sample_headers(4);
+        let refs: Vec<&[u8]> = hdrs.iter().map(|h| h.as_slice()).collect();
+        // A cap below even a single-header payload cannot be satisfied → Err, not
+        // a panic or unbounded recursion.
+        assert!(
+            columnar_blocks_capped(&refs, 1).is_err(),
+            "sub-single-header cap must Err"
+        );
+    }
+}
+
+#[cfg(test)]
+mod decoded_sizes_tests {
+    #[test]
+    fn single_end_archive_carries_decoded_sizes_global() {
+        use crate::compression::chunk_directory::{
+            GLOBAL_SENTINEL, StreamRole, parse_decoded_sizes, read_v5_footer,
         };
-        (Some(qual_compressed), None)
-    } else if args.advanced.quality_modeling && !args.no_quality {
-        info!("Building positional quality model...");
-        let (qual_compressed, model) = if let Some(ref dict) = quality_dict_opt {
-            codecs::compress_qualities_with_model_and_dict(&processed_records, dict, args.advanced.compression_level)?
-        } else {
-            codecs::compress_qualities_with_model(&processed_records, args.advanced.compression_level, resolved_quality_compressor, args.advanced.bsc_static)?
+        let d = tempfile::tempdir().unwrap();
+        let fq = d.path().join("in.fastq");
+        let mut s = String::new();
+        for i in 0..5 {
+            s.push_str(&format!("@read{i}\nACGTACGT\n+\nIIIIIIII\n"));
+        }
+        std::fs::write(&fq, &s).unwrap();
+        let arc = d.path().join("out.qz");
+        let mut cfg = crate::cli::CompressConfig {
+            input: vec![fq],
+            output: arc.clone(),
+            ..Default::default()
         };
-        (None, Some((qual_compressed, model)))
-    } else {
-        (None, None)
-    };
+        cfg.advanced.chunk_records = 2; // usize on AdvancedOptions -> 3 chunks
+        crate::compression::compress(&cfg).unwrap();
 
-    // Helper closure: resolve quality compression (priority: delta > model > dict > default)
-    let bsc_static = args.advanced.bsc_static;
-    let resolve_quality = || -> Result<Vec<u8>> {
-        if let Some(ref qual) = quality_delta_opt {
-            Ok(qual.clone())
-        } else if let Some((ref qual, _)) = quality_model_opt {
-            Ok(qual.clone())
-        } else if args.no_quality {
-            Ok(Vec::new())
-        } else if let Some(ref dict) = quality_dict_opt {
-            codecs::compress_qualities_with_dict(&processed_records, quality_binning, dict, args.advanced.compression_level, resolved_quality_compressor)
-        } else {
-            codecs::compress_qualities_with(&processed_records, quality_binning, args.advanced.compression_level, resolved_quality_compressor, bsc_static)
+        let header_end = crate::compression::test_front_header_end(&arc).unwrap(); // returns stored header_size
+        let footer = read_v5_footer(&arc, header_end).unwrap();
+        let g = footer
+            .entries
+            .iter()
+            .find(|e| e.chunk_index == GLOBAL_SENTINEL && e.role == StreamRole::ChunkDecodedSizes)
+            .expect("ChunkDecodedSizes global present");
+        assert_eq!(g.record_count, footer.num_chunks as u64);
+        assert_eq!(g.mate, 0);
+        let bytes = std::fs::read(&arc).unwrap();
+        // +12 skips the per-block frame header: [block_len u32 | record_count u32 | crc32 u32].
+        let payload = &bytes[(g.offset as usize + 12)..(g.offset as usize + g.length as usize)];
+        let (n_mates, num_chunks, sizes) = parse_decoded_sizes(payload).unwrap();
+        assert_eq!((n_mates, num_chunks), (1, footer.num_chunks));
+        assert_eq!(sizes.iter().sum::<u64>(), 5 * (6 + 8 + 8 + 5)); // "@readN"=6, seq8, qual8, +5
+    }
+
+    /// Flipping a byte inside the ChunkDecodedSizes payload must cause
+    /// `read_chunk_layout` to return `Err` (the frame CRC check fires).
+    #[test]
+    fn corrupt_decoded_sizes_table_is_rejected() {
+        use crate::compression::chunk_directory::{
+            GLOBAL_SENTINEL, StreamRole, read_v5_footer,
+        };
+        let d = tempfile::tempdir().unwrap();
+        let fq = d.path().join("in.fastq");
+        let mut s = String::new();
+        for i in 0..5 {
+            s.push_str(&format!("@read{i}\nACGTACGT\n+\nIIIIIIII\n"));
         }
-    };
+        std::fs::write(&fq, &s).unwrap();
+        let arc = d.path().join("out.qz");
+        let mut cfg = crate::cli::CompressConfig {
+            input: vec![fq],
+            output: arc.clone(),
+            ..Default::default()
+        };
+        cfg.advanced.chunk_records = 2; // 3 chunks
+        crate::compression::compress(&cfg).unwrap();
 
-    // Compress all three streams in parallel:
-    //   Left:  headers
-    //   Right: sequences + qualities (with nested rayon::join)
-    let (header_result, seq_qual_result) = rayon::join(
-        || -> Result<(Vec<u8>, read_id::ReadIdTemplate)> {
-            match args.advanced.header_compressor {
-                HeaderCompressor::Bsc => {
-                    if args.advanced.header_template {
-                        let read_ids: Vec<String> = processed_records.iter().map(|r| String::from_utf8_lossy(&r.id).into_owned()).collect();
-                        let encoded = read_id::compress_read_ids(&read_ids)?;
-                        if encoded.template.prefix.is_empty() {
-                            // Template analysis found no common Illumina structure, fall back to raw BSC
-                            info!("No template structure found in headers, falling back to raw BSC{}...", if args.advanced.bsc_static { " (static)" } else { " (adaptive)" });
-                            let compressed = codecs::compress_headers_bsc_with(&processed_records, args.advanced.bsc_static)?;
-                            let dummy_template = read_id::ReadIdTemplate {
-                                prefix: String::new(),
-                                has_comment: false,
-                                common_comment: None,
-                            };
-                            Ok((compressed, dummy_template))
-                        } else {
-                            info!("Compressing read IDs with template encoding + BSC{}...", if args.advanced.bsc_static { " (static)" } else { " (adaptive)" });
-                            let compressed = bsc_compress_parallel(&encoded.encoded_data, args.advanced.bsc_static)?;
-                            Ok((compressed, encoded.template))
-                        }
-                    } else {
-                        info!("Compressing read IDs with raw BSC{}...", if args.advanced.bsc_static { " (static)" } else { " (adaptive)" });
-                        let compressed = codecs::compress_headers_bsc_with(&processed_records, args.advanced.bsc_static)?;
-                        let dummy_template = read_id::ReadIdTemplate {
-                            prefix: String::new(),
-                            has_comment: false,
-                            common_comment: None,
-                        };
-                        Ok((compressed, dummy_template))
-                    }
-                }
-                HeaderCompressor::Zstd => {
-                    info!("Compressing read IDs with template encoding...");
-                    codecs::compress_headers(&processed_records, args.advanced.compression_level)
-                }
-                HeaderCompressor::OpenZl => {
-                    info!("Compressing read IDs with raw OpenZL...");
-                    let compressed = codecs::compress_headers_openzl(&processed_records)?;
-                    let dummy_template = read_id::ReadIdTemplate {
-                        prefix: String::new(),
-                        has_comment: false,
-                        common_comment: None,
-                    };
-                    Ok((compressed, dummy_template))
-                }
-                HeaderCompressor::Columnar => {
-                    info!("Compressing headers with columnar encoding...");
-                    let blob = codecs::compress_headers_columnar(&processed_records)?;
-                    // Wrap in block format to match chunked path output (qz v3+):
-                    // [num_blocks: u32][block_len: u32, crc32: u32][num_reads: u32][columnar_blob]
-                    // CRC32 covers the [num_reads + columnar_blob] payload.
-                    let num_reads_u32 = processed_records.len() as u32;
-                    let block_data_len = 4 + blob.len();
-                    let mut payload = Vec::with_capacity(block_data_len);
-                    payload.extend_from_slice(&num_reads_u32.to_le_bytes());
-                    payload.extend_from_slice(&blob);
-                    let crc = super::bsc::block_crc32(&payload);
-                    let mut compressed = Vec::with_capacity(12 + block_data_len);
-                    compressed.extend_from_slice(&1u32.to_le_bytes()); // 1 block
-                    compressed.extend_from_slice(&(block_data_len as u32).to_le_bytes());
-                    compressed.extend_from_slice(&crc.to_le_bytes());
-                    compressed.extend_from_slice(&payload);
-                    let dummy_template = read_id::ReadIdTemplate {
-                        prefix: String::new(),
-                        has_comment: false,
-                        common_comment: None,
-                    };
-                    Ok((compressed, dummy_template))
-                }
-            }
-        },
-        || -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-            match args.advanced.sequence_compressor {
-                    SequenceCompressor::Bsc => {
-                        let twobit = args.advanced.twobit;
-                        info!("Compressing sequences{} and qualities in parallel with BSC{}...",
-                            if twobit { " (2-bit)" } else { "" },
-                            if args.advanced.bsc_static { " (static)" } else { " (adaptive)" });
-                        let bsc_static = args.advanced.bsc_static;
-                        let (seq_result, qual_result) = rayon::join(
-                            || if twobit {
-                                codecs::compress_sequences_2bit_bsc_with(&processed_records, bsc_static)
-                            } else {
-                                codecs::compress_sequences_raw_bsc_with(&processed_records, bsc_static, args.advanced.sequence_hints, args.advanced.sequence_delta)
-                            },
-                            &resolve_quality,
-                        );
-                        let (sequences, nmasks) = seq_result?;
-                        let qualities = qual_result?;
-                        Ok((sequences, nmasks, qualities))
-                    }
-                    SequenceCompressor::Zstd => {
-                        info!("Compressing with columnar format (N-mask lossless)...");
-                        let (_h, sequences, nmasks, qualities_columnar, _stats) = compress_columnar(&processed_records, quality_binning, args.advanced.compression_level)?;
-                        let qualities = if let Some(ref qual) = quality_delta_opt {
-                            qual.clone()
-                        } else if let Some((ref qual, _)) = quality_model_opt {
-                            qual.clone()
-                        } else {
-                            qualities_columnar
-                        };
-                        Ok((sequences, nmasks, qualities))
-                    }
-                    SequenceCompressor::OpenZl => {
-                        info!("Compressing sequences and qualities in parallel with OpenZL...");
-                        let (seq_result, qual_result) = rayon::join(
-                            || codecs::compress_sequences_raw_openzl(&processed_records),
-                            &resolve_quality,
-                        );
-                        let (sequences, nmasks) = seq_result?;
-                        let qualities = qual_result?;
-                        Ok((sequences, nmasks, qualities))
-                    }
-                }
-        },
-    );
-    let (headers, read_id_template) = header_result?;
-    let (sequences, nmasks, qualities) = seq_qual_result?;
+        // Locate the ChunkDecodedSizes global entry via the footer.
+        let header_end = crate::compression::test_front_header_end(&arc).unwrap();
+        let footer = read_v5_footer(&arc, header_end).unwrap();
+        let g = footer
+            .entries
+            .iter()
+            .find(|e| e.chunk_index == GLOBAL_SENTINEL && e.role == StreamRole::ChunkDecodedSizes)
+            .expect("ChunkDecodedSizes global present");
 
-    // Compute stats after all streams are compressed
-    let stats = columnar::ColumnarStats {
-        num_reads: processed_records.len(),
-        total_bases: processed_records.iter().map(|r| r.sequence.len()).sum(),
-        original_size: processed_records.iter().map(|r| r.id.len() + r.sequence.len() + r.quality.as_ref().map(|q| q.len()).unwrap_or(0) + 3).sum(),
-        headers_size: headers.len(),
-        sequences_size: sequences.len(),
-        qualities_size: qualities.len(),
-        total_compressed: headers.len() + sequences.len() + qualities.len(),
-    };
+        // Flip one byte inside the payload region (after the 12-byte frame header).
+        let payload_start = g.offset as usize + 12;
+        let mut bytes = std::fs::read(&arc).unwrap();
+        assert!(
+            payload_start < g.offset as usize + g.length as usize,
+            "payload region must be non-empty"
+        );
+        bytes[payload_start] ^= 0xFF;
+        let corrupted = d.path().join("corrupted.qz");
+        std::fs::write(&corrupted, &bytes).unwrap();
 
-    // Build archive header body into a buffer, then write v2 prefix + body + data
-    info!("Writing output file...");
-    let mut hdr = Vec::with_capacity(256);
-
-    // Header body fields
-    hdr.push(encoding_type);
-    hdr.push(0u8); // flags: 0x00 = no const-length fields
-
-    hdr.push(binning_to_code(quality_binning));
-    hdr.push(compressor_to_code(resolved_quality_compressor));
-    hdr.push(seq_compressor_to_code(args.advanced.sequence_compressor));
-    hdr.push(header_compressor_to_code(args.advanced.header_compressor));
-
-    // Quality modeling flag and model
-    if let Some((_, ref model)) = quality_model_opt {
-        hdr.push(1); // modeling enabled
-        let model_bytes = quality_model::serialize_model(model)?;
-        let model_len_u16 = u16::try_from(model_bytes.len())
-            .map_err(|_| anyhow::anyhow!("serialized quality model too large ({} bytes)", model_bytes.len()))?;
-        hdr.extend_from_slice(&model_len_u16.to_le_bytes());
-        hdr.extend_from_slice(&model_bytes);
-    } else {
-        hdr.push(0); // modeling disabled
+        // read_chunk_layout must reject the corrupted archive (CRC mismatch).
+        let result = crate::compression::read_chunk_layout(&corrupted);
+        assert!(result.is_err(), "corrupted ChunkDecodedSizes table must be rejected");
+        let err_msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err_msg.contains("crc"),
+            "error should mention CRC, got: {err_msg}"
+        );
     }
 
-    // Quality delta flag
-    hdr.push(if quality_delta_opt.is_some() { 1 } else { 0 });
-
-    // Quality dictionary
-    if let Some(ref dict) = quality_dict_opt {
-        hdr.push(1); // dictionary enabled
-        hdr.extend_from_slice(&(dict.len() as u32).to_le_bytes());
-        hdr.extend_from_slice(dict);
-    } else {
-        hdr.push(0); // dictionary disabled
-    }
-
-    // Read ID template metadata
-    let template_prefix_bytes = read_id_template.prefix.as_bytes();
-    hdr.extend_from_slice(&(template_prefix_bytes.len() as u16).to_le_bytes());
-    hdr.extend_from_slice(template_prefix_bytes);
-    hdr.push(if read_id_template.has_comment { 1 } else { 0 });
-
-    // Common comment (only when template is in use and has_comment is true)
-    if read_id_template.has_comment {
-        if let Some(ref cc) = read_id_template.common_comment {
-            let bytes = cc.as_bytes();
-            hdr.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-            hdr.extend_from_slice(bytes);
-        } else {
-            hdr.extend_from_slice(&0u16.to_le_bytes());
+    /// `verify --fast` must CRC-walk the ChunkDecodedSizes global block: flipping a
+    /// byte inside its payload must make fast verify return Err, while the un-corrupted
+    /// control verifies clean. (Without the global-block walk, the corruption slips
+    /// through fast verify — it only ever affected the decode-time table read.)
+    #[test]
+    fn verify_fast_crc_walks_decoded_sizes_global() {
+        use crate::compression::chunk_directory::{
+            GLOBAL_SENTINEL, StreamRole, read_v5_footer,
+        };
+        let d = tempfile::tempdir().unwrap();
+        let fq = d.path().join("in.fastq");
+        let mut s = String::new();
+        for i in 0..6 {
+            s.push_str(&format!("@read{i}\nACGTACGT\n+\nIIIIIIII\n"));
         }
+        std::fs::write(&fq, &s).unwrap();
+        let arc = d.path().join("out.qz");
+        let mut cfg = crate::cli::CompressConfig {
+            input: vec![fq],
+            output: arc.clone(),
+            ..Default::default()
+        };
+        cfg.advanced.chunk_records = 2; // 3 chunks → multi-chunk single-end
+        crate::compression::compress(&cfg).unwrap();
+
+        let verify_fast = |path: &std::path::Path| {
+            crate::compression::verify(&crate::cli::VerifyConfig {
+                input: path.to_path_buf(),
+                working_dir: d.path().to_path_buf(),
+                num_threads: 1,
+                fast: true,
+            })
+        };
+
+        // Control: the un-corrupted archive must pass fast verify.
+        verify_fast(&arc).expect("control archive must pass fast verify");
+
+        // Locate the ChunkDecodedSizes global entry via the footer and flip one byte
+        // inside its payload region (after the 12-byte frame header).
+        let header_end = crate::compression::test_front_header_end(&arc).unwrap();
+        let footer = read_v5_footer(&arc, header_end).unwrap();
+        let g = footer
+            .entries
+            .iter()
+            .find(|e| e.chunk_index == GLOBAL_SENTINEL && e.role == StreamRole::ChunkDecodedSizes)
+            .expect("ChunkDecodedSizes global present");
+        let payload_start = g.offset as usize + 12;
+        assert!(
+            payload_start < g.offset as usize + g.length as usize,
+            "payload region must be non-empty"
+        );
+        let mut bytes = std::fs::read(&arc).unwrap();
+        bytes[payload_start] ^= 0xFF;
+        let corrupted = d.path().join("corrupted.qz");
+        std::fs::write(&corrupted, &bytes).unwrap();
+
+        // Corrupted: fast verify must now fail on the ChunkDecodedSizes CRC.
+        let result = verify_fast(&corrupted);
+        assert!(
+            result.is_err(),
+            "corrupted ChunkDecodedSizes table must fail fast verify"
+        );
+        let err_msg = result.unwrap_err().to_string().to_lowercase();
+        assert!(
+            err_msg.contains("crc"),
+            "error should mention CRC, got: {err_msg}"
+        );
     }
-
-    // Stream lengths
-    hdr.extend_from_slice(&(stats.num_reads as u64).to_le_bytes());
-    hdr.extend_from_slice(&(headers.len() as u64).to_le_bytes());
-    hdr.extend_from_slice(&(sequences.len() as u64).to_le_bytes());
-    hdr.extend_from_slice(&(nmasks.len() as u64).to_le_bytes());
-    hdr.extend_from_slice(&(qualities.len() as u64).to_le_bytes());
-
-    // Write v2 prefix + header body + data streams
-    let header_size = V2_PREFIX_SIZE + hdr.len();
-    let mut output_file: Box<dyn Write> = if crate::cli::is_stdio_path(&args.output) {
-        Box::new(std::io::BufWriter::with_capacity(4 * 1024 * 1024, std::io::stdout().lock()))
-    } else {
-        Box::new(std::io::BufWriter::new(std::fs::File::create(&args.output)?))
-    };
-    output_file.write_all(&ARCHIVE_MAGIC)?;
-    output_file.write_all(&[ARCHIVE_VERSION, 0])?;
-    output_file.write_all(&(header_size as u32).to_le_bytes())?;
-    output_file.write_all(&hdr)?;
-
-    output_file.write_all(&headers)?;
-    output_file.write_all(&sequences)?;
-    output_file.write_all(&nmasks)?;
-    output_file.write_all(&qualities)?;
-    output_file.flush()?;
-
-    let metadata_size = header_size;
-    let total_compressed = headers.len() + sequences.len() + nmasks.len() + qualities.len() + metadata_size;
-
-    let elapsed = start_time.elapsed();
-    info!("Compression completed in {:.2}s", elapsed.as_secs_f64());
-
-    // Show compression stats
-    info!("Original size: {} bytes", stats.original_size);
-    info!("Compressed size: {} bytes", total_compressed);
-    info!("Compression ratio: {:.2}x", stats.original_size as f64 / total_compressed as f64);
-
-    // Show detailed stream breakdown
-    info!("Stream breakdown:");
-    info!("  Headers:   {} bytes ({:.1}%)", headers.len(), 100.0 * headers.len() as f64 / total_compressed as f64);
-    info!("  Sequences: {} bytes ({:.1}%)", sequences.len(), 100.0 * sequences.len() as f64 / total_compressed as f64);
-    info!("  N-masks:   {} bytes ({:.1}%)", nmasks.len(), 100.0 * nmasks.len() as f64 / total_compressed as f64);
-    info!("  Qualities: {} bytes ({:.1}%)", qualities.len(), 100.0 * qualities.len() as f64 / total_compressed as f64);
-    info!("  Metadata:  {} bytes ({:.1}%)", metadata_size, 100.0 * metadata_size as f64 / total_compressed as f64);
-
-    Ok(())
 }

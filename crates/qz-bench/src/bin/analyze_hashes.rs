@@ -1,8 +1,8 @@
+use qz_lib::compression::dna_utils::compute_min_syncmer_hash;
+use qz_lib::io::fastq::FastqReader;
 /// Quick analysis of syncmer hash frequency distribution in FASTQ data
 use std::collections::HashMap;
 use std::env;
-use qz_lib::io::fastq::FastqReader;
-use qz_lib::compression::dna_utils::compute_min_syncmer_hash;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -11,7 +11,10 @@ fn main() {
         std::process::exit(1);
     }
     let path = &args[1];
-    let max_reads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max_reads: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     let mut reader = FastqReader::from_path(path, false).expect("Failed to open FASTQ");
     let mut hash_counts: HashMap<u64, u32> = HashMap::new();
@@ -19,7 +22,9 @@ fn main() {
     let mut no_hash = 0usize;
 
     while let Some(rec) = reader.next().expect("read error") {
-        if total >= max_reads { break; }
+        if total >= max_reads {
+            break;
+        }
         total += 1;
         let h = compute_min_syncmer_hash(&rec.sequence);
         if h == u64::MAX {
@@ -39,7 +44,10 @@ fn main() {
     println!("Total reads: {}", total);
     println!("Reads with no hash (too short / all N): {}", no_hash);
     println!("Unique hashes: {}", num_unique);
-    println!("Hash-to-read ratio: {:.4}", num_unique as f64 / (total - no_hash) as f64);
+    println!(
+        "Hash-to-read ratio: {:.4}",
+        num_unique as f64 / (total - no_hash) as f64
+    );
     println!();
 
     // Frequency distribution
@@ -52,9 +60,14 @@ fn main() {
         let reads_covered = count as u64 * num_hashes as u64;
         cumulative_reads += reads_covered;
         if count <= 10 || count % 100 == 0 || num_hashes > 100 {
-            println!("  count={:<6} hashes={:<8} reads={:<10} cum_reads={:<10} ({:.1}%)",
-                count, num_hashes, reads_covered, cumulative_reads,
-                100.0 * cumulative_reads as f64 / total as f64);
+            println!(
+                "  count={:<6} hashes={:<8} reads={:<10} cum_reads={:<10} ({:.1}%)",
+                count,
+                num_hashes,
+                reads_covered,
+                cumulative_reads,
+                100.0 * cumulative_reads as f64 / total as f64
+            );
         }
     }
     println!();
@@ -73,8 +86,19 @@ fn main() {
     let mut cum = 0u64;
     for (i, (_hash, count)) in top.iter().enumerate() {
         cum += *count as u64;
-        if i < 20 || (i + 1) % 50 == 0 || i + 1 == 100 || i + 1 == 200 || i + 1 == 500 || i + 1 == 1000 {
-            println!("  top {:>5}: {:<8} reads ({:.2}%)", i + 1, cum, 100.0 * cum as f64 / total as f64);
+        if i < 20
+            || (i + 1) % 50 == 0
+            || i + 1 == 100
+            || i + 1 == 200
+            || i + 1 == 500
+            || i + 1 == 1000
+        {
+            println!(
+                "  top {:>5}: {:<8} reads ({:.2}%)",
+                i + 1,
+                cum,
+                100.0 * cum as f64 / total as f64
+            );
         }
     }
 }

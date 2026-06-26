@@ -1,0 +1,22 @@
+[package]
+name = "strobealign"
+version = "0.18.0-alpha"
+edition = "2024"
+autobins = false
+
+# Slimmed to the map-only core qz uses (index build + seeding + chaining → NAMs).
+# The upstream alignment stack (Smith-Waterman / block-aligner / SSW C), SAM output,
+# and CLI read I/O were removed — so block-aligner, the SSW C build (cc + ext/ssw),
+# clap, sigpipe, memchr and mimalloc are all gone with them.
+
+[dependencies]
+fastrand = { version = "2.0.1", default-features = false }
+log = { version = "0.4.20", features = ["std"]}
+flate2 = { version = "1.0", features = ["zlib-rs"]}
+thiserror = "2.0.11"
+rayon = "1.11.0"
+
+[dev-dependencies]
+temp-dir = "0.2.0"
+temp-file = "0.1.9"
+tempfile = "3"

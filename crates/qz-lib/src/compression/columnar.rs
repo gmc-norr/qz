@@ -3,13 +3,10 @@
 /// Strategy:
 /// 1. Separate FASTQ into 3 streams (headers, sequences, quality)
 /// 2. Encode each optimally (2-bit DNA, quality binning)
-/// 3. Compress each with Zstd
+/// 3. Compress each with BSC
 /// 4. No reordering required!
-
-use crate::io::FastqRecord;
 use anyhow::Result;
 use std::io::Write;
-use tracing::info;
 
 /// Quality binning schemes
 #[derive(Debug, Clone, Copy)]
@@ -52,16 +49,18 @@ impl QualityBinning {
                 }
             }
             QualityBinning::Binary { threshold } => {
-                if phred >= *threshold { 1 } else { 0 }
-            }
-            QualityBinning::FourLevel => {
-                match phred {
-                    0..=9 => 0,
-                    10..=19 => 1,
-                    20..=29 => 2,
-                    _ => 3,
+                if phred >= *threshold {
+                    1
+                } else {
+                    0
                 }
             }
+            QualityBinning::FourLevel => match phred {
+                0..=9 => 0,
+                10..=19 => 1,
+                20..=29 => 2,
+                _ => 3,
+            },
             QualityBinning::None => phred.min(127),
         }
     }
@@ -84,33 +83,60 @@ impl QualityBinning {
                 }
             }
             QualityBinning::Binary { threshold } => {
-                if encoded == 1 { 40 } else { *threshold / 2 }
-            }
-            QualityBinning::FourLevel => {
-                match encoded {
-                    0 => 6,
-                    1 => 15,
-                    2 => 25,
-                    3 => 37,
-                    _ => 37,
+                if encoded == 1 {
+                    40
+                } else {
+                    *threshold / 2
                 }
             }
+            QualityBinning::FourLevel => match encoded {
+                0 => 6,
+                1 => 15,
+                2 => 25,
+                3 => 37,
+                _ => 37,
+            },
             QualityBinning::None => encoded,
         }
     }
 }
 
-/// Pack quality scores with variable bit width
-pub fn pack_qualities(qualities: &[u8], binning: QualityBinning) -> Vec<u8> {
+/// Pack quality scores with variable bit width.
+///
+/// For the lossless `None` binning (7-bit), a quality byte whose Phred value
+/// exceeds 127 (ASCII > 160 — outside valid Phred+33 FASTQ) cannot be
+/// represented and would otherwise be silently clamped; this is rejected so the
+/// "lossless" contract is never silently violated. Lossy binnings clamp by
+/// design and never error.
+pub fn pack_qualities(qualities: &[u8], binning: QualityBinning) -> Result<Vec<u8>> {
     let bits_per_qual = binning.bits_per_quality();
 
-    let mut packed = Vec::with_capacity((qualities.len() * bits_per_qual + 7) / 8);
+    let mut packed = Vec::with_capacity((qualities.len() * bits_per_qual).div_ceil(8));
     let mut buffer = 0u64;
     let mut bits_in_buffer = 0;
 
     for &qual_ascii in qualities {
+        // Reject sub-33 bytes BEFORE the saturating_sub below silently collapses
+        // them to phred 0 (which would round-trip back to '!' = 33 on decode —
+        // silent lossless violation). Mirror the high-end guard so the "lossless"
+        // contract is never violated silently for out-of-spec / corrupt quality lines.
+        if matches!(binning, QualityBinning::None) && qual_ascii < 33 {
+            anyhow::bail!(
+                "lossless quality packing cannot represent quality byte {} (< 33); \
+                 not valid Phred+33 FASTQ quality",
+                qual_ascii
+            );
+        }
         // Convert ASCII to Phred (assuming Phred+33 encoding)
         let phred = qual_ascii.saturating_sub(33);
+        if matches!(binning, QualityBinning::None) && phred > 127 {
+            anyhow::bail!(
+                "lossless quality packing cannot represent quality byte {} (phred {} > 127); \
+                 not valid Phred+33 FASTQ quality",
+                qual_ascii,
+                phred
+            );
+        }
         let encoded = binning.encode(phred);
 
         // Add to buffer
@@ -130,7 +156,7 @@ pub fn pack_qualities(qualities: &[u8], binning: QualityBinning) -> Vec<u8> {
         packed.push((buffer & 0xFF) as u8);
     }
 
-    packed
+    Ok(packed)
 }
 
 /// Unpack quality scores
@@ -209,17 +235,9 @@ pub fn unpack_qualities_to_writer<W: Write + ?Sized>(
     Ok(())
 }
 
-/// Write variable-length integer
-fn write_varint<W: Write>(writer: &mut W, mut value: usize) -> std::io::Result<()> {
-    while value >= 0x80 {
-        writer.write_all(&[((value & 0x7F) | 0x80) as u8])?;
-        value >>= 7;
-    }
-    writer.write_all(&[value as u8])
-}
-
 /// Columnar compression statistics
 #[derive(Debug)]
+#[allow(dead_code)] // some fields are written for logging but not read back
 pub struct ColumnarStats {
     pub num_reads: usize,
     pub total_bases: usize,
@@ -230,107 +248,31 @@ pub struct ColumnarStats {
     pub total_compressed: usize,
 }
 
-impl ColumnarStats {
-    pub fn compression_ratio(&self) -> f64 {
-        if self.total_compressed > 0 {
-            self.original_size as f64 / self.total_compressed as f64
-        } else {
-            0.0
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pack_qualities_none_is_lossless_or_errors() {
+        // Lossless (None) packing of a valid Phred+33 quality string round-trips.
+        let quals = b"IIIIB!~"; // ASCII 33..126 range
+        let packed = pack_qualities(quals, QualityBinning::None).unwrap();
+        let unpacked = unpack_qualities(&packed, quals.len(), QualityBinning::None);
+        assert_eq!(unpacked, quals);
+
+        // A quality byte that can't be represented losslessly (phred > 127,
+        // i.e. ASCII > 160 — not valid FASTQ) must error, not silently clamp.
+        let bad = [200u8]; // phred 167
+        assert!(pack_qualities(&bad, QualityBinning::None).is_err());
+
+        // A sub-33 byte (e.g. ASCII space 32, or any control/corrupt byte) used
+        // to saturate to phred 0 and round-trip back to '!' (33) — silent data
+        // loss. It must now error instead of corrupting.
+        for bad_byte in [0u8, 10, 31, 32] {
+            assert!(
+                pack_qualities(&[bad_byte], QualityBinning::None).is_err(),
+                "sub-33 byte {bad_byte} should be rejected, not silently clamped"
+            );
         }
     }
 }
-
-/// Compress FASTQ records using columnar approach with N-mask encoding
-pub fn compress_columnar(
-    records: &[FastqRecord],
-    binning: QualityBinning,
-    compression_level: i32,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>, ColumnarStats)> {
-    use crate::compression::n_mask::encode_with_n_mask;
-
-    info!("Compressing {} records using columnar method with N-mask encoding", records.len());
-
-    let mut stats = ColumnarStats {
-        num_reads: records.len(),
-        total_bases: 0,
-        original_size: 0,
-        headers_size: 0,
-        sequences_size: 0,
-        qualities_size: 0,
-        total_compressed: 0,
-    };
-
-    // Stream 1: Headers with length prefixes
-    let mut header_stream = Vec::new();
-    for record in records {
-        write_varint(&mut header_stream, record.id.len())?;
-        header_stream.write_all(&record.id)?;
-        stats.original_size += record.id.len() + 1; // +1 for @ line
-    }
-
-    // Stream 2: Sequences (2-bit encoded with N-mask)
-    let mut sequence_stream = Vec::new();
-    let mut nmask_stream = Vec::new();
-    for record in records {
-        let encoding = encode_with_n_mask(&record.sequence);
-        write_varint(&mut sequence_stream, encoding.length)?;
-        sequence_stream.write_all(&encoding.sequence_2bit)?;
-        nmask_stream.write_all(&encoding.n_mask)?;
-        stats.total_bases += record.sequence.len();
-        stats.original_size += record.sequence.len() + 1; // +1 for newline
-    }
-
-    // Stream 3: Qualities (binned) with length prefixes
-    let mut quality_stream = Vec::new();
-    for record in records {
-        if let Some(qual) = &record.quality {
-            write_varint(&mut quality_stream, qual.len())?;
-            let packed = pack_qualities(qual, binning);
-            quality_stream.write_all(&packed)?;
-            stats.original_size += qual.len() + 2; // +2 for + line and qual line
-        }
-    }
-
-    // Compress each stream with adaptive levels
-    // Headers: highly redundant, benefit from higher levels (min level 15)
-    let header_level = std::cmp::min(std::cmp::max(compression_level + 6, 15), 19);
-    let headers_compressed = compress_stream(&header_stream, header_level)?;
-
-    // Sequences: already 2-bit encoded, use user's level
-    let sequences_compressed = compress_stream(&sequence_stream, compression_level)?;
-
-    // N-masks: very small data, always use maximum compression
-    let nmasks_compressed = compress_stream(&nmask_stream, 19)?;
-
-    // Qualities: binned qualities compress better, add +3 for binned modes
-    let quality_level = match binning {
-        QualityBinning::None => compression_level,
-        _ => std::cmp::min(compression_level + 3, 19), // Binned qualities are more compressible
-    };
-    let qualities_compressed = compress_stream(&quality_stream, quality_level)?;
-
-    stats.headers_size = headers_compressed.len();
-    stats.sequences_size = sequences_compressed.len() + nmasks_compressed.len();
-    stats.qualities_size = qualities_compressed.len();
-    stats.total_compressed = stats.headers_size + stats.sequences_size + stats.qualities_size;
-
-    info!(
-        "Columnar compression: {:.2}x ({} -> {} bytes)",
-        stats.compression_ratio(),
-        stats.original_size,
-        stats.total_compressed
-    );
-    info!(
-        "  Headers: {} bytes, Sequences: {} bytes, Qualities: {} bytes",
-        stats.headers_size, stats.sequences_size, stats.qualities_size
-    );
-
-    Ok((headers_compressed, sequences_compressed, nmasks_compressed, qualities_compressed, stats))
-}
-
-/// Compress a byte stream with zstd at specified level
-fn compress_stream(data: &[u8], level: i32) -> Result<Vec<u8>> {
-    zstd::bulk::compress(data, level)
-        .map_err(|e| anyhow::anyhow!("Zstd compression failed: {}", e))
-}
-

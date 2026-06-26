@@ -1,8 +1,14 @@
 # Rust
 target/
+target-cuda/
 **/*.rs.bk
 *.pdb
-Cargo.lock
+*.rlib
+# Cargo.lock IS tracked: qz/bz ship binaries, so the lockfile is committed for
+# reproducible builds (mirrors the committed pixi.lock).
+
+# Git worktrees
+.worktrees/
 
 # IDE / build
 .vscode/
@@ -16,6 +22,7 @@ cmake-build-*/
 # Test data and outputs
 test_data/
 *.qz
+!crates/qz-lib/tests/fixtures/*.qz
 decompressed*.fastq
 test_*_decompressed.fastq
 target/
@@ -28,15 +35,29 @@ real_data/
 demo/
 
 # Third-party tools
-third_party/
+# libbsc and htscodecs are both vendored in-tree (see their VENDORED.md files).
+# htscodecs is a minimal subset (only the fqzcomp_qual + utils TUs qz compiles).
+third_party/*
+!third_party/libbsc
+!third_party/htscodecs
 ideas/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
 
 manuscript.md
-scripts/bz_optimizer/__pycache__/sensitivity.cpython-312.pyc
-scripts/bz_optimizer/__pycache__/population.cpython-312.pyc
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Compiler crash dumps
+rustc-ice-*.txt
+
+# License/provenance scan outputs (regenerable; don't commit)
+scanoss_results.json
+scan_results.json
+swh_results.json
 scripts/bz_optimizer/__pycache__/main.cpython-312.pyc
 scripts/bz_optimizer/__pycache__/genome.cpython-312.pyc
 scripts/bz_optimizer/__pycache__/ga.cpython-312.pyc
@@ -47,3 +68,19 @@ scripts/bz_optimizer/__pycache__/__init__.cpython-312.pyc
 perf.data.old
 perf.data
 flamegraph.svg
+.claude/scheduled_tasks.lock
+
+# Detached headless-claude run scaffolding
+.detached/
+
+# Internal / sensitive docs — kept locally, NEVER tracked or published.
+# (patent/FTO analysis, internal review reports, internal status index, etc.)
+# CAVEAT: untracking here cleans only the CURRENT tip. These files remain in past
+# commits, so a full-history push would still expose them. For a public release,
+# publish a clean snapshot (orphan/squash), not the 696-commit internal history.
+/private/
+
+# CLAUDE.md is the internal AI-development playbook (internal lessons/conventions).
+# Kept at the repo root (Claude Code reads it from there) but untracked so it is
+# not published — same intent as /private/, without breaking the tooling path.
+/CLAUDE.md

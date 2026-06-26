@@ -14,7 +14,6 @@
 ///   E. Arithmetic coding with k-mer prior (on subset for validation)
 ///
 /// Usage: cargo run --release --bin bench_kmer_prior [fastq_path]
-
 use std::io::BufRead;
 use std::time::Instant;
 
@@ -147,11 +146,7 @@ impl KmerTable {
 
         // Sort bases by count descending, tie-break by base index ascending
         let mut order = [0u8, 1, 2, 3];
-        order.sort_by(|&a, &b| {
-            c[b as usize]
-                .cmp(&c[a as usize])
-                .then(a.cmp(&b))
-        });
+        order.sort_by(|&a, &b| c[b as usize].cmp(&c[a as usize]).then(a.cmp(&b)));
 
         order[rank as usize]
     }
@@ -326,7 +321,7 @@ fn minimizer_sort_key(seq: &[u8]) -> u64 {
                 }
             };
             fwd = (fwd << 2) | v;
-            rev = rev | ((3 - v) << (2 * j));
+            rev |= (3 - v) << (2 * j);
         }
 
         if valid {
@@ -451,7 +446,11 @@ fn main() {
     for k in 1..=max_k {
         let mem = (1usize << (2 * k)) * 4 * 4; // bytes
         if mem > 2_000_000_000 {
-            eprintln!("  k={}: table too large ({} MB), skipping", k, mem / (1024 * 1024));
+            eprintln!(
+                "  k={}: table too large ({} MB), skipping",
+                k,
+                mem / (1024 * 1024)
+            );
             break;
         }
 
@@ -525,23 +524,30 @@ fn main() {
             let decoded = rank_decode_sequence(&recoded[i], table);
             assert_eq!(
                 decoded,
-                sequences[i].iter().map(|&b| {
-                    match b {
-                        b'A' | b'a' => b'A',
-                        b'C' | b'c' => b'C',
-                        b'G' | b'g' => b'G',
-                        b'T' | b't' => b'T',
-                        _ => b'A',
-                    }
-                }).collect::<Vec<u8>>(),
+                sequences[i]
+                    .iter()
+                    .map(|&b| {
+                        match b {
+                            b'A' | b'a' => b'A',
+                            b'C' | b'c' => b'C',
+                            b'G' | b'g' => b'G',
+                            b'T' | b't' => b'T',
+                            _ => b'A',
+                        }
+                    })
+                    .collect::<Vec<u8>>(),
                 "Roundtrip failed for read {}",
                 i
             );
         }
     }
 
-    eprintln!("  Best k={} → {} bytes ({:.3}x)", best_k, best_rank_size,
-        raw_size as f64 / best_rank_size as f64);
+    eprintln!(
+        "  Best k={} → {} bytes ({:.3}x)",
+        best_k,
+        best_rank_size,
+        raw_size as f64 / best_rank_size as f64
+    );
 
     // ── Strategy D: Sorted + rank-recoded + BSC ──────────────────────────
 
@@ -569,7 +575,10 @@ fn main() {
     drop(perm_compressed);
 
     // Sorted sequences reference
-    let sorted_seqs: Vec<&[u8]> = sorted_indices.iter().map(|&i| sequences[i].as_slice()).collect();
+    let sorted_seqs: Vec<&[u8]> = sorted_indices
+        .iter()
+        .map(|&i| sequences[i].as_slice())
+        .collect();
 
     // Sorted baseline (no recoding)
     let sorted_concat: Vec<u8> = sorted_seqs.iter().flat_map(|s| s.iter().copied()).collect();
@@ -633,9 +642,8 @@ fn main() {
         let t = Instant::now();
 
         // Train per-bin tables
-        let mut bin_tables: Vec<KmerTable> = (0..num_pos_bins)
-            .map(|_| KmerTable::new(test_k))
-            .collect();
+        let mut bin_tables: Vec<KmerTable> =
+            (0..num_pos_bins).map(|_| KmerTable::new(test_k)).collect();
 
         for seq in &sequences {
             if seq.len() <= test_k {
@@ -796,8 +804,7 @@ fn main() {
     eprintln!("\n=== Summary ===");
     eprintln!(
         "  Raw:                         {:>12} bytes  {:.4} bpb",
-        raw_size,
-        8.0
+        raw_size, 8.0
     );
     eprintln!(
         "  A. Baseline BSC:             {:>12} bytes  {:.4} bpb  ({:.3}x)",

@@ -7,13 +7,21 @@ license.workspace = true
 description = "Benchmarking tools for QZ FASTQ compression"
 
 [dependencies]
-# Benches exercise experimental encoders (e.g. compress_sequences_template_hybrid)
-# that production builds intentionally do not expose.
-qz-lib = { workspace = true, features = ["experimental"] }
+qz-lib = { workspace = true }
+strobealign = { path = "../strobealign" }
+mimalloc = "0.1.50"
 rayon.workspace = true
 rustc-hash.workspace = true
 syncmers.workspace = true
 anyhow.workspace = true
+tempfile.workspace = true
+libc.workspace = true
+flate2.workspace = true
+memchr = "2.8"
+
+[[bin]]
+name = "bench_map_only"
+path = "src/bin/bench_map_only.rs"
 
 [[bin]]
 name = "analyze_hashes"
@@ -32,12 +40,16 @@ name = "bench_columnar"
 path = "src/bin/bench_columnar.rs"
 
 [[bin]]
-name = "bench_full_pipeline"
-path = "src/bin/bench_full_pipeline.rs"
+name = "bench_fqz_flags"
+path = "src/bin/bench_fqz_flags.rs"
 
 [[bin]]
-name = "bench_greedy_contig"
-path = "src/bin/bench_greedy_contig.rs"
+name = "bench_fqz_strand"
+path = "src/bin/bench_fqz_strand.rs"
+
+[[bin]]
+name = "bench_fastr_bsc"
+path = "src/bin/bench_fastr_bsc.rs"
 
 [[bin]]
 name = "bench_header_col"
@@ -48,29 +60,92 @@ name = "bench_kmer_prior"
 path = "src/bin/bench_kmer_prior.rs"
 
 [[bin]]
-name = "bench_openzl_graphs"
-path = "src/bin/bench_openzl_graphs.rs"
-
-[[bin]]
-name = "bench_quality_ctx"
-path = "src/bin/bench_quality_ctx.rs"
-
-[[bin]]
-name = "bench_quality_reorder"
-path = "src/bin/bench_quality_reorder.rs"
-
-[[bin]]
-name = "bench_sequence_strategies"
-path = "src/bin/bench_sequence_strategies.rs"
+name = "bench_rc_orientation"
+path = "src/bin/bench_rc_orientation.rs"
 
 [[bin]]
 name = "bench_sort_strategies"
 path = "src/bin/bench_sort_strategies.rs"
 
+
 [[bin]]
-name = "bench_template"
-path = "src/bin/bench_template.rs"
+name = "bench_bounded_streaming"
+path = "src/bin/bench_bounded_streaming.rs"
+
+[[bin]]
+name = "bench_bsc_per_stream"
+path = "src/bin/bench_bsc_per_stream.rs"
+
+[[bin]]
+name = "bench_ref_decode_mem"
+path = "src/bin/bench_ref_decode_mem.rs"
 
 [[bin]]
 name = "bench_qctx_blocksize"
 path = "../../benchmarks/bench_qctx_blocksize.rs"
+
+[[bin]]
+name = "bench_reorder_cluster"
+path = "src/bin/bench_reorder_cluster.rs"
+
+[[bin]]
+name = "bench_reorder_cluster_ext"
+path = "src/bin/bench_reorder_cluster_ext.rs"
+
+[[bin]]
+name = "bench_bsc_raw"
+path = "src/bin/bench_bsc_raw.rs"
+
+[[bin]]
+name = "bench_mst"
+path = "src/bin/bench_mst.rs"
+
+[[bin]]
+name = "bench_rolz"
+path = "src/bin/bench_rolz.rs"
+
+[[bin]]
+name = "bench_bsc_concurrent"
+path = "src/bin/bench_bsc_concurrent.rs"
+
+[[bin]]
+name = "bench_rc_canon"
+path = "src/bin/bench_rc_canon.rs"
+
+[[bin]]
+name = "bench_canon_resort"
+path = "src/bin/bench_canon_resort.rs"
+
+[[bin]]
+name = "bench_reorder_fused"
+path = "src/bin/bench_reorder_fused.rs"
+
+[[bin]]
+name = "bench_reorder_cluster_pe_ext"
+path = "src/bin/bench_reorder_cluster_pe_ext.rs"
+
+[[bin]]
+name = "bench_reorder_cluster_fused_bsc"
+path = "src/bin/bench_reorder_cluster_fused_bsc.rs"
+
+[[bin]]
+name = "bench_reorder_cluster_fused_bp"
+path = "src/bin/bench_reorder_cluster_fused_bp.rs"
+
+[[bin]]
+name = "bench_reorder_cluster_fused_pool"
+path = "src/bin/bench_reorder_cluster_fused_pool.rs"
+
+# qz-bench is throwaway profiling/benchmark code, not shipped. It mirrors the
+# workspace clippy allows and additionally permits a few patterns that are fine
+# in quick benchmark drivers (manual counters, field reassignment, etc.).
+[lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+explicit_counter_loop = "allow"
+unnecessary_sort_by = "allow"
+field_reassign_with_default = "allow"
+
+[lints.rust]
+unused_parens = "allow"

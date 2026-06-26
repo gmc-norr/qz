@@ -22,12 +22,7 @@ pub fn quantize_quality<'a>(quality: &'a [u8], mode: QualityMode) -> Cow<'a, [u8
         QualityMode::IlluminaBin => Cow::Owned(quantize_illumina(quality)),
         QualityMode::Illumina4 => Cow::Owned(quantize_four_level(quality)),
         QualityMode::Binary => Cow::Owned(quantize_binary(quality, 20, 40, 6)),
-        QualityMode::Qvz => {
-            unimplemented!("QVZ quality mode is not yet implemented");
-        }
-        QualityMode::Discard => {
-            Cow::Owned(vec![b'!'; quality.len()])
-        }
+        QualityMode::Discard => Cow::Owned(vec![b'!'; quality.len()]),
     }
 }
 
@@ -36,9 +31,9 @@ fn quantize_four_level(quality: &[u8]) -> Vec<u8> {
     quality
         .iter()
         .map(|&qv| {
-            let phred = (qv as i32).saturating_sub(33).max(0).min(93);
+            let phred = (qv as i32).saturating_sub(33).clamp(0, 93);
             let binned = if phred < 10 {
-                6  // Low quality
+                6 // Low quality
             } else if phred < 20 {
                 15 // Medium quality
             } else if phred < 30 {
@@ -84,7 +79,10 @@ mod tests {
     #[test]
     fn test_lossless() {
         let quality = b"IIIIIIII";
-        assert_eq!(quantize_quality(quality, QualityMode::Lossless).as_ref(), quality);
+        assert_eq!(
+            quantize_quality(quality, QualityMode::Lossless).as_ref(),
+            quality
+        );
     }
 
     #[test]

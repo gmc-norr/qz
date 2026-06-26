@@ -22,7 +22,10 @@ fn main() {
         std::process::exit(1);
     }
     let path = &args[1];
-    let max_reads: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let max_reads: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     // ================================================================
     // Load headers
@@ -79,8 +82,8 @@ fn main() {
     println!("=== 2. Columnar + per-column BSC ===");
     let header_refs: Vec<&str> = headers.iter().map(|h| h.as_str()).collect();
     let t0 = Instant::now();
-    let compressed = header_col::compress_headers_columnar(&header_refs)
-        .expect("columnar compress failed");
+    let compressed =
+        header_col::compress_headers_columnar(&header_refs).expect("columnar compress failed");
     let col_time = t0.elapsed().as_secs_f64();
     let col_size = compressed.len();
     println!(
@@ -184,25 +187,51 @@ fn main() {
     // ================================================================
     println!("\n=== Summary ===");
     println!("  Raw ASCII:       {:>10} bytes", raw_size);
-    println!("  1. Raw+BSC:      {:>10} bytes ({:.2}x) [{:.2}s]", bsc_size, raw_size as f64 / bsc_size as f64, bsc_time);
-    println!("  2. Columnar:     {:>10} bytes ({:.2}x) [{:.2}s]", col_size, raw_size as f64 / col_size as f64, col_time);
+    println!(
+        "  1. Raw+BSC:      {:>10} bytes ({:.2}x) [{:.2}s]",
+        bsc_size,
+        raw_size as f64 / bsc_size as f64,
+        bsc_time
+    );
+    println!(
+        "  2. Columnar:     {:>10} bytes ({:.2}x) [{:.2}s]",
+        col_size,
+        raw_size as f64 / col_size as f64,
+        col_time
+    );
     if let Some((packed_data, meta_size)) = pack_sra_columns(&headers) {
         let packed_compressed = bsc::compress_parallel_adaptive(&packed_data).expect("BSC failed");
         let packed_size = packed_compressed.len() + meta_size;
-        println!("  3. Packed:       {:>10} bytes ({:.2}x)", packed_size, raw_size as f64 / packed_size as f64);
+        println!(
+            "  3. Packed:       {:>10} bytes ({:.2}x)",
+            packed_size,
+            raw_size as f64 / packed_size as f64
+        );
     }
     if let Some((packed_data, meta_size)) = pack_sra_columns_delta(&headers) {
         let packed_compressed = bsc::compress_parallel_adaptive(&packed_data).expect("BSC failed");
         let packed_size = packed_compressed.len() + meta_size;
-        println!("  4. Packed+delta: {:>10} bytes ({:.2}x)", packed_size, raw_size as f64 / packed_size as f64);
+        println!(
+            "  4. Packed+delta: {:>10} bytes ({:.2}x)",
+            packed_size,
+            raw_size as f64 / packed_size as f64
+        );
     }
     if let Some((packed_data, meta_size)) = pack_sra_columns_delta_varint(&headers) {
         let packed_compressed = bsc::compress_parallel_adaptive(&packed_data).expect("BSC failed");
         let packed_size = packed_compressed.len() + meta_size;
-        println!("  5. Packed+dv:    {:>10} bytes ({:.2}x)", packed_size, raw_size as f64 / packed_size as f64);
+        println!(
+            "  5. Packed+dv:    {:>10} bytes ({:.2}x)",
+            packed_size,
+            raw_size as f64 / packed_size as f64
+        );
     }
     if let Some((total_size, _)) = pack_sra_columns_parallel_bsc(&headers) {
-        println!("  6. Par-col BSC:  {:>10} bytes ({:.2}x)", total_size, raw_size as f64 / total_size as f64);
+        println!(
+            "  6. Par-col BSC:  {:>10} bytes ({:.2}x)",
+            total_size,
+            raw_size as f64 / total_size as f64
+        );
     }
 }
 
@@ -272,11 +301,16 @@ fn pack_sra_columns(headers: &[String]) -> Option<(Vec<u8>, usize)> {
 
         // Extract combo (first 3 colon fields)
         let combo_fields: Vec<&str> = combo_str.split(':').collect();
-        let combo_key = format!("{}:{}:{}", combo_fields[0], combo_fields[1], combo_fields[2]);
+        let combo_key = format!(
+            "{}:{}:{}",
+            combo_fields[0], combo_fields[1], combo_fields[2]
+        );
         let idx = if let Some(&idx) = combo_map.get(&combo_key) {
             idx
         } else {
-            if combos.len() >= 255 { return None; }
+            if combos.len() >= 255 {
+                return None;
+            }
             let idx = combos.len() as u8;
             combos.push(combo_key.clone());
             combo_map.insert(combo_key, idx);
@@ -292,7 +326,9 @@ fn pack_sra_columns(headers: &[String]) -> Option<(Vec<u8>, usize)> {
     }
 
     // Concatenate all columns in order (column-major)
-    let mut packed = Vec::with_capacity(read_nums.len() + combo_idxs.len() + lanes.len() + tiles.len() + xs.len() + ys.len());
+    let mut packed = Vec::with_capacity(
+        read_nums.len() + combo_idxs.len() + lanes.len() + tiles.len() + xs.len() + ys.len(),
+    );
     packed.extend_from_slice(&read_nums);
     packed.extend_from_slice(&combo_idxs);
     packed.extend_from_slice(&lanes);
@@ -327,11 +363,16 @@ fn pack_sra_columns_delta(headers: &[String]) -> Option<(Vec<u8>, usize)> {
         let (read_num, combo_str, lane, tile, x, y) = parse_sra_header(h)?;
 
         let combo_fields: Vec<&str> = combo_str.split(':').collect();
-        let combo_key = format!("{}:{}:{}", combo_fields[0], combo_fields[1], combo_fields[2]);
+        let combo_key = format!(
+            "{}:{}:{}",
+            combo_fields[0], combo_fields[1], combo_fields[2]
+        );
         let idx = if let Some(&idx) = combo_map.get(&combo_key) {
             idx
         } else {
-            if combos.len() >= 255 { return None; }
+            if combos.len() >= 255 {
+                return None;
+            }
             let idx = combos.len() as u8;
             combos.push(combo_key.clone());
             combo_map.insert(combo_key, idx);
@@ -354,7 +395,9 @@ fn pack_sra_columns_delta(headers: &[String]) -> Option<(Vec<u8>, usize)> {
         ys.extend_from_slice(&delta_y.to_le_bytes());
     }
 
-    let mut packed = Vec::with_capacity(read_nums.len() + combo_idxs.len() + lanes.len() + tiles.len() + xs.len() + ys.len());
+    let mut packed = Vec::with_capacity(
+        read_nums.len() + combo_idxs.len() + lanes.len() + tiles.len() + xs.len() + ys.len(),
+    );
     packed.extend_from_slice(&read_nums);
     packed.extend_from_slice(&combo_idxs);
     packed.extend_from_slice(&lanes);
@@ -382,11 +425,16 @@ fn pack_sra_columns_parallel_bsc(headers: &[String]) -> Option<(usize, f64)> {
     for h in headers {
         let (read_num, combo_str, lane, tile, x, y) = parse_sra_header(h)?;
         let combo_fields: Vec<&str> = combo_str.split(':').collect();
-        let combo_key = format!("{}:{}:{}", combo_fields[0], combo_fields[1], combo_fields[2]);
+        let combo_key = format!(
+            "{}:{}:{}",
+            combo_fields[0], combo_fields[1], combo_fields[2]
+        );
         let idx = if let Some(&idx) = combo_map.get(&combo_key) {
             idx
         } else {
-            if combos.len() >= 255 { return None; }
+            if combos.len() >= 255 {
+                return None;
+            }
             let idx = combos.len() as u8;
             combos.push(combo_key.clone());
             combo_map.insert(combo_key, idx);
@@ -407,24 +455,37 @@ fn pack_sra_columns_parallel_bsc(headers: &[String]) -> Option<(usize, f64)> {
     // Compress all 6 columns in parallel using rayon
     let (c_rn, (c_ci, (c_ln, (c_ti, (c_xs, c_ys))))) = rayon::join(
         || bsc::compress_parallel_adaptive(&read_nums),
-        || rayon::join(
-            || bsc::compress_parallel_adaptive(&combo_idxs),
-            || rayon::join(
-                || bsc::compress_parallel_adaptive(&lanes),
-                || rayon::join(
-                    || bsc::compress_parallel_adaptive(&tiles),
-                    || rayon::join(
-                        || bsc::compress_parallel_adaptive(&xs),
-                        || bsc::compress_parallel_adaptive(&ys),
-                    ),
-                ),
-            ),
-        ),
+        || {
+            rayon::join(
+                || bsc::compress_parallel_adaptive(&combo_idxs),
+                || {
+                    rayon::join(
+                        || bsc::compress_parallel_adaptive(&lanes),
+                        || {
+                            rayon::join(
+                                || bsc::compress_parallel_adaptive(&tiles),
+                                || {
+                                    rayon::join(
+                                        || bsc::compress_parallel_adaptive(&xs),
+                                        || bsc::compress_parallel_adaptive(&ys),
+                                    )
+                                },
+                            )
+                        },
+                    )
+                },
+            )
+        },
     );
     let elapsed = t0.elapsed().as_secs_f64();
 
-    let total = c_rn.ok()?.len() + c_ci.ok()?.len() + c_ln.ok()?.len()
-        + c_ti.ok()?.len() + c_xs.ok()?.len() + c_ys.ok()?.len() + meta_size;
+    let total = c_rn.ok()?.len()
+        + c_ci.ok()?.len()
+        + c_ln.ok()?.len()
+        + c_ti.ok()?.len()
+        + c_xs.ok()?.len()
+        + c_ys.ok()?.len()
+        + meta_size;
 
     Some((total, elapsed))
 }
@@ -454,11 +515,16 @@ fn pack_sra_columns_delta_varint(headers: &[String]) -> Option<(Vec<u8>, usize)>
         let (read_num, combo_str, lane, tile, x, y) = parse_sra_header(h)?;
 
         let combo_fields: Vec<&str> = combo_str.split(':').collect();
-        let combo_key = format!("{}:{}:{}", combo_fields[0], combo_fields[1], combo_fields[2]);
+        let combo_key = format!(
+            "{}:{}:{}",
+            combo_fields[0], combo_fields[1], combo_fields[2]
+        );
         let idx = if let Some(&idx) = combo_map.get(&combo_key) {
             idx
         } else {
-            if combos.len() >= 255 { return None; }
+            if combos.len() >= 255 {
+                return None;
+            }
             let idx = combos.len() as u8;
             combos.push(combo_key.clone());
             combo_map.insert(combo_key, idx);
@@ -485,7 +551,7 @@ fn pack_sra_columns_delta_varint(headers: &[String]) -> Option<(Vec<u8>, usize)>
     write_varint(&mut packed, rn_stream.len());
     packed.extend_from_slice(&rn_stream);
     packed.extend_from_slice(&combo_idxs); // fixed size = n
-    packed.extend_from_slice(&lanes);       // fixed size = n
+    packed.extend_from_slice(&lanes); // fixed size = n
     write_varint(&mut packed, tile_stream.len());
     packed.extend_from_slice(&tile_stream);
     write_varint(&mut packed, x_stream.len());

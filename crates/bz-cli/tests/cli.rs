@@ -15,22 +15,17 @@ fn bz() -> Command {
 
 #[test]
 fn help_lists_all_subcommands() {
-    bz()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(
-            predicate::str::contains("compress")
-                .and(predicate::str::contains("decompress"))
-                .and(predicate::str::contains("extract"))
-                .and(predicate::str::contains("verify")),
-        );
+    bz().arg("--help").assert().success().stdout(
+        predicate::str::contains("compress")
+            .and(predicate::str::contains("decompress"))
+            .and(predicate::str::contains("extract"))
+            .and(predicate::str::contains("verify")),
+    );
 }
 
 #[test]
 fn version_prints_a_version_string() {
-    bz()
-        .arg("--version")
+    bz().arg("--version")
         .assert()
         .success()
         .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
@@ -38,8 +33,7 @@ fn version_prints_a_version_string() {
 
 #[test]
 fn missing_input_errors_out() {
-    bz()
-        .args(["compress", "-i", "/nonexistent/path.bam", "-o", "/tmp/x.bz"])
+    bz().args(["compress", "-i", "/nonexistent/path.bam", "-o", "/tmp/x.bz"])
         .assert()
         .failure();
 }
@@ -55,8 +49,7 @@ fn refuses_to_overwrite_compress_output_without_force() {
     let dummy_input = dir.path().join("dummy.bam");
     fs::write(&dummy_input, b"placeholder").unwrap();
 
-    bz()
-        .args(["compress", "-i"])
+    bz().args(["compress", "-i"])
         .arg(&dummy_input)
         .args(["-o"])
         .arg(&dummy_output)
@@ -78,8 +71,7 @@ fn refuses_to_overwrite_extract_output_without_force() {
     let dummy_input = dir.path().join("dummy.bam");
     fs::write(&dummy_input, b"placeholder").unwrap();
 
-    bz()
-        .args(["extract", "-i"])
+    bz().args(["extract", "-i"])
         .arg(&dummy_input)
         .args(["-o"])
         .arg(&prefix)

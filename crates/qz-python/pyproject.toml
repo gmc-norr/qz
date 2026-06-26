@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "qz"
-version = "0.2.0"
+version = "0.3.0"
 description = "High-performance FASTQ compression (BSC/BWT + columnar encoding)"
 readme = "README.md"
 requires-python = ">=3.8"

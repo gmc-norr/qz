@@ -1,0 +1,15 @@
+[package]
+name = "numa-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Format-agnostic NUMA multi-process sharding (topology, pinning, gate, assembly) shared by the qz and bz CLIs"
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -12,31 +12,30 @@ name = "qz_lib"
 [features]
 default = []
 cuda = []
-# Enables experimental encoders that are not (yet) round-trippable.
-# Currently gates `compress_sequences_template_hybrid` — it writes a "THB1"
-# archive but no decompressor exists, so building with this feature MUST NOT be
-# used for archives a downstream tool needs to read back.
-experimental = []
 
 [dependencies]
+strobealign = { path = "../strobealign" }
 anyhow.workspace = true
 rayon.workspace = true
 flate2.workspace = true
 gzp.workspace = true
 zstd.workspace = true
-constriction.workspace = true
-openzl-sys.workspace = true
 rustc-hash.workspace = true
 minimizer-iter.workspace = true
 syncmers.workspace = true
 libc.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 memmap2.workspace = true
 tempfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_repr.workspace = true
 
+[dev-dependencies]
+proptest = "1"
+
 [build-dependencies]
 cc.workspace = true
+
+[lints]
+workspace = true

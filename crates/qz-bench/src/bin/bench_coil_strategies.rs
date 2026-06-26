@@ -3,7 +3,6 @@
 /// 1. Quality context_residuals + BSC vs raw qualities + BSC
 /// 2. Lexicographic sequence sorting + BSC vs unsorted + BSC
 /// 3. Consensus reference stats (to confirm it doesn't help on unsorted WGS)
-
 use std::io::BufRead;
 use std::time::Instant;
 
@@ -68,10 +67,12 @@ fn main() {
     let bsc_time = t.elapsed();
 
     // Verify roundtrip
-    let dec_residuals =
-        qz_lib::compression::bsc::decompress_parallel(&residual_bsc).unwrap();
+    let dec_residuals = qz_lib::compression::bsc::decompress_parallel(&residual_bsc).unwrap();
     let reconstructed = reconstruct_from_residuals(&dec_residuals, &qualities);
-    assert_eq!(qualities, reconstructed, "Quality residual roundtrip FAILED");
+    assert_eq!(
+        qualities, reconstructed,
+        "Quality residual roundtrip FAILED"
+    );
 
     println!(
         "Context residuals + BSC:      {:>10} B  ({:.2}x)  {:.1}ms (predict: {:.1}ms + BSC: {:.1}ms)",
@@ -95,7 +96,8 @@ fn main() {
         .collect();
 
     let t = Instant::now();
-    let unsorted_bsc = qz_lib::compression::bsc::compress_parallel_adaptive(&unsorted_stream).unwrap();
+    let unsorted_bsc =
+        qz_lib::compression::bsc::compress_parallel_adaptive(&unsorted_stream).unwrap();
     let unsorted_time = t.elapsed();
     println!(
         "Unsorted sequences + BSC:     {:>10} B  ({:.2}x)  {:.1}ms",
@@ -153,18 +155,26 @@ fn main() {
         let avg_pct = avg_diffs / first_len as f64 * 100.0;
 
         println!("Read length: {}", first_len);
-        println!("Avg diffs from consensus: {:.1} per read ({:.1}%)", avg_diffs, avg_pct);
+        println!(
+            "Avg diffs from consensus: {:.1} per read ({:.1}%)",
+            avg_diffs, avg_pct
+        );
         println!(
             "Consensus encoding size estimate: {} bytes (vs {} raw)",
-            total_diffs * 2 + num_reads,  // 2 bytes per diff + 1 varint per read
+            total_diffs * 2 + num_reads, // 2 bytes per diff + 1 varint per read
             unsorted_stream.len(),
         );
 
         if avg_pct > 50.0 {
-            println!("  -> Consensus is WORSE than raw (>{:.0}% diffs = expansion)", 50.0);
+            println!(
+                "  -> Consensus is WORSE than raw (>{:.0}% diffs = expansion)",
+                50.0
+            );
         } else {
-            println!("  -> Consensus would save {:.1}% before secondary compression",
-                100.0 * (1.0 - (total_diffs * 2 + num_reads) as f64 / unsorted_stream.len() as f64));
+            println!(
+                "  -> Consensus would save {:.1}% before secondary compression",
+                100.0 * (1.0 - (total_diffs * 2 + num_reads) as f64 / unsorted_stream.len() as f64)
+            );
         }
     } else {
         println!("Variable read lengths - consensus not applicable");
@@ -180,13 +190,21 @@ fn build_consensus(sequences: &[String]) -> Vec<u8> {
         for seq in sequences {
             let base = seq.as_bytes()[pos];
             let idx = match base {
-                b'A' => 0, b'C' => 1, b'G' => 2, b'T' => 3, _ => 4,
+                b'A' => 0,
+                b'C' => 1,
+                b'G' => 2,
+                b'T' => 3,
+                _ => 4,
             };
             counts[idx] += 1;
         }
         let max_idx = counts.iter().enumerate().max_by_key(|(_, c)| *c).unwrap().0;
         consensus.push(match max_idx {
-            0 => b'A', 1 => b'C', 2 => b'G', 3 => b'T', _ => b'N',
+            0 => b'A',
+            1 => b'C',
+            2 => b'G',
+            3 => b'T',
+            _ => b'N',
         });
     }
     consensus
@@ -225,7 +243,7 @@ fn context_residuals(qualities: &[String]) -> Vec<u8> {
             let total: u32 = counts[ctx].iter().sum();
             if total >= RESCALE_THRESHOLD {
                 for c in counts[ctx].iter_mut() {
-                    *c = (*c + 1) / 2;
+                    *c = (*c).div_ceil(2);
                 }
             }
 
@@ -268,7 +286,7 @@ fn reconstruct_from_residuals(residuals: &[u8], original_qualities: &[String]) -
             let total: u32 = counts[ctx].iter().sum();
             if total >= RESCALE_THRESHOLD {
                 for c in counts[ctx].iter_mut() {
-                    *c = (*c + 1) / 2;
+                    *c = (*c).div_ceil(2);
                 }
             }
 

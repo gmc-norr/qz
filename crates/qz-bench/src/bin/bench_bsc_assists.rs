@@ -16,7 +16,6 @@
 ///      Partial transposition that preserves BWT-friendly locality.
 ///
 /// Usage: cargo run --release --bin bench_bsc_assists [fastq_path]
-
 use std::io::BufRead;
 use std::time::Instant;
 
@@ -49,7 +48,7 @@ fn bit2_to_base(v: u8) -> u8 {
 // ── 2-bit packing: 4 bases per byte ──────────────────────────────────────
 
 fn pack_2bit(bases: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity((bases.len() + 3) / 4);
+    let mut out = Vec::with_capacity(bases.len().div_ceil(4));
     for chunk in bases.chunks(4) {
         let mut byte = 0u8;
         for (j, &b) in chunk.iter().enumerate() {
@@ -156,7 +155,7 @@ fn minimizer_sort_key(seq: &[u8]) -> u64 {
                 }
             };
             fwd = (fwd << 2) | v;
-            rev = rev | ((3 - v) << (2 * j));
+            rev |= (3 - v) << (2 * j);
         }
         if valid {
             min_hash = min_hash.min(fwd.min(rev));
@@ -232,7 +231,13 @@ fn main() {
     let t = Instant::now();
     let raw_concat: Vec<u8> = sequences.iter().flat_map(|s| s.iter().copied()).collect();
     let baseline_size = bsc::compress_parallel_adaptive(&raw_concat).unwrap().len();
-    report("A. Baseline (raw + BSC)", baseline_size, raw_size, 0, t.elapsed().as_secs_f64());
+    report(
+        "A. Baseline (raw + BSC)",
+        baseline_size,
+        raw_size,
+        0,
+        t.elapsed().as_secs_f64(),
+    );
     drop(raw_concat);
 
     // ── B. 2-bit packing ────────────────────────────────────────────────
@@ -246,7 +251,13 @@ fn main() {
         })
         .collect();
     let packed_size = bsc::compress_parallel_adaptive(&packed).unwrap().len();
-    report("B. 2-bit packed + BSC", packed_size, raw_size, 0, t.elapsed().as_secs_f64());
+    report(
+        "B. 2-bit packed + BSC",
+        packed_size,
+        raw_size,
+        0,
+        t.elapsed().as_secs_f64(),
+    );
 
     // Verify roundtrip
     {
@@ -254,8 +265,11 @@ fn main() {
         let unpacked = unpack_2bit(&packed_one, read_len);
         for i in 0..read_len {
             let expected = match sequences[0][i] {
-                b'A' | b'a' => b'A', b'C' | b'c' => b'C',
-                b'G' | b'g' => b'G', b'T' | b't' => b'T', _ => b'A',
+                b'A' | b'a' => b'A',
+                b'C' | b'c' => b'C',
+                b'G' | b'g' => b'G',
+                b'T' | b't' => b'T',
+                _ => b'A',
             };
             assert_eq!(unpacked[i], expected, "2-bit roundtrip failed at pos {}", i);
         }
@@ -270,8 +284,16 @@ fn main() {
         .flat_map(|seq| seq.iter().map(|&b| base_to_2bit(b)))
         .collect();
     let packed_stream = pack_2bit_from_2bit(&all_2bit);
-    let packed_stream_size = bsc::compress_parallel_adaptive(&packed_stream).unwrap().len();
-    report("B2. 2-bit whole-stream + BSC", packed_stream_size, raw_size, 0, t.elapsed().as_secs_f64());
+    let packed_stream_size = bsc::compress_parallel_adaptive(&packed_stream)
+        .unwrap()
+        .len();
+    report(
+        "B2. 2-bit whole-stream + BSC",
+        packed_stream_size,
+        raw_size,
+        0,
+        t.elapsed().as_secs_f64(),
+    );
     drop(packed_stream);
 
     // ── C. RC canonicalization ───────────────────────────────────────────
@@ -280,7 +302,9 @@ fn main() {
     let canon: Vec<(Vec<u8>, bool)> = sequences.par_iter().map(|s| canonicalize(s)).collect();
     let rc_flags: Vec<u8> = canon.iter().map(|(_, rev)| *rev as u8).collect();
     let canon_concat: Vec<u8> = canon.iter().flat_map(|(s, _)| s.iter().copied()).collect();
-    let canon_size = bsc::compress_parallel_adaptive(&canon_concat).unwrap().len();
+    let canon_size = bsc::compress_parallel_adaptive(&canon_concat)
+        .unwrap()
+        .len();
     let flags_size = bsc::compress_adaptive(&rc_flags).unwrap().len();
     report(
         "C. RC canonical + BSC",
@@ -289,9 +313,12 @@ fn main() {
         0,
         t.elapsed().as_secs_f64(),
     );
-    eprintln!("     (canon={} B, flags={} B, rc_frac={:.1}%)",
-        canon_size, flags_size,
-        100.0 * rc_flags.iter().filter(|&&f| f == 1).count() as f64 / num_reads as f64);
+    eprintln!(
+        "     (canon={} B, flags={} B, rc_frac={:.1}%)",
+        canon_size,
+        flags_size,
+        100.0 * rc_flags.iter().filter(|&&f| f == 1).count() as f64 / num_reads as f64
+    );
     drop(canon_concat);
 
     // ── Sort reads ──────────────────────────────────────────────────────
@@ -316,13 +343,24 @@ fn main() {
     let perm_cost = bsc::compress_parallel_adaptive(&perm_bytes).unwrap().len();
     eprintln!("  Permutation cost: {} B\n", perm_cost);
 
-    let sorted_seqs: Vec<&[u8]> = sorted_idx.iter().map(|&i| sequences[i].as_slice()).collect();
+    let sorted_seqs: Vec<&[u8]> = sorted_idx
+        .iter()
+        .map(|&i| sequences[i].as_slice())
+        .collect();
 
     // Sorted baseline
     let t = Instant::now();
     let sorted_concat: Vec<u8> = sorted_seqs.iter().flat_map(|s| s.iter().copied()).collect();
-    let sorted_size = bsc::compress_parallel_adaptive(&sorted_concat).unwrap().len();
-    report("D0. Sorted + BSC", sorted_size, raw_size, perm_cost, t.elapsed().as_secs_f64());
+    let sorted_size = bsc::compress_parallel_adaptive(&sorted_concat)
+        .unwrap()
+        .len();
+    report(
+        "D0. Sorted + BSC",
+        sorted_size,
+        raw_size,
+        perm_cost,
+        t.elapsed().as_secs_f64(),
+    );
     drop(sorted_concat);
 
     // ── D. Sorted + mod-4 delta ─────────────────────────────────────────
@@ -356,8 +394,16 @@ fn main() {
         100.0 * dist[3] as f64 / total_bases,
     );
 
-    let delta_size = bsc::compress_parallel_adaptive(&delta_stream).unwrap().len();
-    report("D. Sorted + mod4-delta + BSC", delta_size, raw_size, perm_cost, t.elapsed().as_secs_f64());
+    let delta_size = bsc::compress_parallel_adaptive(&delta_stream)
+        .unwrap()
+        .len();
+    report(
+        "D. Sorted + mod4-delta + BSC",
+        delta_size,
+        raw_size,
+        perm_cost,
+        t.elapsed().as_secs_f64(),
+    );
 
     // Verify roundtrip for first 100 reads
     {
@@ -369,20 +415,34 @@ fn main() {
                 for j in 0..rl {
                     let recovered = bit2_to_base(delta_stream[pos + j]);
                     let expected = match sorted_seqs[i][j] {
-                        b'A' | b'a' => b'A', b'C' | b'c' => b'C',
-                        b'G' | b'g' => b'G', b'T' | b't' => b'T', _ => b'A',
+                        b'A' | b'a' => b'A',
+                        b'C' | b'c' => b'C',
+                        b'G' | b'g' => b'G',
+                        b'T' | b't' => b'T',
+                        _ => b'A',
                     };
-                    assert_eq!(recovered, expected, "Delta roundtrip failed read {} pos {}", i, j);
+                    assert_eq!(
+                        recovered, expected,
+                        "Delta roundtrip failed read {} pos {}",
+                        i, j
+                    );
                 }
                 prev = sorted_seqs[i].to_vec();
             } else {
                 let decoded = mod4_undelta(&delta_stream[pos..pos + rl], &prev);
                 for j in 0..rl {
                     let expected = match sorted_seqs[i][j] {
-                        b'A' | b'a' => b'A', b'C' | b'c' => b'C',
-                        b'G' | b'g' => b'G', b'T' | b't' => b'T', _ => b'A',
+                        b'A' | b'a' => b'A',
+                        b'C' | b'c' => b'C',
+                        b'G' | b'g' => b'G',
+                        b'T' | b't' => b'T',
+                        _ => b'A',
                     };
-                    assert_eq!(decoded[j], expected, "Delta roundtrip failed read {} pos {}", i, j);
+                    assert_eq!(
+                        decoded[j], expected,
+                        "Delta roundtrip failed read {} pos {}",
+                        i, j
+                    );
                 }
                 prev = sorted_seqs[i].to_vec();
             }
@@ -400,8 +460,16 @@ fn main() {
         .flat_map(|seq| seq.iter().map(|&b| base_to_2bit(b)))
         .collect();
     let sorted_packed = pack_2bit_from_2bit(&sorted_2bit);
-    let sorted_packed_size = bsc::compress_parallel_adaptive(&sorted_packed).unwrap().len();
-    report("E. Sorted + 2-bit packed + BSC", sorted_packed_size, raw_size, perm_cost, t.elapsed().as_secs_f64());
+    let sorted_packed_size = bsc::compress_parallel_adaptive(&sorted_packed)
+        .unwrap()
+        .len();
+    report(
+        "E. Sorted + 2-bit packed + BSC",
+        sorted_packed_size,
+        raw_size,
+        perm_cost,
+        t.elapsed().as_secs_f64(),
+    );
     drop(sorted_packed);
 
     // ── F. RC canon + sorted ────────────────────────────────────────────
@@ -420,10 +488,15 @@ fn main() {
         .iter()
         .flat_map(|&i| canon_seqs[i].0.iter().copied())
         .collect();
-    let canon_sorted_size = bsc::compress_parallel_adaptive(&canon_sorted_concat).unwrap().len();
+    let canon_sorted_size = bsc::compress_parallel_adaptive(&canon_sorted_concat)
+        .unwrap()
+        .len();
 
     // RC flags in sorted order
-    let canon_sorted_flags: Vec<u8> = canon_sorted_idx.iter().map(|&i| canon_seqs[i].1 as u8).collect();
+    let canon_sorted_flags: Vec<u8> = canon_sorted_idx
+        .iter()
+        .map(|&i| canon_seqs[i].1 as u8)
+        .collect();
     let canon_flags_size = bsc::compress_adaptive(&canon_sorted_flags).unwrap().len();
 
     // Permutation
@@ -431,7 +504,9 @@ fn main() {
         .iter()
         .flat_map(|&i| (i as u32).to_le_bytes())
         .collect();
-    let canon_perm_cost = bsc::compress_parallel_adaptive(&canon_perm_bytes).unwrap().len();
+    let canon_perm_cost = bsc::compress_parallel_adaptive(&canon_perm_bytes)
+        .unwrap()
+        .len();
 
     let canon_total = canon_sorted_size + canon_flags_size;
     report(
@@ -441,7 +516,10 @@ fn main() {
         canon_perm_cost,
         t.elapsed().as_secs_f64(),
     );
-    eprintln!("     (seqs={} B, flags={} B, perm={} B)", canon_sorted_size, canon_flags_size, canon_perm_cost);
+    eprintln!(
+        "     (seqs={} B, flags={} B, perm={} B)",
+        canon_sorted_size, canon_flags_size, canon_perm_cost
+    );
     drop(canon_sorted_concat);
 
     // ── G. Sorted + mod4-delta + 2-bit packed ───────────────────────────
@@ -460,8 +538,16 @@ fn main() {
         }
     }
     let delta_packed = pack_2bit_from_2bit(&delta_2bit);
-    let delta_packed_size = bsc::compress_parallel_adaptive(&delta_packed).unwrap().len();
-    report("G. Sorted + mod4-delta + 2bit + BSC", delta_packed_size, raw_size, perm_cost, t.elapsed().as_secs_f64());
+    let delta_packed_size = bsc::compress_parallel_adaptive(&delta_packed)
+        .unwrap()
+        .len();
+    report(
+        "G. Sorted + mod4-delta + 2bit + BSC",
+        delta_packed_size,
+        raw_size,
+        perm_cost,
+        t.elapsed().as_secs_f64(),
+    );
     drop(delta_packed);
 
     // ── H. Small-cluster interleave ─────────────────────────────────────
@@ -543,8 +629,16 @@ fn main() {
         .iter()
         .flat_map(|seq| seq.iter().map(|&b| base_to_2bit(b)))
         .collect();
-    let twobit_size = bsc::compress_parallel_adaptive(&twobit_stream).unwrap().len();
-    report("J. 2-bit values (not packed) + BSC", twobit_size, raw_size, 0, t.elapsed().as_secs_f64());
+    let twobit_size = bsc::compress_parallel_adaptive(&twobit_stream)
+        .unwrap()
+        .len();
+    report(
+        "J. 2-bit values (not packed) + BSC",
+        twobit_size,
+        raw_size,
+        0,
+        t.elapsed().as_secs_f64(),
+    );
     drop(twobit_stream);
 
     // ── K. Sorted + 2-bit values (not packed) + BSC ─────────────────────
@@ -554,8 +648,16 @@ fn main() {
         .iter()
         .flat_map(|seq| seq.iter().map(|&b| base_to_2bit(b)))
         .collect();
-    let sorted_twobit_size = bsc::compress_parallel_adaptive(&sorted_twobit).unwrap().len();
-    report("K. Sorted + 2-bit values + BSC", sorted_twobit_size, raw_size, perm_cost, t.elapsed().as_secs_f64());
+    let sorted_twobit_size = bsc::compress_parallel_adaptive(&sorted_twobit)
+        .unwrap()
+        .len();
+    report(
+        "K. Sorted + 2-bit values + BSC",
+        sorted_twobit_size,
+        raw_size,
+        perm_cost,
+        t.elapsed().as_secs_f64(),
+    );
 
     // ── Summary ─────────────────────────────────────────────────────────
 
@@ -580,13 +682,18 @@ fn main() {
         if *extra > 0 {
             eprintln!(
                 "  {:<32} {:>10} B  {:.3}x  (net {:.3}x with {} B perm)",
-                name, size, raw_size as f64 / *size as f64,
-                raw_size as f64 / total as f64, extra,
+                name,
+                size,
+                raw_size as f64 / *size as f64,
+                raw_size as f64 / total as f64,
+                extra,
             );
         } else {
             eprintln!(
                 "  {:<32} {:>10} B  {:.3}x",
-                name, size, raw_size as f64 / *size as f64,
+                name,
+                size,
+                raw_size as f64 / *size as f64,
             );
         }
     }
@@ -594,7 +701,7 @@ fn main() {
 
 /// Pack a stream of 2-bit values (0-3) into bytes, 4 values per byte.
 fn pack_2bit_from_2bit(values: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity((values.len() + 3) / 4);
+    let mut out = Vec::with_capacity(values.len().div_ceil(4));
     for chunk in values.chunks(4) {
         let mut byte = 0u8;
         for (j, &v) in chunk.iter().enumerate() {

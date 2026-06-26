@@ -1,5 +1,7 @@
 use anyhow::Result;
-use noodles::bgzf;
+// Same crate as `noodles::bgzf` (the umbrella re-exports it); imported directly so
+// the libdeflate-feature-enabling dep is genuinely used, not just feature-unified.
+use noodles_bgzf as bgzf;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 
@@ -54,31 +56,43 @@ impl RawBamRecord {
         let read_name_end = 32usize
             .checked_add(self.l_read_name() as usize)
             .filter(|&v| v <= len)
-            .ok_or_else(|| anyhow::anyhow!(
-                "BAM record read_name extends past end (l_read_name={}, record_len={})",
-                self.l_read_name(), len
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "BAM record read_name extends past end (l_read_name={}, record_len={})",
+                    self.l_read_name(),
+                    len
+                )
+            })?;
         let cigar_end = read_name_end
             .checked_add(4 * self.n_cigar_op() as usize)
             .filter(|&v| v <= len)
-            .ok_or_else(|| anyhow::anyhow!(
-                "BAM record CIGAR extends past end (n_cigar_op={}, record_len={})",
-                self.n_cigar_op(), len
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "BAM record CIGAR extends past end (n_cigar_op={}, record_len={})",
+                    self.n_cigar_op(),
+                    len
+                )
+            })?;
         let seq_end = cigar_end
-            .checked_add((l_seq + 1) / 2)
+            .checked_add(l_seq.div_ceil(2))
             .filter(|&v| v <= len)
-            .ok_or_else(|| anyhow::anyhow!(
-                "BAM record seq extends past end (l_seq={}, record_len={})",
-                l_seq, len
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "BAM record seq extends past end (l_seq={}, record_len={})",
+                    l_seq,
+                    len
+                )
+            })?;
         let _qual_end = seq_end
             .checked_add(l_seq)
             .filter(|&v| v <= len)
-            .ok_or_else(|| anyhow::anyhow!(
-                "BAM record qual extends past end (l_seq={}, record_len={})",
-                l_seq, len
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "BAM record qual extends past end (l_seq={}, record_len={})",
+                    l_seq,
+                    len
+                )
+            })?;
         Ok(())
     }
 
@@ -136,7 +150,7 @@ impl RawBamRecord {
 
     fn seq_end(&self) -> usize {
         let l_seq = self.l_seq() as usize;
-        self.cigar_end() + ((l_seq + 1) / 2)
+        self.cigar_end() + l_seq.div_ceil(2)
     }
 
     fn qual_end(&self) -> usize {
@@ -193,7 +207,7 @@ pub fn unpack_nibbles(packed: &[u8], l_seq: usize) -> Vec<u8> {
         nibbles[i * 2] = packed[i] >> 4;
         nibbles[i * 2 + 1] = packed[i] & 0x0F;
     }
-    if l_seq % 2 != 0 {
+    if !l_seq.is_multiple_of(2) {
         nibbles[l_seq - 1] = packed[pairs] >> 4;
     }
     nibbles
@@ -201,13 +215,13 @@ pub fn unpack_nibbles(packed: &[u8], l_seq: usize) -> Vec<u8> {
 
 /// Pack individual nibble values back into BAM 4-bit encoding (2 per byte, high first).
 pub fn pack_nibbles(nibbles: &[u8]) -> Vec<u8> {
-    let out_len = (nibbles.len() + 1) / 2;
+    let out_len = nibbles.len().div_ceil(2);
     let mut packed = vec![0u8; out_len];
     let pairs = nibbles.len() / 2;
     for i in 0..pairs {
         packed[i] = (nibbles[i * 2] << 4) | nibbles[i * 2 + 1];
     }
-    if nibbles.len() % 2 != 0 {
+    if !nibbles.len().is_multiple_of(2) {
         packed[pairs] = nibbles[pairs * 2] << 4;
     }
     packed
@@ -263,8 +277,7 @@ impl RawBamReader<bgzf::io::Reader<std::io::BufReader<std::fs::File>>> {
     pub fn from_path(path: &std::path::Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let buf = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-        Self::new(bgzf::io::Reader::new(buf))
-            .map_err(|e| wrap_bam_open_error(e, path))
+        Self::new(bgzf::io::Reader::new(buf)).map_err(|e| wrap_bam_open_error(e, path))
     }
 }
 
@@ -272,8 +285,38 @@ impl RawBamReader<bgzf::io::MultithreadedReader<std::io::BufReader<std::fs::File
     pub fn from_path_mt(path: &std::path::Path, worker_count: NonZeroUsize) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let buf = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
-        Self::new(bgzf::io::MultithreadedReader::with_worker_count(worker_count, buf))
-            .map_err(|e| wrap_bam_open_error(e, path))
+        Self::new(bgzf::io::MultithreadedReader::with_worker_count(
+            worker_count,
+            buf,
+        ))
+        .map_err(|e| wrap_bam_open_error(e, path))
+    }
+
+    /// BGZF virtual position of the underlying reader at the *next* record to be
+    /// read (its compressed-block offset + uncompressed offset, packed as u64).
+    /// Captured at chunk boundaries by the NUMA-compress prescan so a worker can
+    /// later seek straight to its assigned chunk start.
+    pub fn virtual_position(&self) -> u64 {
+        u64::from(self.reader.virtual_position())
+    }
+
+    /// Open `path`, read the BAM header (always from the file start), then seek the
+    /// underlying BGZF reader to `vpos` — a value previously captured via
+    /// [`Self::virtual_position`] at a chunk boundary — so the next `read_chunk`
+    /// begins at that record. Lets a NUMA-compress worker start at its assigned
+    /// chunk while keeping multithreaded inflate (the MT reader is seekable).
+    pub fn from_path_mt_seek(
+        path: &std::path::Path,
+        worker_count: NonZeroUsize,
+        vpos: u64,
+    ) -> Result<Self> {
+        use bgzf::io::Seek as _;
+        let mut reader = Self::from_path_mt(path, worker_count)?;
+        reader
+            .reader
+            .seek_to_virtual_position(bgzf::VirtualPosition::from(vpos))
+            .map_err(|e| anyhow::anyhow!("BGZF seek to virtual position {vpos} failed: {e}"))?;
+        Ok(reader)
     }
 }
 
@@ -286,7 +329,8 @@ fn wrap_bam_open_error(e: anyhow::Error, path: &std::path::Path) -> anyhow::Erro
     }
     anyhow::anyhow!(
         "Failed to read {:?} as BAM: {}. Is this a valid BAM file?",
-        path, msg
+        path,
+        msg
     )
 }
 
@@ -327,11 +371,8 @@ impl<R: Read> RawBamReader<R> {
             let mut name_len_buf = [0u8; 4];
             reader.read_exact(&mut name_len_buf)?;
             let name_len_i32 = i32::from_le_bytes(name_len_buf);
-            if name_len_i32 < 0 || name_len_i32 > 256 {
-                anyhow::bail!(
-                    "Invalid BAM reference name length: {}",
-                    name_len_i32
-                );
+            if !(0..=256).contains(&name_len_i32) {
+                anyhow::bail!("Invalid BAM reference name length: {}", name_len_i32);
             }
             let name_len = name_len_i32 as usize;
             let mut name = vec![0u8; name_len];
@@ -350,13 +391,32 @@ impl<R: Read> RawBamReader<R> {
         })
     }
 
-    /// Read the next BAM record as raw bytes. Returns None at EOF.
+    /// Read the next BAM record as raw bytes. Returns None at a clean EOF.
+    ///
+    /// A clean EOF is *zero* bytes remaining at a record boundary. If the stream
+    /// ends partway through the 4-byte `block_size` prefix (1-3 bytes), the BAM is
+    /// truncated and we must error rather than silently shortening the file —
+    /// `read_exact` reports both cases as `UnexpectedEof`, so we read manually and
+    /// inspect how many bytes arrived.
     pub fn next_record(&mut self) -> Result<Option<RawBamRecord>> {
         let mut block_size_buf = [0u8; 4];
-        match self.reader.read_exact(&mut block_size_buf) {
-            Ok(()) => {}
-            Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(anyhow::Error::from(e)),
+        let mut filled = 0;
+        while filled < block_size_buf.len() {
+            match self.reader.read(&mut block_size_buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(anyhow::Error::from(e)),
+            }
+        }
+        if filled == 0 {
+            return Ok(None); // clean EOF at a record boundary
+        }
+        if filled < block_size_buf.len() {
+            anyhow::bail!(
+                "Truncated BAM: stream ended mid record block_size prefix ({} of 4 bytes)",
+                filled
+            );
         }
         let block_size_i32 = i32::from_le_bytes(block_size_buf);
         if block_size_i32 < 32 {
@@ -394,7 +454,9 @@ impl BamWriter<bgzf::io::Writer<std::io::BufWriter<std::fs::File>>> {
     pub fn from_path(path: &std::path::Path) -> Result<Self> {
         let file = std::fs::File::create(path)?;
         let buf = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
-        Ok(Self { writer: bgzf::io::Writer::new(buf) })
+        Ok(Self {
+            writer: bgzf::io::Writer::new(buf),
+        })
     }
 
     pub fn finish(self) -> Result<()> {
@@ -405,7 +467,13 @@ impl BamWriter<bgzf::io::Writer<std::io::BufWriter<std::fs::File>>> {
 
 impl BamWriter<bgzf::io::MultithreadedWriter<std::io::BufWriter<std::fs::File>>> {
     pub fn from_path_mt(path: &std::path::Path, worker_count: NonZeroUsize) -> Result<Self> {
-        let file = std::fs::File::create(path)?;
+        Self::from_file_mt(std::fs::File::create(path)?, worker_count)
+    }
+
+    /// Build a multithreaded BGZF writer over an already-open file. Used by the
+    /// atomic-output path, which opens a randomized O_EXCL temp file itself
+    /// (avoids re-opening a path, which would follow a symlink / truncate).
+    pub fn from_file_mt(file: std::fs::File, worker_count: NonZeroUsize) -> Result<Self> {
         let buf = std::io::BufWriter::with_capacity(4 * 1024 * 1024, file);
         Ok(Self {
             writer: bgzf::io::MultithreadedWriter::with_worker_count(worker_count, buf),
@@ -435,9 +503,79 @@ impl<W: Write> BamWriter<W> {
 
     /// Write a single BAM record from its raw bytes (as stored in RawBamRecord.data).
     pub fn write_record(&mut self, data: &[u8]) -> Result<()> {
-        self.writer
-            .write_all(&(data.len() as i32).to_le_bytes())?;
+        self.writer.write_all(&(data.len() as i32).to_le_bytes())?;
         self.writer.write_all(data)?;
         Ok(())
+    }
+
+    /// Write a block of already-formatted record bytes (length-prefixed records,
+    /// exactly as produced by `write_record`). Used by the decompress pipeline:
+    /// a worker reconstructs a chunk into a `BamWriter<Vec<u8>>` off the critical
+    /// path, then the in-order drain feeds the bytes straight into the real
+    /// (BGZF) output here.
+    pub fn write_block_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_all(bytes)?;
+        Ok(())
+    }
+
+    /// Consume the writer and return the underlying sink. For `BamWriter<Vec<u8>>`
+    /// this yields the reconstructed record bytes; the BGZF-backed writers use
+    /// `finish()` instead to flush the gzip trailer.
+    pub fn into_inner(self) -> W {
+        self.writer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Minimal uncompressed BAM stream: magic + empty header text + 0 references.
+    /// `RawBamReader::new` consumes exactly this; `record_tail` is appended raw so
+    /// tests can exercise `next_record` at a record boundary.
+    fn bam_header_plus(record_tail: &[u8]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"BAM\x01");
+        v.extend_from_slice(&0i32.to_le_bytes()); // l_text = 0
+        v.extend_from_slice(&0i32.to_le_bytes()); // n_ref = 0
+        v.extend_from_slice(record_tail);
+        v
+    }
+
+    #[test]
+    fn next_record_clean_eof_returns_none() {
+        // Zero bytes after the header is a clean EOF at a record boundary.
+        let data = bam_header_plus(&[]);
+        let mut reader = RawBamReader::new(Cursor::new(data)).unwrap();
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn next_record_truncated_block_size_prefix_errors() {
+        // A BAM truncated after 1-3 bytes of the 4-byte block_size prefix must be
+        // reported as truncation, not silently treated as a clean EOF.
+        for partial in 1..4usize {
+            let data = bam_header_plus(&vec![0u8; partial]);
+            let mut reader = RawBamReader::new(Cursor::new(data)).unwrap();
+            let err = reader
+                .next_record()
+                .map(drop)
+                .expect_err("partial block_size prefix must error");
+            assert!(
+                err.to_string().contains("Truncated BAM"),
+                "unexpected error for {partial}-byte prefix: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn next_record_truncated_record_body_errors() {
+        // Full block_size prefix but a missing/short record body is also truncation.
+        let mut tail = 100i32.to_le_bytes().to_vec(); // claims a 100-byte record
+        tail.extend_from_slice(&[0u8; 10]); // only 10 bytes present
+        let data = bam_header_plus(&tail);
+        let mut reader = RawBamReader::new(Cursor::new(data)).unwrap();
+        assert!(reader.next_record().is_err());
     }
 }

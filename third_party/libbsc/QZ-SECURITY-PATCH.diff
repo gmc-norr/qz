@@ -1,0 +1,463 @@
+diff --git a/libbsc/coder/coder.cpp b/libbsc/coder/coder.cpp
+index 5048cde..52f5f19 100644
+--- a/libbsc/coder/coder.cpp
++++ b/libbsc/coder/coder.cpp
+@@ -266,16 +266,19 @@ int bsc_coder_compress(const unsigned char * input, unsigned char * output, int
+ }
+ 
+ 
+-int bsc_coder_decode_block(const unsigned char * input, unsigned char * output, int coder)
++int bsc_coder_decode_block(const unsigned char * input, unsigned char * output, int outputSize, int coder)
+ {
+-    if (coder == LIBBSC_CODER_QLFC_STATIC)   return bsc_qlfc_static_decode_block  (input, output);
+-    if (coder == LIBBSC_CODER_QLFC_ADAPTIVE) return bsc_qlfc_adaptive_decode_block(input, output);
+-    if (coder == LIBBSC_CODER_QLFC_FAST)     return bsc_qlfc_fast_decode_block    (input, output);
++    if (coder == LIBBSC_CODER_QLFC_STATIC)   return bsc_qlfc_static_decode_block  (input, output, outputSize);
++    if (coder == LIBBSC_CODER_QLFC_ADAPTIVE) return bsc_qlfc_adaptive_decode_block(input, output, outputSize);
++    if (coder == LIBBSC_CODER_QLFC_FAST)     return bsc_qlfc_fast_decode_block    (input, output, outputSize);
+ 
+     return LIBBSC_BAD_PARAMETER;
+ }
+ 
+-int bsc_coder_decompress(const unsigned char * input, unsigned char * output, int coder, int features)
++/* QZ-SECURITY-PATCH (bsc-decode-output-bound): bsc_coder_decompress now takes the
++   caller's total output-buffer capacity so each sub-block decode is bounded and a
++   malicious per-block size table cannot drive a write past the allocation. */
++int bsc_coder_decompress(const unsigned char * input, unsigned char * output, int outputCapacity, int coder, int features)
+ {
+     if ((coder != LIBBSC_CODER_QLFC_STATIC) && (coder != LIBBSC_CODER_QLFC_ADAPTIVE) && (coder != LIBBSC_CODER_QLFC_FAST))
+     {
+@@ -285,7 +288,7 @@ int bsc_coder_decompress(const unsigned char * input, unsigned char * output, in
+     int nBlocks = input[0];
+     if (nBlocks == 1)
+     {
+-        return bsc_coder_decode_block(input + 1, output, coder);
++        return bsc_coder_decode_block(input + 1, output, outputCapacity, coder);
+     }
+ 
+     int decompressionResult[ALPHABET_SIZE];
+@@ -316,9 +319,16 @@ int bsc_coder_decompress(const unsigned char * input, unsigned char * output, in
+             memcpy(&inputSize , input + 1 + 8 * blockId + 4, sizeof(int));
+             memcpy(&outputSize, input + 1 + 8 * blockId + 0, sizeof(int));
+ 
+-            if (inputSize != outputSize)
++            /* QZ-SECURITY-PATCH (bsc-decode-output-bound): reject a per-block size
++               table that would place this block's output outside the caller's
++               buffer before any write/decode happens. */
++            if (inputSize < 0 || outputSize < 0 || outputPtr > outputCapacity || outputSize > outputCapacity - outputPtr)
+             {
+-                decompressionResult[blockId] = bsc_coder_decode_block(input + inputPtr, output + outputPtr, coder);
++                decompressionResult[blockId] = LIBBSC_DATA_CORRUPT;
++            }
++            else if (inputSize != outputSize)
++            {
++                decompressionResult[blockId] = bsc_coder_decode_block(input + inputPtr, output + outputPtr, outputSize, coder);
+             }
+             else
+             {
+@@ -349,9 +359,16 @@ int bsc_coder_decompress(const unsigned char * input, unsigned char * output, in
+             memcpy(&inputSize , input + 1 + 8 * blockId + 4, sizeof(int));
+             memcpy(&outputSize, input + 1 + 8 * blockId + 0, sizeof(int));
+ 
+-            if (inputSize != outputSize)
++            /* QZ-SECURITY-PATCH (bsc-decode-output-bound): reject a per-block size
++               table that would place this block's output outside the caller's
++               buffer before any write/decode happens. */
++            if (inputSize < 0 || outputSize < 0 || outputPtr > outputCapacity || outputSize > outputCapacity - outputPtr)
++            {
++                decompressionResult[blockId] = LIBBSC_DATA_CORRUPT;
++            }
++            else if (inputSize != outputSize)
+             {
+-                decompressionResult[blockId] = bsc_coder_decode_block(input + inputPtr, output + outputPtr, coder);
++                decompressionResult[blockId] = bsc_coder_decode_block(input + inputPtr, output + outputPtr, outputSize, coder);
+             }
+             else
+             {
+diff --git a/libbsc/coder/coder.h b/libbsc/coder/coder.h
+index cd80697..7f5d75d 100644
+--- a/libbsc/coder/coder.h
++++ b/libbsc/coder/coder.h
+@@ -57,13 +57,16 @@ extern "C" {
+ 
+     /**
+     * Decompress a memory block using Quantized Local Frequency Coding.
+-    * @param input      - the input memory block.
+-    * @param output     - the output memory block.
+-    * @param coder      - the entropy coding algorithm.
+-    * @param features   - the set of additional features.
++    * @param input         - the input memory block.
++    * @param output        - the output memory block.
++    * @param outputCapacity - the capacity in bytes of the output memory block
++    *                         (QZ-SECURITY-PATCH bsc-decode-output-bound: used to
++    *                         reject untrusted coded lengths that would overrun it).
++    * @param coder         - the entropy coding algorithm.
++    * @param features      - the set of additional features.
+     * @return the length of decompressed memory block if no error occurred, error code otherwise.
+     */
+-    int bsc_coder_decompress(const unsigned char * input, unsigned char * output, int coder, int features);
++    int bsc_coder_decompress(const unsigned char * input, unsigned char * output, int outputCapacity, int coder, int features);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libbsc/coder/qlfc/qlfc.cpp b/libbsc/coder/qlfc/qlfc.cpp
+index b7f2ba3..fbe3fe2 100644
+--- a/libbsc/coder/qlfc/qlfc.cpp
++++ b/libbsc/coder/qlfc/qlfc.cpp
+@@ -1434,7 +1434,7 @@ static const unsigned char ALIGNED(64) rank16_shuffle[16][16] =
+ 
+ #if defined(QLFC_ADAPTIVE_DECODE_FUNCTION_NAME)
+ 
+-int QLFC_ADAPTIVE_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char * output, QlfcStatisticalModel1 * model)
++int QLFC_ADAPTIVE_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char * output, int outputSize, QlfcStatisticalModel1 * model)
+ {
+     RangeCoder coder;
+ 
+@@ -1456,6 +1456,13 @@ int QLFC_ADAPTIVE_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned ch
+ 
+     coder.InitDecoder(input);
+     int n = (int)coder.DecodeWord();
++    /* QZ-SECURITY-PATCH (bsc-decode-output-bound): the decoded length `n` comes
++       straight from the (untrusted) range-coded payload and is independent of the
++       header dataSize that sized `output`. Reject n that would overrun the
++       caller's buffer BEFORE the byte-emitting loop writes past it (heap OOB).
++       Valid data always has n == dataSize <= outputSize, so this never rejects
++       genuine input. */
++    if (n < 0 || n > outputSize) return LIBBSC_DATA_CORRUPT;
+ 
+     unsigned char usedChar[ALPHABET_SIZE];
+     for (int i = 0; i < ALPHABET_SIZE; ++i) usedChar[i] = 0;
+@@ -1744,7 +1751,7 @@ int QLFC_ADAPTIVE_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned ch
+ 
+ #if defined(QLFC_STATIC_DECODE_FUNCTION_NAME)
+ 
+-int QLFC_STATIC_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char * output, QlfcStatisticalModel1 * model)
++int QLFC_STATIC_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char * output, int outputSize, QlfcStatisticalModel1 * model)
+ {
+     RangeCoder coder;
+ 
+@@ -1766,6 +1773,9 @@ int QLFC_STATIC_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char
+ 
+     coder.InitDecoder(input);
+     int n = (int)coder.DecodeWord();
++    /* QZ-SECURITY-PATCH (bsc-decode-output-bound): see adaptive decode above —
++       reject an untrusted coded length that would overrun `output`. */
++    if (n < 0 || n > outputSize) return LIBBSC_DATA_CORRUPT;
+ 
+     unsigned char usedChar[ALPHABET_SIZE];
+     for (int i = 0; i < ALPHABET_SIZE; ++i) usedChar[i] = 0;
+@@ -2010,7 +2020,7 @@ int QLFC_STATIC_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char
+ 
+ #if defined(QLFC_STATIC_DECODE_FUNCTION_NAME)
+ 
+-int QLFC_FAST_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char * output, QlfcStatisticalModel2 * model)
++int QLFC_FAST_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char * output, int outputSize, QlfcStatisticalModel2 * model)
+ {
+     unsigned char ALIGNED(64) MTFTable[ALPHABET_SIZE];
+ 
+@@ -2020,6 +2030,9 @@ int QLFC_FAST_DECODE_FUNCTION_NAME (const unsigned char * input, unsigned char *
+     coder.InitDecoder(input);
+ 
+     int n = (int)coder.DecodeWord();
++    /* QZ-SECURITY-PATCH (bsc-decode-output-bound): see adaptive decode above —
++       reject an untrusted coded length that would overrun `output`. */
++    if (n < 0 || n > outputSize) return LIBBSC_DATA_CORRUPT;
+ 
+     unsigned char usedChar[ALPHABET_SIZE];
+     for (int i = 0; i < ALPHABET_SIZE; ++i) usedChar[i] = 0;
+@@ -2266,11 +2279,11 @@ int bsc_qlfc_fast_encode_block(const unsigned char * input, unsigned char * outp
+     return LIBBSC_NOT_ENOUGH_MEMORY;
+ }
+ 
+-int bsc_qlfc_static_decode_block(const unsigned char * input, unsigned char * output)
++int bsc_qlfc_static_decode_block(const unsigned char * input, unsigned char * output, int outputSize)
+ {
+     if (QlfcStatisticalModel1 * model = (QlfcStatisticalModel1 *)bsc_malloc(sizeof(QlfcStatisticalModel1)))
+     {
+-        int result = bsc_qlfc_static_decode(input, output, model);
++        int result = bsc_qlfc_static_decode(input, output, outputSize, model);
+ 
+         bsc_free(model);
+ 
+@@ -2279,11 +2292,11 @@ int bsc_qlfc_static_decode_block(const unsigned char * input, unsigned char * ou
+     return LIBBSC_NOT_ENOUGH_MEMORY;
+ }
+ 
+-int bsc_qlfc_adaptive_decode_block(const unsigned char * input, unsigned char * output)
++int bsc_qlfc_adaptive_decode_block(const unsigned char * input, unsigned char * output, int outputSize)
+ {
+     if (QlfcStatisticalModel1 * model = (QlfcStatisticalModel1 *)bsc_malloc(sizeof(QlfcStatisticalModel1)))
+     {
+-        int result = bsc_qlfc_adaptive_decode(input, output, model);
++        int result = bsc_qlfc_adaptive_decode(input, output, outputSize, model);
+ 
+         bsc_free(model);
+ 
+@@ -2292,11 +2305,11 @@ int bsc_qlfc_adaptive_decode_block(const unsigned char * input, unsigned char *
+     return LIBBSC_NOT_ENOUGH_MEMORY;
+ }
+ 
+-int bsc_qlfc_fast_decode_block(const unsigned char * input, unsigned char * output)
++int bsc_qlfc_fast_decode_block(const unsigned char * input, unsigned char * output, int outputSize)
+ {
+     if (QlfcStatisticalModel2 * model = (QlfcStatisticalModel2 *)bsc_malloc(sizeof(QlfcStatisticalModel2)))
+     {
+-        int result = bsc_qlfc_fast_decode(input, output, model);
++        int result = bsc_qlfc_fast_decode(input, output, outputSize, model);
+ 
+         bsc_free(model);
+ 
+diff --git a/libbsc/coder/qlfc/qlfc.h b/libbsc/coder/qlfc/qlfc.h
+index ac0b2be..d08b7c8 100644
+--- a/libbsc/coder/qlfc/qlfc.h
++++ b/libbsc/coder/qlfc/qlfc.h
+@@ -80,7 +80,7 @@ extern "C" {
+     * @param output     - the output memory block of n bytes.
+     * @return the length of compressed memory block if no error occurred, error code otherwise.
+     */
+-    int bsc_qlfc_static_decode_block(const unsigned char * input, unsigned char * output);
++    int bsc_qlfc_static_decode_block(const unsigned char * input, unsigned char * output, int outputSize);
+ 
+     /**
+     * Decompress a memory block using Quantized Local Frequency Coding algorithm.
+@@ -88,7 +88,7 @@ extern "C" {
+     * @param output     - the output memory block of n bytes.
+     * @return the length of decompressed memory block if no error occurred, error code otherwise.
+     */
+-    int bsc_qlfc_adaptive_decode_block(const unsigned char * input, unsigned char * output);
++    int bsc_qlfc_adaptive_decode_block(const unsigned char * input, unsigned char * output, int outputSize);
+ 
+     /**
+     * Decompress a memory block using Quantized Local Frequency Coding algorithm.
+@@ -96,7 +96,7 @@ extern "C" {
+     * @param output     - the output memory block of n bytes.
+     * @return the length of decompressed memory block if no error occurred, error code otherwise.
+     */
+-    int bsc_qlfc_fast_decode_block(const unsigned char * input, unsigned char * output);
++    int bsc_qlfc_fast_decode_block(const unsigned char * input, unsigned char * output, int outputSize);
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/libbsc/libbsc/libbsc.cpp b/libbsc/libbsc/libbsc.cpp
+index 192e448..cd3a12d 100644
+--- a/libbsc/libbsc/libbsc.cpp
++++ b/libbsc/libbsc/libbsc.cpp
+@@ -468,7 +468,7 @@ int bsc_decompress_inplace(unsigned char * data, int inputSize, int outputSize,
+ 
+         memcpy(buffer, data, blockSize);
+ 
+-        lzSize = bsc_coder_decompress(buffer + LIBBSC_HEADER_SIZE, data, coder, features);
++        lzSize = bsc_coder_decompress(buffer + LIBBSC_HEADER_SIZE, data, outputSize, coder, features);
+ 
+         bsc_free(buffer);
+     }
+@@ -505,7 +505,7 @@ int bsc_decompress_inplace(unsigned char * data, int inputSize, int outputSize,
+         if (unsigned char * buffer = (unsigned char *)bsc_malloc(lzSize))
+         {
+             memcpy(buffer, data, lzSize);
+-            result = bsc_lzp_decompress(buffer, data, lzSize, lzpHashSize, lzpMinLen, features);
++            result = bsc_lzp_decompress(buffer, data, lzSize, outputSize, lzpHashSize, lzpMinLen, features);
+             bsc_free(buffer);
+             if (result < LIBBSC_NO_ERROR)
+             {
+@@ -568,7 +568,7 @@ int bsc_decompress(const unsigned char * input, int inputSize, unsigned char * o
+     int coder        = (mode >>  5) & 0x7;
+     int blockSorter  = (mode >>  0) & 0x1f;
+ 
+-    int lzSize = bsc_coder_decompress(input + LIBBSC_HEADER_SIZE, output, coder, features);
++    int lzSize = bsc_coder_decompress(input + LIBBSC_HEADER_SIZE, output, outputSize, coder, features);
+     if (lzSize < LIBBSC_NO_ERROR)
+     {
+         return lzSize;
+@@ -602,7 +602,7 @@ int bsc_decompress(const unsigned char * input, int inputSize, unsigned char * o
+         if (unsigned char * buffer = (unsigned char *)bsc_malloc(lzSize))
+         {
+             memcpy(buffer, output, lzSize);
+-            result = bsc_lzp_decompress(buffer, output, lzSize, lzpHashSize, lzpMinLen, features);
++            result = bsc_lzp_decompress(buffer, output, lzSize, outputSize, lzpHashSize, lzpMinLen, features);
+             bsc_free(buffer);
+             if (result < LIBBSC_NO_ERROR)
+             {
+diff --git a/libbsc/lzp/lzp.cpp b/libbsc/lzp/lzp.cpp
+index 63e4a6c..9cc7586 100644
+--- a/libbsc/lzp/lzp.cpp
++++ b/libbsc/lzp/lzp.cpp
+@@ -712,17 +712,24 @@ int bsc_lzp_encode_block(const unsigned char * input, const unsigned char * inpu
+     return result;
+ }
+ 
+-int bsc_lzp_decode_block(const unsigned char * RESTRICT input, const unsigned char * inputEnd, unsigned char * RESTRICT output, int hashSize, int minLen)
++int bsc_lzp_decode_block(const unsigned char * RESTRICT input, const unsigned char * inputEnd, unsigned char * RESTRICT output, int outputSize, int hashSize, int minLen)
+ {
+-    if (inputEnd - input < 4)
++    /* QZ-SECURITY-PATCH (bsc-decode-output-bound): bsc_lzp_decode_block now takes the
++       caller's output-buffer capacity. The LZP match run length and back-reference
++       offset are read from the compressed stream, so without this bound a crafted
++       block can drive the match copies (and the speculative fast-path stores) past
++       the output allocation — a heap buffer overflow. Every output write below is
++       bounded to [output, outputBufEnd). */
++    if (inputEnd - input < 4 || outputSize < 4)
+     {
+-        return LIBBSC_UNEXPECTED_EOB;
++        return (outputSize < 4) ? LIBBSC_DATA_CORRUPT : LIBBSC_UNEXPECTED_EOB;
+     }
+ 
+     if (int * RESTRICT lookup = (int *)bsc_zero_malloc(((size_t)1 << hashSize) * sizeof(int)))
+     {
+-        unsigned int            mask        = (int)(1 << hashSize) - 1;
+-        const unsigned char *   outputStart = output;
++        unsigned int            mask         = (int)(1 << hashSize) - 1;
++        const unsigned char *   outputStart  = output;
++        const unsigned char *   outputBufEnd = output + outputSize;
+ 
+         for (int i = 0; i < 4; ++i) { *output++ = *input++; }
+ 
+@@ -733,6 +740,14 @@ int bsc_lzp_decode_block(const unsigned char * RESTRICT input, const unsigned ch
+ 
+             while (input < inputEnd - 8)
+             {
++                /* QZ-SECURITY-PATCH (bsc-decode-output-bound): bound the speculative
++                   4-byte store below (and the <=4-byte advances that follow) to the
++                   output buffer. A well-formed block always has >= 4 output bytes left
++                   here: > 8 input bytes remain, and the densest LZP encoding (a
++                   MATCH_FLAG escape) emits 1 output byte per 2 input bytes, so this
++                   never rejects a valid block — only a crafted one whose output has
++                   already been driven to the buffer end by earlier matches. */
++                if (outputBufEnd - output < 4) { bsc_free(lookup); return LIBBSC_DATA_CORRUPT; }
+                 unsigned int next4          = *(unsigned int *)(output) = *(unsigned int *)(input);
+                 unsigned long long next8    = bsc_byteswap_uint64(((unsigned long long)next4 << 32) | prev4);
+ 
+@@ -768,7 +783,13 @@ LIBBSC_LZP_MATCH_FOUND1:
+ 
+                 if (*input != 255)
+                 {
+-                    int len = minLen; while (true) { len += *input; if (*input++ != 254) break; }
++                    /* QZ-SECURITY-PATCH (bsc-decode-output-bound): the run length is
++                       built from attacker-controlled count bytes — bound the walk to
++                       inputEnd (no OOB read) and reject a copy that would overrun the
++                       output buffer. len is widened to avoid signed overflow on a long
++                       count-byte run. */
++                    long long len = minLen; while (input < inputEnd) { len += *input; if (*input++ != 254) break; }
++                    if (len < 0 || len > outputBufEnd - output) { bsc_free(lookup); return LIBBSC_DATA_CORRUPT; }
+ 
+                     const unsigned char * reference = outputStart + value;
+                           unsigned char * outputEnd = output + len;
+@@ -788,7 +809,12 @@ LIBBSC_LZP_MATCH_FOUND1:
+         {
+             unsigned int context = output[-1] | (output[-2] << 8) | (output[-3] << 16) | (output[-4] << 24);
+ 
+-            while (input < inputEnd)
++            /* QZ-SECURITY-PATCH (bsc-decode-output-bound): also stop at the output
++               buffer end so the 1-byte literal/escape stores in this tail cannot
++               overrun it. A valid block finishes exactly when output reaches its
++               size (input reaches inputEnd at the same point), so this only trims a
++               crafted stream that keeps emitting past the buffer. */
++            while (input < inputEnd && output < outputBufEnd)
+             {
+                 unsigned int index = ((context >> 15) ^ context ^ (context >> 3)) & mask;
+                 int value = lookup[index]; lookup[index] = (int)(output - outputStart);
+@@ -797,7 +823,11 @@ LIBBSC_LZP_MATCH_FOUND1:
+                     input++;
+                     if (*input != 255)
+                     {
+-                        int len = minLen; while (true) { len += *input; if (*input++ != 254) break; }
++                        /* QZ-SECURITY-PATCH (bsc-decode-output-bound): bound the
++                           attacker-controlled run length (count-byte walk to inputEnd,
++                           copy to outputBufEnd) exactly as the fast path above. */
++                        long long len = minLen; while (input < inputEnd) { len += *input; if (*input++ != 254) break; }
++                        if (len < 0 || len > outputBufEnd - output) { bsc_free(lookup); return LIBBSC_DATA_CORRUPT; }
+ 
+                         const unsigned char * reference = outputStart + value;
+                               unsigned char * outputEnd = output + len;
+@@ -950,13 +980,22 @@ int bsc_lzp_compress(const unsigned char * input, unsigned char * output, int n,
+     return bsc_lzp_compress_serial(input, output, n, hashSize, minLen);
+ }
+ 
+-int bsc_lzp_decompress(const unsigned char * input, unsigned char * output, int n, int hashSize, int minLen, int features)
++int bsc_lzp_decompress(const unsigned char * input, unsigned char * output, int n, int outputCapacity, int hashSize, int minLen, int features)
+ {
+     int nBlocks = input[0];
+ 
+     if (nBlocks == 1)
+     {
+-        return bsc_lzp_decode_block(input + 1, input + n, output, hashSize, minLen);
++        return bsc_lzp_decode_block(input + 1, input + n, output, outputCapacity, hashSize, minLen);
++    }
++
++    /* QZ-SECURITY-PATCH (bsc-decode-output-bound): reject a forged block count whose
++       per-block size table (1 + 8*nBlocks bytes) would not fit in the compressed
++       input — the per-block loops below read that table, so an oversized count is an
++       OOB read. */
++    if (nBlocks < 1 || n < 1 + 8 * nBlocks)
++    {
++        return LIBBSC_DATA_CORRUPT;
+     }
+ 
+     int decompressionResult[ALPHABET_SIZE];
+@@ -987,9 +1026,16 @@ int bsc_lzp_decompress(const unsigned char * input, unsigned char * output, int
+             memcpy(&inputSize , input + 1 + 8 * blockId + 4, sizeof(int));
+             memcpy(&outputSize, input + 1 + 8 * blockId + 0, sizeof(int));
+ 
+-            if (inputSize != outputSize)
++            /* QZ-SECURITY-PATCH (bsc-decode-output-bound): reject a per-block size
++               table that would place this block's output outside the caller's buffer
++               before any write/decode happens (mirrors bsc_coder_decompress). */
++            if (inputSize < 0 || outputSize < 0 || outputPtr > outputCapacity || outputSize > outputCapacity - outputPtr)
+             {
+-                decompressionResult[blockId] = bsc_lzp_decode_block(input + inputPtr, input + inputPtr + inputSize, output + outputPtr, hashSize, minLen);
++                decompressionResult[blockId] = LIBBSC_DATA_CORRUPT;
++            }
++            else if (inputSize != outputSize)
++            {
++                decompressionResult[blockId] = bsc_lzp_decode_block(input + inputPtr, input + inputPtr + inputSize, output + outputPtr, outputSize, hashSize, minLen);
+             }
+             else
+             {
+@@ -1020,9 +1066,16 @@ int bsc_lzp_decompress(const unsigned char * input, unsigned char * output, int
+             memcpy(&inputSize , input + 1 + 8 * blockId + 4, sizeof(int));
+             memcpy(&outputSize, input + 1 + 8 * blockId + 0, sizeof(int));
+ 
+-            if (inputSize != outputSize)
++            /* QZ-SECURITY-PATCH (bsc-decode-output-bound): reject a per-block size
++               table that would place this block's output outside the caller's buffer
++               before any write/decode happens (mirrors bsc_coder_decompress). */
++            if (inputSize < 0 || outputSize < 0 || outputPtr > outputCapacity || outputSize > outputCapacity - outputPtr)
++            {
++                decompressionResult[blockId] = LIBBSC_DATA_CORRUPT;
++            }
++            else if (inputSize != outputSize)
+             {
+-                decompressionResult[blockId] = bsc_lzp_decode_block(input + inputPtr, input + inputPtr + inputSize, output + outputPtr, hashSize, minLen);
++                decompressionResult[blockId] = bsc_lzp_decode_block(input + inputPtr, input + inputPtr + inputSize, output + outputPtr, outputSize, hashSize, minLen);
+             }
+             else
+             {
+diff --git a/libbsc/lzp/lzp.h b/libbsc/lzp/lzp.h
+index e8e3743..ffddeb3 100644
+--- a/libbsc/lzp/lzp.h
++++ b/libbsc/lzp/lzp.h
+@@ -51,15 +51,17 @@ extern "C" {
+ 
+     /**
+     * Reconstructs the original memory block after LZP algorithm.
+-    * @param input      - the input memory block of n bytes.
+-    * @param output     - the output memory block.
+-    * @param n          - the length of the input memory block.
+-    * @param hashSize   - the hash table size.
+-    * @param minLen     - the minimum match length.
+-    * @param features   - the set of additional features.
++    * @param input          - the input memory block of n bytes.
++    * @param output         - the output memory block.
++    * @param n              - the length of the input memory block.
++    * @param outputCapacity - the capacity of the output memory block (QZ-SECURITY-PATCH:
++    *                         bounds every decode write so a crafted stream cannot overrun it).
++    * @param hashSize       - the hash table size.
++    * @param minLen         - the minimum match length.
++    * @param features       - the set of additional features.
+     * @return The length of original memory block if no error occurred, error code otherwise.
+     */
+-    int bsc_lzp_decompress(const unsigned char * input, unsigned char * output, int n, int hashSize, int minLen, int features);
++    int bsc_lzp_decompress(const unsigned char * input, unsigned char * output, int n, int outputCapacity, int hashSize, int minLen, int features);
+ 
+ #ifdef __cplusplus
+ }

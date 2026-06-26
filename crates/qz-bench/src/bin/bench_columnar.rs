@@ -19,7 +19,6 @@
 ///   F. Sorted + aligned + consensus-residual: shift-align then residual + BSC
 ///
 /// Usage: cargo run --release --bin bench_columnar [fastq_path]
-
 use std::io::BufRead;
 use std::time::Instant;
 
@@ -82,7 +81,7 @@ fn minimizer_sort_key(seq: &[u8]) -> u64 {
                 }
             };
             fwd = (fwd << 2) | v;
-            rev = rev | ((3 - v) << (2 * j));
+            rev |= (3 - v) << (2 * j);
         }
 
         if valid {
@@ -119,11 +118,11 @@ fn find_best_shift(reference: &[u8], query: &[u8], k: usize) -> i32 {
     let mut shift_votes: FxHashMap<i32, u32> = FxHashMap::default();
     for i in 0..=query.len() - k {
         let h = kmer_hash(&query[i..i + k]);
-        if let Some(h) = h {
-            if let Some(&ref_pos) = ref_kmers.get(&h) {
-                let shift = i as i32 - ref_pos;
-                *shift_votes.entry(shift).or_insert(0) += 1;
-            }
+        if let Some(h) = h
+            && let Some(&ref_pos) = ref_kmers.get(&h)
+        {
+            let shift = i as i32 - ref_pos;
+            *shift_votes.entry(shift).or_insert(0) += 1;
         }
     }
 
@@ -211,10 +210,7 @@ fn consensus_residual(sequences: &[&[u8]], read_len: usize) -> (Vec<u8>, Vec<u8>
 /// Build consensus + residual for shift-aligned reads.
 /// Reads are placed on a virtual coordinate system based on their shifts.
 /// Returns (consensus, residual_column_major, matrix_width).
-fn aligned_consensus_residual(
-    sequences: &[&[u8]],
-    shifts: &[i32],
-) -> (Vec<u8>, Vec<u8>, usize) {
+fn aligned_consensus_residual(sequences: &[&[u8]], shifts: &[i32]) -> (Vec<u8>, Vec<u8>, usize) {
     let n = sequences.len();
     if n == 0 {
         return (Vec::new(), Vec::new(), 0);
@@ -377,10 +373,7 @@ fn main() {
     let num_reads = sequences.len();
     let read_len = sequences[0].len();
     let all_same_len = sequences.iter().all(|s| s.len() == read_len);
-    eprintln!(
-        "Read length: {} (uniform: {})",
-        read_len, all_same_len
-    );
+    eprintln!("Read length: {} (uniform: {})", read_len, all_same_len);
 
     let raw_size = num_reads * read_len;
     eprintln!("Raw sequence data: {} bytes", raw_size);
@@ -415,7 +408,10 @@ fn main() {
     eprintln!("  Sorted in {:.2}s", t.elapsed().as_secs_f64());
 
     // Build sorted sequence refs
-    let sorted_seqs: Vec<&[u8]> = sorted_indices.iter().map(|&i| sequences[i].as_slice()).collect();
+    let sorted_seqs: Vec<&[u8]> = sorted_indices
+        .iter()
+        .map(|&i| sequences[i].as_slice())
+        .collect();
 
     // ── Strategy B: Sorted + raw BSC ─────────────────────────────────────
 
@@ -569,7 +565,7 @@ fn main() {
     let mut total_covered = 0usize;
     let mut chunk_compressed_parts: Vec<Vec<u8>> = Vec::new();
 
-    let num_chunks = (num_reads + chunk_size - 1) / chunk_size;
+    let num_chunks = num_reads.div_ceil(chunk_size);
 
     for chunk_idx in 0..num_chunks {
         let start = chunk_idx * chunk_size;
@@ -700,10 +696,7 @@ fn main() {
     // ── Summary ──────────────────────────────────────────────────────────
 
     eprintln!("\n=== Summary ===");
-    eprintln!(
-        "  Raw:                         {:>12} bytes",
-        raw_size
-    );
+    eprintln!("  Raw:                         {:>12} bytes", raw_size);
     eprintln!(
         "  A. Baseline (no sort):       {:>12} bytes  {:.3}x  {:.3} bpb",
         baseline_size,

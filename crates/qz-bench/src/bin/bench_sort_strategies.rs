@@ -20,7 +20,6 @@
 ///   - Compressed size of the sorted stream
 ///   - Sort key / permutation storage cost (BSC'd)
 ///   - Net total = sorted_compressed + perm_cost
-
 use std::io::BufRead;
 use std::time::Instant;
 
@@ -65,1413 +64,1858 @@ fn main() {
     );
 
     // ========================================================================
-    // SEQUENCE SORTING STRATEGIES
+    // SETUP — always runs. Compute baselines used by every section.
     // ========================================================================
-    println!("=== SEQUENCE SORTING STRATEGIES ===\n");
-    println!(
-        "{:<50} {:>12} {:>8} {:>12} {:>12} {:>10}",
-        "Strategy", "Seq BSC", "Ratio", "Perm cost", "Net total", "Time"
-    );
-    println!("{}", "-".repeat(108));
-
-    // Pre-compute quality baseline (needed by three-level key section)
     let qual_baseline = {
-        let raw: Vec<u8> = qualities.iter().flat_map(|q| q.as_bytes()).copied().collect();
+        let raw: Vec<u8> = qualities
+            .iter()
+            .flat_map(|q| q.as_bytes())
+            .copied()
+            .collect();
         bsc::compress_parallel_adaptive(&raw).unwrap().len()
     };
-
-    // Baseline: no sort
-    let seq_baseline;
-    {
-        let raw: Vec<u8> = sequences.iter().flat_map(|s| s.as_bytes()).copied().collect();
+    let (seq_baseline, seq_baseline_time) = {
+        let raw: Vec<u8> = sequences
+            .iter()
+            .flat_map(|s| s.as_bytes())
+            .copied()
+            .collect();
         let t = Instant::now();
         let compressed = bsc::compress_parallel_adaptive(&raw).unwrap();
-        let elapsed = t.elapsed();
-        seq_baseline = compressed.len();
+        (compressed.len(), t.elapsed())
+    };
+    let combined_baseline = seq_baseline + qual_baseline;
+    eprintln!(
+        "Baselines computed: seq={} B ({:.2}x), qual={} B ({:.2}x), combined={} B",
+        seq_baseline,
+        total_seq_bytes as f64 / seq_baseline as f64,
+        qual_baseline,
+        total_qual_bytes as f64 / qual_baseline as f64,
+        combined_baseline,
+    );
+
+    // Section selector via env var QZ_BENCH_ONLY (comma-separated names).
+    // Names: seq, improved, qual, combined, perm, approx, block-q, block-s
+    // Unset = run all.
+    let bench_only: Option<std::collections::HashSet<String>> = std::env::var("QZ_BENCH_ONLY")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
+    let run_section = |name: &str| -> bool { bench_only.as_ref().is_none_or(|s| s.contains(name)) };
+
+    // ========================================================================
+    // SEQUENCE SORTING STRATEGIES
+    // ========================================================================
+    if run_section("seq") {
+        println!("=== SEQUENCE SORTING STRATEGIES ===\n");
+        println!(
+            "{:<50} {:>12} {:>8} {:>12} {:>12} {:>10}",
+            "Strategy", "Seq BSC", "Ratio", "Perm cost", "Net total", "Time"
+        );
+        println!("{}", "-".repeat(108));
         print_result(
             "1. Baseline (original order)",
             total_seq_bytes,
-            compressed.len(),
+            seq_baseline,
             0,
-            elapsed,
+            seq_baseline_time,
         );
-    }
 
-    // --- Sort helpers ---
-    // Each strategy produces a permutation. We measure:
-    //   a) compressed size of reordered stream
-    //   b) permutation cost (delta-zigzag-varint + BSC)
+        // --- Sort helpers ---
+        // Each strategy produces a permutation. We measure:
+        //   a) compressed size of reordered stream
+        //   b) permutation cost (delta-zigzag-varint + BSC)
 
-    // 2. Lexicographic sort
-    bench_sort_strategy(
-        "2. Lexicographic",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0, // qual_baseline filled later
-        |_i, seq, _qual| seq.as_bytes().to_vec(),
-        true,
-        false,
-    );
-
-    // 3. Sort by mean ASCII value
-    bench_sort_strategy(
-        "3. Mean ASCII value",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0,
-        |_i, seq, _qual| {
-            let bytes = seq.as_bytes();
-            let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
-            vec![mean as u8]
-        },
-        true,
-        false,
-    );
-
-    // 4. Sort by L2 norm (sum of squares)
-    bench_sort_strategy(
-        "4. L2 norm (sum of squares)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0,
-        |_i, seq, _qual| {
-            let bytes = seq.as_bytes();
-            let sos: u64 = bytes.iter().map(|&b| (b as u64) * (b as u64)).sum();
-            sos.to_le_bytes().to_vec()
-        },
-        true,
-        false,
-    );
-
-    // 5. Multi-key: (mean, variance)
-    bench_sort_strategy(
-        "5. Multi-key (mean, variance)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0,
-        |_i, seq, _qual| {
-            let bytes = seq.as_bytes();
-            let n = bytes.len().max(1) as u64;
-            let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
-            let mean = sum / n;
-            let var: u64 = bytes.iter().map(|&b| {
-                let d = (b as i64) - (mean as i64);
-                (d * d) as u64
-            }).sum::<u64>() / n;
-            let mut key = Vec::with_capacity(3);
-            key.push(mean as u8);
-            key.extend_from_slice(&(var as u16).to_le_bytes());
-            key
-        },
-        true,
-        false,
-    );
-
-    // 6. Multi-key: (mean, min)
-    bench_sort_strategy(
-        "6. Multi-key (mean, min)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0,
-        |_i, seq, _qual| {
-            let bytes = seq.as_bytes();
-            let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
-            let min = bytes.iter().copied().min().unwrap_or(0);
-            vec![mean as u8, min]
-        },
-        true,
-        false,
-    );
-
-    // 7. Quantized profile (8 bins)
-    bench_sort_strategy(
-        "7. Quantized profile (8 bins)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0,
-        |_i, seq, _qual| quantize_profile(seq.as_bytes(), 8),
-        true,
-        false,
-    );
-
-    // 7b. Quantized profile (16 bins)
-    bench_sort_strategy(
-        "7b. Quantized profile (16 bins)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0,
-        |_i, seq, _qual| quantize_profile(seq.as_bytes(), 16),
-        true,
-        false,
-    );
-
-    // 8. Sort by first + last 16 bytes
-    bench_sort_strategy(
-        "8. First+last 16 bytes",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0,
-        |_i, seq, _qual| {
-            let b = seq.as_bytes();
-            let n = b.len();
-            let mut key = Vec::with_capacity(32);
-            key.extend_from_slice(&b[..16.min(n)]);
-            if n > 16 {
-                key.extend_from_slice(&b[n - 16..]);
-            }
-            key
-        },
-        true,
-        false,
-    );
-
-    // 9. Reverse-complement canonical + lex sort
-    bench_sort_strategy(
-        "9. RC-canonical + lex",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        0,
-        |_i, seq, _qual| {
-            let b = seq.as_bytes();
-            let rc = reverse_complement_bytes(b);
-            if rc < b.to_vec() { rc } else { b.to_vec() }
-        },
-        true,
-        false,
-    );
-
-    // 10. Minimizer sort (k=15, w=10)
-    {
-        let t = Instant::now();
-        let mut perm: Vec<u32> = (0..num_reads as u32).collect();
-        let min_hashes: Vec<u64> = sequences
-            .par_iter()
-            .map(|s| canonical_minimizer(s.as_bytes(), 15, 10))
-            .collect();
-        perm.sort_unstable_by_key(|&i| min_hashes[i as usize]);
-        let elapsed = t.elapsed();
-
-        let reordered: Vec<u8> = perm
-            .iter()
-            .flat_map(|&i| sequences[i as usize].as_bytes())
-            .copied()
-            .collect();
-        let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
-
-        // No permutation cost — decompressor can recompute from sequences
-        print_result(
-            "10. Minimizer (k=15,w=10) [free perm]",
+        // 2. Lexicographic sort
+        bench_sort_strategy(
+            "2. Lexicographic",
+            &sequences,
+            &qualities,
             total_seq_bytes,
-            compressed.len(),
-            0,
-            elapsed,
+            total_qual_bytes,
+            seq_baseline,
+            0, // qual_baseline filled later
+            |_i, seq, _qual| seq.as_bytes().to_vec(),
+            true,
+            false,
         );
-        print_delta(compressed.len(), 0, seq_baseline);
-    }
 
-    // 11. Syncmer sort (k=31, s=28)
-    {
-        let anchor_k = 31usize;
-        let s = anchor_k.saturating_sub(3).max(5);
-        let t_end = anchor_k - s;
+        // 3. Sort by mean ASCII value
+        bench_sort_strategy(
+            "3. Mean ASCII value",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            0,
+            |_i, seq, _qual| {
+                let bytes = seq.as_bytes();
+                let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
+                vec![mean as u8]
+            },
+            true,
+            false,
+        );
 
-        let t = Instant::now();
-        let sort_keys: Vec<u64> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                if sb.len() < anchor_k { return u64::MAX; }
-                let positions = syncmers::find_syncmers_pos(anchor_k, s, &[0, t_end], sb);
-                let mut min_hash = u64::MAX;
-                for pos in positions {
-                    if pos + anchor_k > sb.len() { continue; }
-                    let kmer = &sb[pos..pos + anchor_k];
-                    if let Some(fwd) = kmer_to_hash(kmer) {
-                        let rc = reverse_complement_hash(fwd, anchor_k);
-                        let canon = fwd.min(rc);
-                        if canon < min_hash { min_hash = canon; }
-                    }
+        // 4. Sort by L2 norm (sum of squares)
+        bench_sort_strategy(
+            "4. L2 norm (sum of squares)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            0,
+            |_i, seq, _qual| {
+                let bytes = seq.as_bytes();
+                let sos: u64 = bytes.iter().map(|&b| (b as u64) * (b as u64)).sum();
+                sos.to_le_bytes().to_vec()
+            },
+            true,
+            false,
+        );
+
+        // 5. Multi-key: (mean, variance)
+        bench_sort_strategy(
+            "5. Multi-key (mean, variance)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            0,
+            |_i, seq, _qual| {
+                let bytes = seq.as_bytes();
+                let n = bytes.len().max(1) as u64;
+                let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
+                let mean = sum / n;
+                let var: u64 = bytes
+                    .iter()
+                    .map(|&b| {
+                        let d = (b as i64) - (mean as i64);
+                        (d * d) as u64
+                    })
+                    .sum::<u64>()
+                    / n;
+                let mut key = Vec::with_capacity(3);
+                key.push(mean as u8);
+                key.extend_from_slice(&(var as u16).to_le_bytes());
+                key
+            },
+            true,
+            false,
+        );
+
+        // 6. Multi-key: (mean, min)
+        bench_sort_strategy(
+            "6. Multi-key (mean, min)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            0,
+            |_i, seq, _qual| {
+                let bytes = seq.as_bytes();
+                let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
+                let min = bytes.iter().copied().min().unwrap_or(0);
+                vec![mean as u8, min]
+            },
+            true,
+            false,
+        );
+
+        // 7. Quantized profile (8 bins)
+        bench_sort_strategy(
+            "7. Quantized profile (8 bins)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            0,
+            |_i, seq, _qual| quantize_profile(seq.as_bytes(), 8),
+            true,
+            false,
+        );
+
+        // 7b. Quantized profile (16 bins)
+        bench_sort_strategy(
+            "7b. Quantized profile (16 bins)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            0,
+            |_i, seq, _qual| quantize_profile(seq.as_bytes(), 16),
+            true,
+            false,
+        );
+
+        // 8. Sort by first + last 16 bytes
+        bench_sort_strategy(
+            "8. First+last 16 bytes",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            0,
+            |_i, seq, _qual| {
+                let b = seq.as_bytes();
+                let n = b.len();
+                let mut key = Vec::with_capacity(32);
+                key.extend_from_slice(&b[..16.min(n)]);
+                if n > 16 {
+                    key.extend_from_slice(&b[n - 16..]);
                 }
-                min_hash
-            })
-            .collect();
-        let mut perm: Vec<u32> = (0..num_reads as u32).collect();
-        perm.sort_unstable_by_key(|&i| sort_keys[i as usize]);
-        let elapsed = t.elapsed();
-
-        let reordered: Vec<u8> = perm
-            .iter()
-            .flat_map(|&i| sequences[i as usize].as_bytes())
-            .copied()
-            .collect();
-        let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
-
-        print_result(
-            "11. Syncmer (k=31,s=28) [free perm]",
-            total_seq_bytes,
-            compressed.len(),
-            0,
-            elapsed,
+                key
+            },
+            true,
+            false,
         );
-        print_delta(compressed.len(), 0, seq_baseline);
-    }
+
+        // 9. Reverse-complement canonical + lex sort
+        bench_sort_strategy(
+            "9. RC-canonical + lex",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            0,
+            |_i, seq, _qual| {
+                let b = seq.as_bytes();
+                let rc = reverse_complement_bytes(b);
+                if rc < b.to_vec() { rc } else { b.to_vec() }
+            },
+            true,
+            false,
+        );
+
+        // 10. Minimizer sort (k=15, w=10)
+        {
+            let t = Instant::now();
+            let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+            let min_hashes: Vec<u64> = sequences
+                .par_iter()
+                .map(|s| canonical_minimizer(s.as_bytes(), 15, 10))
+                .collect();
+            perm.sort_unstable_by_key(|&i| min_hashes[i as usize]);
+            let elapsed = t.elapsed();
+
+            let reordered: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| sequences[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
+
+            // No permutation cost — decompressor can recompute from sequences
+            print_result(
+                "10. Minimizer (k=15,w=10) [free perm]",
+                total_seq_bytes,
+                compressed.len(),
+                0,
+                elapsed,
+            );
+            print_delta(compressed.len(), 0, seq_baseline);
+        }
+
+        // 11. Syncmer sort (k=31, s=28)
+        {
+            let anchor_k = 31usize;
+            let s = anchor_k.saturating_sub(3).max(5);
+            let t_end = anchor_k - s;
+
+            let t = Instant::now();
+            let sort_keys: Vec<u64> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    if sb.len() < anchor_k {
+                        return u64::MAX;
+                    }
+                    let positions = syncmers::find_syncmers_pos(anchor_k, s, &[0, t_end], sb);
+                    let mut min_hash = u64::MAX;
+                    for pos in positions {
+                        if pos + anchor_k > sb.len() {
+                            continue;
+                        }
+                        let kmer = &sb[pos..pos + anchor_k];
+                        if let Some(fwd) = kmer_to_hash(kmer) {
+                            let rc = reverse_complement_hash(fwd, anchor_k);
+                            let canon = fwd.min(rc);
+                            if canon < min_hash {
+                                min_hash = canon;
+                            }
+                        }
+                    }
+                    min_hash
+                })
+                .collect();
+            let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+            perm.sort_unstable_by_key(|&i| sort_keys[i as usize]);
+            let elapsed = t.elapsed();
+
+            let reordered: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| sequences[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
+
+            print_result(
+                "11. Syncmer (k=31,s=28) [free perm]",
+                total_seq_bytes,
+                compressed.len(),
+                0,
+                elapsed,
+            );
+            print_delta(compressed.len(), 0, seq_baseline);
+        }
+    } // end run_section("seq")
 
     // ========================================================================
     // IMPROVED SYNCMER / MINIMIZER STRATEGIES
     // ========================================================================
-    println!("\n\n=== IMPROVED SYNCMER / MINIMIZER STRATEGIES (all free perm) ===\n");
-    println!(
-        "{:<55} {:>12} {:>8} {:>10}",
-        "Strategy", "Seq BSC", "Ratio", "Time"
-    );
-    println!("{}", "-".repeat(88));
-    println!(
-        "{:<55} {:>10} B {:>6.2}x",
-        "Baseline (no sort)", seq_baseline, total_seq_bytes as f64 / seq_baseline as f64,
-    );
-
-    // Helper: run a sequence sort by u128 key and print result
-    let bench_seq_sort_u128 = |name: &str, keys: &[u128]| {
-        let t = Instant::now();
-        let mut perm: Vec<u32> = (0..num_reads as u32).collect();
-        perm.sort_unstable_by_key(|&i| keys[i as usize]);
-        let elapsed = t.elapsed();
-        let reordered: Vec<u8> = perm.iter().flat_map(|&i| sequences[i as usize].as_bytes()).copied().collect();
-        let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
-        let delta = compressed.len() as i64 - seq_baseline as i64;
+    if run_section("improved") {
+        println!("\n\n=== IMPROVED SYNCMER / MINIMIZER STRATEGIES (all free perm) ===\n");
         println!(
-            "{:<55} {:>10} B {:>6.2}x {:>8.0}ms  ({:+} B)",
-            name,
-            compressed.len(),
-            total_seq_bytes as f64 / compressed.len() as f64,
-            elapsed.as_secs_f64() * 1000.0,
-            delta,
+            "{:<55} {:>12} {:>8} {:>10}",
+            "Strategy", "Seq BSC", "Ratio", "Time"
         );
-        compressed.len()
-    };
-
-    // Helper: sort by Vec<u8> key
-    let bench_seq_sort_bytes = |name: &str, keys: &[Vec<u8>]| {
-        let t = Instant::now();
-        let mut perm: Vec<u32> = (0..num_reads as u32).collect();
-        perm.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
-        let elapsed = t.elapsed();
-        let reordered: Vec<u8> = perm.iter().flat_map(|&i| sequences[i as usize].as_bytes()).copied().collect();
-        let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
-        let delta = compressed.len() as i64 - seq_baseline as i64;
+        println!("{}", "-".repeat(88));
         println!(
-            "{:<55} {:>10} B {:>6.2}x {:>8.0}ms  ({:+} B)",
-            name,
-            compressed.len(),
-            total_seq_bytes as f64 / compressed.len() as f64,
-            elapsed.as_secs_f64() * 1000.0,
-            delta,
+            "{:<55} {:>10} B {:>6.2}x",
+            "Baseline (no sort)",
+            seq_baseline,
+            total_seq_bytes as f64 / seq_baseline as f64,
         );
-        compressed.len()
-    };
 
-    // --- Reference: current best syncmer (k=31, s=28) ---
-    let syncmer_k31_keys: Vec<u64> = sequences
-        .par_iter()
-        .map(|seq| compute_min_syncmer_hash(seq.as_bytes(), 31, 28))
-        .collect();
-    {
-        let keys128: Vec<u128> = syncmer_k31_keys.iter().map(|&h| h as u128).collect();
-        bench_seq_sort_u128("Ref: Syncmer k=31 s=28 (single hash)", &keys128);
-    }
+        // Helper: run a sequence sort by u128 key and print result
+        let bench_seq_sort_u128 = |name: &str, keys: &[u128]| {
+            let t = Instant::now();
+            let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+            perm.sort_unstable_by_key(|&i| keys[i as usize]);
+            let elapsed = t.elapsed();
+            let reordered: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| sequences[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
+            let delta = compressed.len() as i64 - seq_baseline as i64;
+            println!(
+                "{:<55} {:>10} B {:>6.2}x {:>8.0}ms  ({:+} B)",
+                name,
+                compressed.len(),
+                total_seq_bytes as f64 / compressed.len() as f64,
+                elapsed.as_secs_f64() * 1000.0,
+                delta,
+            );
+            compressed.len()
+        };
 
-    // === 1. Multi-level: (min_hash, 2nd_min_hash) ===
-    {
-        let keys: Vec<u128> = sequences
+        // Helper: sort by Vec<u8> key
+        let bench_seq_sort_bytes = |name: &str, keys: &[Vec<u8>]| {
+            let t = Instant::now();
+            let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+            perm.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
+            let elapsed = t.elapsed();
+            let reordered: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| sequences[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
+            let delta = compressed.len() as i64 - seq_baseline as i64;
+            println!(
+                "{:<55} {:>10} B {:>6.2}x {:>8.0}ms  ({:+} B)",
+                name,
+                compressed.len(),
+                total_seq_bytes as f64 / compressed.len() as f64,
+                elapsed.as_secs_f64() * 1000.0,
+                delta,
+            );
+            compressed.len()
+        };
+
+        // --- Reference: current best syncmer (k=31, s=28) ---
+        let syncmer_k31_keys: Vec<u64> = sequences
             .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let (h1, h2) = compute_top2_syncmer_hashes(sb, 31, 28);
-                ((h1 as u128) << 64) | (h2 as u128)
-            })
+            .map(|seq| compute_min_syncmer_hash(seq.as_bytes(), 31, 28))
             .collect();
-        bench_seq_sort_u128("1. Syncmer (min_hash, 2nd_hash) k=31", &keys);
-    }
+        {
+            let keys128: Vec<u128> = syncmer_k31_keys.iter().map(|&h| h as u128).collect();
+            bench_seq_sort_u128("Ref: Syncmer k=31 s=28 (single hash)", &keys128);
+        }
 
-    // === 2. (min_hash, position_of_min) — approximates genomic offset ===
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = compute_min_syncmer_hash_with_pos(sb, 31, 28);
-                ((hash as u128) << 16) | (pos as u128)
-            })
-            .collect();
-        bench_seq_sort_u128("2. Syncmer (min_hash, position) k=31", &keys);
-    }
+        // === 1. Multi-level: (min_hash, 2nd_min_hash) ===
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let (h1, h2) = compute_top2_syncmer_hashes(sb, 31, 28);
+                    ((h1 as u128) << 64) | (h2 as u128)
+                })
+                .collect();
+            bench_seq_sort_u128("1. Syncmer (min_hash, 2nd_hash) k=31", &keys);
+        }
 
-    // === 3. (min_hash, lex suffix after min position) ===
-    {
-        let keys: Vec<Vec<u8>> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = compute_min_syncmer_hash_with_pos(sb, 31, 28);
-                let mut key = hash.to_be_bytes().to_vec();
-                // Append the read starting from the minimizer position
-                let start = (pos as usize).min(sb.len());
-                key.extend_from_slice(&sb[start..]);
-                key
-            })
-            .collect();
-        bench_seq_sort_bytes("3. Syncmer (min_hash, lex_suffix) k=31", &keys);
-    }
+        // === 2. (min_hash, position_of_min) — approximates genomic offset ===
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = compute_min_syncmer_hash_with_pos(sb, 31, 28);
+                    ((hash as u128) << 16) | (pos as u128)
+                })
+                .collect();
+            bench_seq_sort_u128("2. Syncmer (min_hash, position) k=31", &keys);
+        }
 
-    // === 4. MinHash sketch: sorted top-4 canonical hashes ===
-    {
-        let keys: Vec<Vec<u8>> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let hashes = compute_sorted_syncmer_hashes(sb, 31, 28, 4);
-                hashes.iter().flat_map(|h| h.to_be_bytes()).collect()
-            })
-            .collect();
-        bench_seq_sort_bytes("4. MinHash sketch (top-4 syncmer hashes) k=31", &keys);
-    }
+        // === 3. (min_hash, lex suffix after min position) ===
+        {
+            let keys: Vec<Vec<u8>> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = compute_min_syncmer_hash_with_pos(sb, 31, 28);
+                    let mut key = hash.to_be_bytes().to_vec();
+                    // Append the read starting from the minimizer position
+                    let start = (pos as usize).min(sb.len());
+                    key.extend_from_slice(&sb[start..]);
+                    key
+                })
+                .collect();
+            bench_seq_sort_bytes("3. Syncmer (min_hash, lex_suffix) k=31", &keys);
+        }
 
-    // === 5. MinHash sketch top-8 ===
-    {
-        let keys: Vec<Vec<u8>> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let hashes = compute_sorted_syncmer_hashes(sb, 31, 28, 8);
-                hashes.iter().flat_map(|h| h.to_be_bytes()).collect()
-            })
-            .collect();
-        bench_seq_sort_bytes("5. MinHash sketch (top-8 syncmer hashes) k=31", &keys);
-    }
+        // === 4. MinHash sketch: sorted top-4 canonical hashes ===
+        {
+            let keys: Vec<Vec<u8>> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let hashes = compute_sorted_syncmer_hashes(sb, 31, 28, 4);
+                    hashes.iter().flat_map(|h| h.to_be_bytes()).collect()
+                })
+                .collect();
+            bench_seq_sort_bytes("4. MinHash sketch (top-4 syncmer hashes) k=31", &keys);
+        }
 
-    // === 6. Parameter sweep: different k values with syncmers ===
-    println!();
-    for k in [15usize, 21, 25, 31, 41] {
-        let s = k.saturating_sub(3).max(5);
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .map(|seq| compute_min_syncmer_hash(seq.as_bytes(), k, s) as u128)
-            .collect();
-        bench_seq_sort_u128(
-            &format!("6. Syncmer k={} s={} (single hash)", k, s),
-            &keys,
-        );
-    }
+        // === 5. MinHash sketch top-8 ===
+        {
+            let keys: Vec<Vec<u8>> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let hashes = compute_sorted_syncmer_hashes(sb, 31, 28, 8);
+                    hashes.iter().flat_map(|h| h.to_be_bytes()).collect()
+                })
+                .collect();
+            bench_seq_sort_bytes("5. MinHash sketch (top-8 syncmer hashes) k=31", &keys);
+        }
 
-    // === 7. Parameter sweep: minimizer with different k, w ===
-    println!();
-    for (k, w) in [(11, 5), (15, 10), (21, 11), (25, 15), (31, 16)] {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .map(|seq| canonical_minimizer(seq.as_bytes(), k, w) as u128)
-            .collect();
-        bench_seq_sort_u128(
-            &format!("7. Minimizer k={} w={}", k, w),
-            &keys,
-        );
-    }
+        // === 6. Parameter sweep: different k values with syncmers ===
+        println!();
+        for k in [15usize, 21, 25, 31, 41] {
+            let s = k.saturating_sub(3).max(5);
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .map(|seq| compute_min_syncmer_hash(seq.as_bytes(), k, s) as u128)
+                .collect();
+            bench_seq_sort_u128(&format!("6. Syncmer k={} s={} (single hash)", k, s), &keys);
+        }
 
-    // === 8. (minimizer, 2nd minimizer) multi-level ===
-    println!();
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let (h1, h2) = compute_top2_minimizer_hashes(sb, 15, 10);
-                ((h1 as u128) << 64) | (h2 as u128)
-            })
-            .collect();
-        bench_seq_sort_u128("8. Minimizer (top-2 hashes) k=15 w=10", &keys);
-    }
+        // === 7. Parameter sweep: minimizer with different k, w ===
+        println!();
+        for (k, w) in [(11, 5), (15, 10), (21, 11), (25, 15), (31, 16)] {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .map(|seq| canonical_minimizer(seq.as_bytes(), k, w) as u128)
+                .collect();
+            bench_seq_sort_u128(&format!("7. Minimizer k={} w={}", k, w), &keys);
+        }
 
-    // === 9. (minimizer, position of minimizer) ===
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
-                ((hash as u128) << 16) | (pos as u128)
-            })
-            .collect();
-        bench_seq_sort_u128("9. Minimizer (hash, position) k=15 w=10", &keys);
-    }
+        // === 8. (minimizer, 2nd minimizer) multi-level ===
+        println!();
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let (h1, h2) = compute_top2_minimizer_hashes(sb, 15, 10);
+                    ((h1 as u128) << 64) | (h2 as u128)
+                })
+                .collect();
+            bench_seq_sort_u128("8. Minimizer (top-2 hashes) k=15 w=10", &keys);
+        }
 
-    // === 10. Open syncmers (different selection from closed) ===
-    println!();
-    for k in [21, 31] {
-        let s = k / 2;
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .map(|seq| compute_min_open_syncmer_hash(seq.as_bytes(), k, s) as u128)
-            .collect();
-        bench_seq_sort_u128(
-            &format!("10. Open syncmer k={} s={}", k, s),
-            &keys,
-        );
-    }
+        // === 9. (minimizer, position of minimizer) ===
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
+                    ((hash as u128) << 16) | (pos as u128)
+                })
+                .collect();
+            bench_seq_sort_u128("9. Minimizer (hash, position) k=15 w=10", &keys);
+        }
 
-    // === 11. Hybrid: syncmer primary + lex secondary ===
-    {
-        let keys: Vec<Vec<u8>> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let hash = compute_min_syncmer_hash(sb, 31, 28);
-                let mut key = hash.to_be_bytes().to_vec();
-                key.extend_from_slice(sb); // full lex as tiebreak
-                key
-            })
-            .collect();
-        bench_seq_sort_bytes("11. Syncmer k=31 + lex tiebreak", &keys);
-    }
+        // === 10. Open syncmers (different selection from closed) ===
+        println!();
+        for k in [21, 31] {
+            let s = k / 2;
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .map(|seq| compute_min_open_syncmer_hash(seq.as_bytes(), k, s) as u128)
+                .collect();
+            bench_seq_sort_u128(&format!("10. Open syncmer k={} s={}", k, s), &keys);
+        }
 
-    // === 12. Hybrid: syncmer primary + RC-canonical lex secondary ===
-    {
-        let keys: Vec<Vec<u8>> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let hash = compute_min_syncmer_hash(sb, 31, 28);
-                let rc = reverse_complement_bytes(sb);
-                let canon = if rc < sb.to_vec() { rc } else { sb.to_vec() };
-                let mut key = hash.to_be_bytes().to_vec();
-                key.extend_from_slice(&canon);
-                key
-            })
-            .collect();
-        bench_seq_sort_bytes("12. Syncmer k=31 + RC-canon lex tiebreak", &keys);
-    }
+        // === 11. Hybrid: syncmer primary + lex secondary ===
+        {
+            let keys: Vec<Vec<u8>> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let hash = compute_min_syncmer_hash(sb, 31, 28);
+                    let mut key = hash.to_be_bytes().to_vec();
+                    key.extend_from_slice(sb); // full lex as tiebreak
+                    key
+                })
+                .collect();
+            bench_seq_sort_bytes("11. Syncmer k=31 + lex tiebreak", &keys);
+        }
 
-    // === 13-17. Three-level keys: seq-derived + quality tiebreak (all free perm) ===
-    println!("\n--- Three-level keys: seq hash + quality tiebreak (both streams, free perm) ---\n");
-    println!(
-        "{:<55} {:>12} {:>12} {:>12} {:>10}",
-        "Strategy", "Seq BSC", "Qual BSC", "Net total", "vs base"
-    );
-    println!("{}", "-".repeat(104));
+        // === 12. Hybrid: syncmer primary + RC-canonical lex secondary ===
+        {
+            let keys: Vec<Vec<u8>> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let hash = compute_min_syncmer_hash(sb, 31, 28);
+                    let rc = reverse_complement_bytes(sb);
+                    let canon = if rc < sb.to_vec() { rc } else { sb.to_vec() };
+                    let mut key = hash.to_be_bytes().to_vec();
+                    key.extend_from_slice(&canon);
+                    key
+                })
+                .collect();
+            bench_seq_sort_bytes("12. Syncmer k=31 + RC-canon lex tiebreak", &keys);
+        }
 
-    let combined_baseline = seq_baseline + qual_baseline;
-    println!(
-        "{:<55} {:>10} B {:>10} B {:>10} B",
-        "Baseline (no sort)",
-        seq_baseline,
-        qual_baseline,
-        combined_baseline,
-    );
-
-    // Helper closure for combined benchmarks
-    let bench_combined_u128 = |name: &str, keys: &[u128]| {
-        let t = Instant::now();
-        let mut perm: Vec<u32> = (0..num_reads as u32).collect();
-        perm.sort_unstable_by_key(|&i| keys[i as usize]);
-        let elapsed = t.elapsed();
-        let seq_reord: Vec<u8> = perm.iter().flat_map(|&i| sequences[i as usize].as_bytes()).copied().collect();
-        let qual_reord: Vec<u8> = perm.iter().flat_map(|&i| qualities[i as usize].as_bytes()).copied().collect();
-        let seq_comp = bsc::compress_parallel_adaptive(&seq_reord).unwrap();
-        let qual_comp = bsc::compress_parallel_adaptive(&qual_reord).unwrap();
-        let net = seq_comp.len() + qual_comp.len();
-        let delta = net as i64 - combined_baseline as i64;
+        // === 13-17. Three-level keys: seq-derived + quality tiebreak (all free perm) ===
         println!(
-            "{:<55} {:>10} B {:>10} B {:>10} B  {:>+8} B  {:.0}ms",
-            name,
-            seq_comp.len(),
-            qual_comp.len(),
-            net,
-            delta,
-            elapsed.as_secs_f64() * 1000.0,
+            "\n--- Three-level keys: seq hash + quality tiebreak (both streams, free perm) ---\n"
         );
-    };
+        println!(
+            "{:<55} {:>12} {:>12} {:>12} {:>10}",
+            "Strategy", "Seq BSC", "Qual BSC", "Net total", "vs base"
+        );
+        println!("{}", "-".repeat(104));
 
-    // Reference: minimizer (hash, pos) k=15 — current best
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
-                ((hash as u128) << 16) | (pos as u128)
-            })
-            .collect();
-        bench_combined_u128("Ref: Minimizer (hash, pos) k=15 w=10", &keys);
-    }
+        let combined_baseline = seq_baseline + qual_baseline;
+        println!(
+            "{:<55} {:>10} B {:>10} B {:>10} B",
+            "Baseline (no sort)", seq_baseline, qual_baseline, combined_baseline,
+        );
 
-    // 13. Three-level: (minimizer_hash, position, mean_quality)
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .zip(qualities.par_iter())
-            .map(|(seq, qual)| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
-                let qb = qual.as_bytes();
-                let mean_q = qb.iter().map(|&v| v as u64).sum::<u64>() / qb.len().max(1) as u64;
-                ((hash as u128) << 24) | ((pos as u128) << 8) | (mean_q as u128)
-            })
-            .collect();
-        bench_combined_u128("13. Minimizer (hash, pos, mean_qual) k=15", &keys);
-    }
+        // Helper closure for combined benchmarks
+        let bench_combined_u128 = |name: &str, keys: &[u128]| {
+            let t = Instant::now();
+            let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+            perm.sort_unstable_by_key(|&i| keys[i as usize]);
+            let elapsed = t.elapsed();
+            let seq_reord: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| sequences[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let qual_reord: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| qualities[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let seq_comp = bsc::compress_parallel_adaptive(&seq_reord).unwrap();
+            let qual_comp = bsc::compress_parallel_adaptive(&qual_reord).unwrap();
+            let net = seq_comp.len() + qual_comp.len();
+            let delta = net as i64 - combined_baseline as i64;
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>10} B  {:>+8} B  {:.0}ms",
+                name,
+                seq_comp.len(),
+                qual_comp.len(),
+                net,
+                delta,
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        };
 
-    // 14. Three-level: (minimizer_hash, mean_quality, position)
-    //     Prioritizes quality grouping over position ordering
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .zip(qualities.par_iter())
-            .map(|(seq, qual)| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
-                let qb = qual.as_bytes();
-                let mean_q = qb.iter().map(|&v| v as u64).sum::<u64>() / qb.len().max(1) as u64;
-                ((hash as u128) << 24) | ((mean_q as u128) << 16) | (pos as u128)
-            })
-            .collect();
-        bench_combined_u128("14. Minimizer (hash, mean_qual, pos) k=15", &keys);
-    }
+        // Reference: minimizer (hash, pos) k=15 — current best
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
+                    ((hash as u128) << 16) | (pos as u128)
+                })
+                .collect();
+            bench_combined_u128("Ref: Minimizer (hash, pos) k=15 w=10", &keys);
+        }
 
-    // 15. Three-level with syncmer: (syncmer_hash, position, mean_quality)
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .zip(qualities.par_iter())
-            .map(|(seq, qual)| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = compute_min_syncmer_hash_with_pos(sb, 31, 28);
-                let qb = qual.as_bytes();
-                let mean_q = qb.iter().map(|&v| v as u64).sum::<u64>() / qb.len().max(1) as u64;
-                ((hash as u128) << 24) | ((pos as u128) << 8) | (mean_q as u128)
-            })
-            .collect();
-        bench_combined_u128("15. Syncmer (hash, pos, mean_qual) k=31", &keys);
-    }
+        // 13. Three-level: (minimizer_hash, position, mean_quality)
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .zip(qualities.par_iter())
+                .map(|(seq, qual)| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
+                    let qb = qual.as_bytes();
+                    let mean_q = qb.iter().map(|&v| v as u64).sum::<u64>() / qb.len().max(1) as u64;
+                    ((hash as u128) << 24) | ((pos as u128) << 8) | (mean_q as u128)
+                })
+                .collect();
+            bench_combined_u128("13. Minimizer (hash, pos, mean_qual) k=15", &keys);
+        }
 
-    // 16. Four-level: (minimizer_hash, pos, mean_qual, qual_variance)
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .zip(qualities.par_iter())
-            .map(|(seq, qual)| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
-                let qb = qual.as_bytes();
-                let n = qb.len().max(1) as u64;
-                let sum: u64 = qb.iter().map(|&v| v as u64).sum();
-                let mean_q = sum / n;
-                let var: u64 = qb.iter().map(|&v| {
-                    let d = (v as i64) - (mean_q as i64);
-                    (d * d) as u64
-                }).sum::<u64>() / n;
-                let var8 = (var.min(255)) as u128;
-                ((hash as u128) << 32) | ((pos as u128) << 16) | ((mean_q as u128) << 8) | var8
-            })
-            .collect();
-        bench_combined_u128("16. Minimizer (hash,pos,mean_q,var) k=15", &keys);
-    }
+        // 14. Three-level: (minimizer_hash, mean_quality, position)
+        //     Prioritizes quality grouping over position ordering
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .zip(qualities.par_iter())
+                .map(|(seq, qual)| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
+                    let qb = qual.as_bytes();
+                    let mean_q = qb.iter().map(|&v| v as u64).sum::<u64>() / qb.len().max(1) as u64;
+                    ((hash as u128) << 24) | ((mean_q as u128) << 16) | (pos as u128)
+                })
+                .collect();
+            bench_combined_u128("14. Minimizer (hash, mean_qual, pos) k=15", &keys);
+        }
 
-    // 17. Open syncmer k=21 + position + mean quality
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .zip(qualities.par_iter())
-            .map(|(seq, qual)| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = compute_min_open_syncmer_hash_with_pos(sb, 21, 10);
-                let qb = qual.as_bytes();
-                let mean_q = qb.iter().map(|&v| v as u64).sum::<u64>() / qb.len().max(1) as u64;
-                ((hash as u128) << 24) | ((pos as u128) << 8) | (mean_q as u128)
-            })
-            .collect();
-        bench_combined_u128("17. Open syncmer (hash,pos,mean_q) k=21", &keys);
-    }
+        // 15. Three-level with syncmer: (syncmer_hash, position, mean_quality)
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .zip(qualities.par_iter())
+                .map(|(seq, qual)| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = compute_min_syncmer_hash_with_pos(sb, 31, 28);
+                    let qb = qual.as_bytes();
+                    let mean_q = qb.iter().map(|&v| v as u64).sum::<u64>() / qb.len().max(1) as u64;
+                    ((hash as u128) << 24) | ((pos as u128) << 8) | (mean_q as u128)
+                })
+                .collect();
+            bench_combined_u128("15. Syncmer (hash, pos, mean_qual) k=31", &keys);
+        }
 
-    // 18. Minimizer hash + position + quantized quality profile (4 bins)
-    {
-        let keys: Vec<u128> = sequences
-            .par_iter()
-            .zip(qualities.par_iter())
-            .map(|(seq, qual)| {
-                let sb = seq.as_bytes();
-                let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
-                let qb = qual.as_bytes();
-                let profile = quantize_profile(qb, 4);
-                ((hash as u128) << 48)
-                    | ((pos as u128) << 32)
-                    | ((profile[0] as u128) << 24)
-                    | ((profile[1] as u128) << 16)
-                    | ((profile[2] as u128) << 8)
-                    | (profile[3] as u128)
-            })
-            .collect();
-        bench_combined_u128("18. Minimizer (hash,pos,qual_profile4) k=15", &keys);
-    }
+        // 16. Four-level: (minimizer_hash, pos, mean_qual, qual_variance)
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .zip(qualities.par_iter())
+                .map(|(seq, qual)| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
+                    let qb = qual.as_bytes();
+                    let n = qb.len().max(1) as u64;
+                    let sum: u64 = qb.iter().map(|&v| v as u64).sum();
+                    let mean_q = sum / n;
+                    let var: u64 = qb
+                        .iter()
+                        .map(|&v| {
+                            let d = (v as i64) - (mean_q as i64);
+                            (d * d) as u64
+                        })
+                        .sum::<u64>()
+                        / n;
+                    let var8 = (var.min(255)) as u128;
+                    ((hash as u128) << 32) | ((pos as u128) << 16) | ((mean_q as u128) << 8) | var8
+                })
+                .collect();
+            bench_combined_u128("16. Minimizer (hash,pos,mean_q,var) k=15", &keys);
+        }
 
-    println!("{}", "-".repeat(104));
+        // 17. Open syncmer k=21 + position + mean quality
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .zip(qualities.par_iter())
+                .map(|(seq, qual)| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = compute_min_open_syncmer_hash_with_pos(sb, 21, 10);
+                    let qb = qual.as_bytes();
+                    let mean_q = qb.iter().map(|&v| v as u64).sum::<u64>() / qb.len().max(1) as u64;
+                    ((hash as u128) << 24) | ((pos as u128) << 8) | (mean_q as u128)
+                })
+                .collect();
+            bench_combined_u128("17. Open syncmer (hash,pos,mean_q) k=21", &keys);
+        }
+
+        // 18. Minimizer hash + position + quantized quality profile (4 bins)
+        {
+            let keys: Vec<u128> = sequences
+                .par_iter()
+                .zip(qualities.par_iter())
+                .map(|(seq, qual)| {
+                    let sb = seq.as_bytes();
+                    let (hash, pos) = canonical_minimizer_with_pos(sb, 15, 10);
+                    let qb = qual.as_bytes();
+                    let profile = quantize_profile(qb, 4);
+                    ((hash as u128) << 48)
+                        | ((pos as u128) << 32)
+                        | ((profile[0] as u128) << 24)
+                        | ((profile[1] as u128) << 16)
+                        | ((profile[2] as u128) << 8)
+                        | (profile[3] as u128)
+                })
+                .collect();
+            bench_combined_u128("18. Minimizer (hash,pos,qual_profile4) k=15", &keys);
+        }
+
+        println!("{}", "-".repeat(104));
+    } // end run_section("improved")
 
     // ========================================================================
     // QUALITY SORTING STRATEGIES
     // ========================================================================
-    println!("\n\n=== QUALITY SORTING STRATEGIES ===\n");
-    println!(
-        "{:<50} {:>12} {:>8} {:>12} {:>12} {:>10}",
-        "Strategy", "Qual BSC", "Ratio", "Perm cost", "Net total", "Time"
-    );
-    println!("{}", "-".repeat(108));
-
-    // Baseline (qual_baseline already computed at top)
-    print_result(
-        "1. Baseline (original order)",
-        total_qual_bytes,
-        qual_baseline,
-        0,
-        std::time::Duration::ZERO,
-    );
-
-    // 2. Lexicographic sort
-    bench_sort_strategy(
-        "2. Lexicographic",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        qual_baseline,
-        |_i, _seq, qual| qual.as_bytes().to_vec(),
-        false,
-        true,
-    );
-
-    // 3. Sort by mean ASCII value
-    bench_sort_strategy(
-        "3. Mean ASCII value",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        qual_baseline,
-        |_i, _seq, qual| {
-            let bytes = qual.as_bytes();
-            let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
-            vec![mean as u8]
-        },
-        false,
-        true,
-    );
-
-    // 4. Sort by L2 norm (sum of squares)
-    bench_sort_strategy(
-        "4. L2 norm (sum of squares)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        qual_baseline,
-        |_i, _seq, qual| {
-            let bytes = qual.as_bytes();
-            let sos: u64 = bytes.iter().map(|&b| (b as u64) * (b as u64)).sum();
-            sos.to_le_bytes().to_vec()
-        },
-        false,
-        true,
-    );
-
-    // 5. Multi-key: (mean, variance)
-    bench_sort_strategy(
-        "5. Multi-key (mean, variance)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        qual_baseline,
-        |_i, _seq, qual| {
-            let bytes = qual.as_bytes();
-            let n = bytes.len().max(1) as u64;
-            let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
-            let mean = sum / n;
-            let var: u64 = bytes.iter().map(|&b| {
-                let d = (b as i64) - (mean as i64);
-                (d * d) as u64
-            }).sum::<u64>() / n;
-            let mut key = Vec::with_capacity(3);
-            key.push(mean as u8);
-            key.extend_from_slice(&(var as u16).to_le_bytes());
-            key
-        },
-        false,
-        true,
-    );
-
-    // 6. Multi-key: (mean, min)
-    bench_sort_strategy(
-        "6. Multi-key (mean, min)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        qual_baseline,
-        |_i, _seq, qual| {
-            let bytes = qual.as_bytes();
-            let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
-            let min = bytes.iter().copied().min().unwrap_or(0);
-            vec![mean as u8, min]
-        },
-        false,
-        true,
-    );
-
-    // 7. Quantized profile (8 bins)
-    bench_sort_strategy(
-        "7. Quantized profile (8 bins)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        qual_baseline,
-        |_i, _seq, qual| quantize_profile(qual.as_bytes(), 8),
-        false,
-        true,
-    );
-
-    // 7b. Quantized profile (16 bins)
-    bench_sort_strategy(
-        "7b. Quantized profile (16 bins)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        qual_baseline,
-        |_i, _seq, qual| quantize_profile(qual.as_bytes(), 16),
-        false,
-        true,
-    );
-
-    // 8. Sort by first + last 16 bytes
-    bench_sort_strategy(
-        "8. First+last 16 bytes",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        seq_baseline,
-        qual_baseline,
-        |_i, _seq, qual| {
-            let b = qual.as_bytes();
-            let n = b.len();
-            let mut key = Vec::with_capacity(32);
-            key.extend_from_slice(&b[..16.min(n)]);
-            if n > 16 {
-                key.extend_from_slice(&b[n - 16..]);
-            }
-            key
-        },
-        false,
-        true,
-    );
-
-    // 9. Sequence-derived sort: syncmer hash (free permutation for quality!)
-    {
-        let anchor_k = 31usize;
-        let s = anchor_k.saturating_sub(3).max(5);
-        let t_end = anchor_k - s;
-
-        let t = Instant::now();
-        let sort_keys: Vec<u64> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                if sb.len() < anchor_k { return u64::MAX; }
-                let positions = syncmers::find_syncmers_pos(anchor_k, s, &[0, t_end], sb);
-                let mut min_hash = u64::MAX;
-                for pos in positions {
-                    if pos + anchor_k > sb.len() { continue; }
-                    let kmer = &sb[pos..pos + anchor_k];
-                    if let Some(fwd) = kmer_to_hash(kmer) {
-                        let rc = reverse_complement_hash(fwd, anchor_k);
-                        let canon = fwd.min(rc);
-                        if canon < min_hash { min_hash = canon; }
-                    }
-                }
-                min_hash
-            })
-            .collect();
-        let mut perm: Vec<u32> = (0..num_reads as u32).collect();
-        perm.sort_unstable_by_key(|&i| sort_keys[i as usize]);
-        let elapsed = t.elapsed();
-
-        let reordered: Vec<u8> = perm
-            .iter()
-            .flat_map(|&i| qualities[i as usize].as_bytes())
-            .copied()
-            .collect();
-        let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
-
-        print_result(
-            "9. Syncmer from seq [free perm]",
-            total_qual_bytes,
-            compressed.len(),
-            0,
-            elapsed,
+    if run_section("qual") {
+        println!("\n\n=== QUALITY SORTING STRATEGIES ===\n");
+        println!(
+            "{:<50} {:>12} {:>8} {:>12} {:>12} {:>10}",
+            "Strategy", "Qual BSC", "Ratio", "Perm cost", "Net total", "Time"
         );
-        print_delta(compressed.len(), 0, qual_baseline);
-    }
+        println!("{}", "-".repeat(108));
+
+        // Baseline (qual_baseline already computed at top)
+        print_result(
+            "1. Baseline (original order)",
+            total_qual_bytes,
+            qual_baseline,
+            0,
+            std::time::Duration::ZERO,
+        );
+
+        // 2. Lexicographic sort
+        bench_sort_strategy(
+            "2. Lexicographic",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            qual_baseline,
+            |_i, _seq, qual| qual.as_bytes().to_vec(),
+            false,
+            true,
+        );
+
+        // 3. Sort by mean ASCII value
+        bench_sort_strategy(
+            "3. Mean ASCII value",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            qual_baseline,
+            |_i, _seq, qual| {
+                let bytes = qual.as_bytes();
+                let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
+                vec![mean as u8]
+            },
+            false,
+            true,
+        );
+
+        // 4. Sort by L2 norm (sum of squares)
+        bench_sort_strategy(
+            "4. L2 norm (sum of squares)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            qual_baseline,
+            |_i, _seq, qual| {
+                let bytes = qual.as_bytes();
+                let sos: u64 = bytes.iter().map(|&b| (b as u64) * (b as u64)).sum();
+                sos.to_le_bytes().to_vec()
+            },
+            false,
+            true,
+        );
+
+        // 5. Multi-key: (mean, variance)
+        bench_sort_strategy(
+            "5. Multi-key (mean, variance)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            qual_baseline,
+            |_i, _seq, qual| {
+                let bytes = qual.as_bytes();
+                let n = bytes.len().max(1) as u64;
+                let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
+                let mean = sum / n;
+                let var: u64 = bytes
+                    .iter()
+                    .map(|&b| {
+                        let d = (b as i64) - (mean as i64);
+                        (d * d) as u64
+                    })
+                    .sum::<u64>()
+                    / n;
+                let mut key = Vec::with_capacity(3);
+                key.push(mean as u8);
+                key.extend_from_slice(&(var as u16).to_le_bytes());
+                key
+            },
+            false,
+            true,
+        );
+
+        // 6. Multi-key: (mean, min)
+        bench_sort_strategy(
+            "6. Multi-key (mean, min)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            qual_baseline,
+            |_i, _seq, qual| {
+                let bytes = qual.as_bytes();
+                let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
+                let min = bytes.iter().copied().min().unwrap_or(0);
+                vec![mean as u8, min]
+            },
+            false,
+            true,
+        );
+
+        // 7. Quantized profile (8 bins)
+        bench_sort_strategy(
+            "7. Quantized profile (8 bins)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            qual_baseline,
+            |_i, _seq, qual| quantize_profile(qual.as_bytes(), 8),
+            false,
+            true,
+        );
+
+        // 7b. Quantized profile (16 bins)
+        bench_sort_strategy(
+            "7b. Quantized profile (16 bins)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            qual_baseline,
+            |_i, _seq, qual| quantize_profile(qual.as_bytes(), 16),
+            false,
+            true,
+        );
+
+        // 8. Sort by first + last 16 bytes
+        bench_sort_strategy(
+            "8. First+last 16 bytes",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            seq_baseline,
+            qual_baseline,
+            |_i, _seq, qual| {
+                let b = qual.as_bytes();
+                let n = b.len();
+                let mut key = Vec::with_capacity(32);
+                key.extend_from_slice(&b[..16.min(n)]);
+                if n > 16 {
+                    key.extend_from_slice(&b[n - 16..]);
+                }
+                key
+            },
+            false,
+            true,
+        );
+
+        // 9. Sequence-derived sort: syncmer hash (free permutation for quality!)
+        {
+            let anchor_k = 31usize;
+            let s = anchor_k.saturating_sub(3).max(5);
+            let t_end = anchor_k - s;
+
+            let t = Instant::now();
+            let sort_keys: Vec<u64> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    if sb.len() < anchor_k {
+                        return u64::MAX;
+                    }
+                    let positions = syncmers::find_syncmers_pos(anchor_k, s, &[0, t_end], sb);
+                    let mut min_hash = u64::MAX;
+                    for pos in positions {
+                        if pos + anchor_k > sb.len() {
+                            continue;
+                        }
+                        let kmer = &sb[pos..pos + anchor_k];
+                        if let Some(fwd) = kmer_to_hash(kmer) {
+                            let rc = reverse_complement_hash(fwd, anchor_k);
+                            let canon = fwd.min(rc);
+                            if canon < min_hash {
+                                min_hash = canon;
+                            }
+                        }
+                    }
+                    min_hash
+                })
+                .collect();
+            let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+            perm.sort_unstable_by_key(|&i| sort_keys[i as usize]);
+            let elapsed = t.elapsed();
+
+            let reordered: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| qualities[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let compressed = bsc::compress_parallel_adaptive(&reordered).unwrap();
+
+            print_result(
+                "9. Syncmer from seq [free perm]",
+                total_qual_bytes,
+                compressed.len(),
+                0,
+                elapsed,
+            );
+            print_delta(compressed.len(), 0, qual_baseline);
+        }
+    } // end run_section("qual")
 
     // ========================================================================
     // COMBINED: apply same sort to both streams
     // ========================================================================
-    println!("\n\n=== COMBINED: SAME SORT FOR SEQ + QUAL ===\n");
-    println!(
-        "{:<50} {:>12} {:>12} {:>12} {:>12} {:>10}",
-        "Strategy", "Seq BSC", "Qual BSC", "Perm cost", "Net total", "vs base"
-    );
-    println!("{}", "-".repeat(112));
-
-    let combined_baseline = seq_baseline + qual_baseline;
-    println!(
-        "{:<50} {:>10} B {:>10} B {:>10}   {:>10} B {:>10}",
-        "Baseline (no sort)",
-        seq_baseline,
-        qual_baseline,
-        "-",
-        combined_baseline,
-        "-",
-    );
-
-    // Lex sort on sequences, apply same permutation to qualities
-    bench_combined(
-        "Lex sort (on sequences)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        combined_baseline,
-        |_i, seq, _qual| seq.as_bytes().to_vec(),
-    );
-
-    // Mean ASCII sort on sequences
-    bench_combined(
-        "Mean ASCII (on sequences)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        combined_baseline,
-        |_i, seq, _qual| {
-            let bytes = seq.as_bytes();
-            let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
-            vec![mean as u8]
-        },
-    );
-
-    // Quantized profile (8 bins) on sequences
-    bench_combined(
-        "Quantized profile 8-bin (on sequences)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        combined_baseline,
-        |_i, seq, _qual| quantize_profile(seq.as_bytes(), 8),
-    );
-
-    // Quantized profile (16 bins) on sequences
-    bench_combined(
-        "Quantized profile 16-bin (on sequences)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        combined_baseline,
-        |_i, seq, _qual| quantize_profile(seq.as_bytes(), 16),
-    );
-
-    // Lex sort on qualities, apply same permutation to sequences
-    bench_combined(
-        "Lex sort (on qualities)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        combined_baseline,
-        |_i, _seq, qual| qual.as_bytes().to_vec(),
-    );
-
-    // Mean quality sort, apply to both
-    bench_combined(
-        "Mean ASCII (on qualities)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        combined_baseline,
-        |_i, _seq, qual| {
-            let bytes = qual.as_bytes();
-            let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
-            vec![mean as u8]
-        },
-    );
-
-    // Multi-key (mean, variance) on qualities
-    bench_combined(
-        "Multi-key mean+var (on qualities)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        combined_baseline,
-        |_i, _seq, qual| {
-            let bytes = qual.as_bytes();
-            let n = bytes.len().max(1) as u64;
-            let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
-            let mean = sum / n;
-            let var: u64 = bytes.iter().map(|&b| {
-                let d = (b as i64) - (mean as i64);
-                (d * d) as u64
-            }).sum::<u64>() / n;
-            let mut key = Vec::with_capacity(3);
-            key.push(mean as u8);
-            key.extend_from_slice(&(var as u16).to_le_bytes());
-            key
-        },
-    );
-
-    // RC-canonical + lex on sequences
-    bench_combined(
-        "RC-canonical + lex (on sequences)",
-        &sequences,
-        &qualities,
-        total_seq_bytes,
-        total_qual_bytes,
-        combined_baseline,
-        |_i, seq, _qual| {
-            let b = seq.as_bytes();
-            let rc = reverse_complement_bytes(b);
-            if rc < b.to_vec() { rc } else { b.to_vec() }
-        },
-    );
-
-    // Minimizer sort on sequences
-    {
-        let t = Instant::now();
-        let min_hashes: Vec<u64> = sequences
-            .par_iter()
-            .map(|s| canonical_minimizer(s.as_bytes(), 15, 10))
-            .collect();
-        let mut perm: Vec<u32> = (0..num_reads as u32).collect();
-        perm.sort_unstable_by_key(|&i| min_hashes[i as usize]);
-        let elapsed = t.elapsed();
-
-        let seq_reord: Vec<u8> = perm.iter().flat_map(|&i| sequences[i as usize].as_bytes()).copied().collect();
-        let qual_reord: Vec<u8> = perm.iter().flat_map(|&i| qualities[i as usize].as_bytes()).copied().collect();
-
-        let seq_comp = bsc::compress_parallel_adaptive(&seq_reord).unwrap();
-        let qual_comp = bsc::compress_parallel_adaptive(&qual_reord).unwrap();
-
-        let net = seq_comp.len() + qual_comp.len();
-        let delta = net as i64 - combined_baseline as i64;
+    if run_section("combined") {
+        println!("\n\n=== COMBINED: SAME SORT FOR SEQ + QUAL ===\n");
         println!(
-            "{:<50} {:>10} B {:>10} B {:>10}   {:>10} B {:>+9} B  {:.0}ms",
-            "Minimizer (k=15,w=10) [free perm]",
-            seq_comp.len(),
-            qual_comp.len(),
-            0,
-            net,
-            delta,
-            elapsed.as_secs_f64() * 1000.0,
+            "{:<50} {:>12} {:>12} {:>12} {:>12} {:>10}",
+            "Strategy", "Seq BSC", "Qual BSC", "Perm cost", "Net total", "vs base"
         );
-    }
+        println!("{}", "-".repeat(112));
 
-    // Syncmer sort on sequences
-    {
-        let anchor_k = 31usize;
-        let s = anchor_k.saturating_sub(3).max(5);
-        let t_end = anchor_k - s;
+        println!(
+            "{:<50} {:>10} B {:>10} B {:>10}   {:>10} B {:>10}",
+            "Baseline (no sort)", seq_baseline, qual_baseline, "-", combined_baseline, "-",
+        );
 
-        let t = Instant::now();
-        let sort_keys: Vec<u64> = sequences
-            .par_iter()
-            .map(|seq| {
-                let sb = seq.as_bytes();
-                if sb.len() < anchor_k { return u64::MAX; }
-                let positions = syncmers::find_syncmers_pos(anchor_k, s, &[0, t_end], sb);
-                let mut min_hash = u64::MAX;
-                for pos in positions {
-                    if pos + anchor_k > sb.len() { continue; }
-                    let kmer = &sb[pos..pos + anchor_k];
-                    if let Some(fwd) = kmer_to_hash(kmer) {
-                        let rc = reverse_complement_hash(fwd, anchor_k);
-                        let canon = fwd.min(rc);
-                        if canon < min_hash { min_hash = canon; }
+        // Lex sort on sequences, apply same permutation to qualities
+        bench_combined(
+            "Lex sort (on sequences)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            combined_baseline,
+            |_i, seq, _qual| seq.as_bytes().to_vec(),
+        );
+
+        // Mean ASCII sort on sequences
+        bench_combined(
+            "Mean ASCII (on sequences)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            combined_baseline,
+            |_i, seq, _qual| {
+                let bytes = seq.as_bytes();
+                let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
+                vec![mean as u8]
+            },
+        );
+
+        // Quantized profile (8 bins) on sequences
+        bench_combined(
+            "Quantized profile 8-bin (on sequences)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            combined_baseline,
+            |_i, seq, _qual| quantize_profile(seq.as_bytes(), 8),
+        );
+
+        // Quantized profile (16 bins) on sequences
+        bench_combined(
+            "Quantized profile 16-bin (on sequences)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            combined_baseline,
+            |_i, seq, _qual| quantize_profile(seq.as_bytes(), 16),
+        );
+
+        // Lex sort on qualities, apply same permutation to sequences
+        bench_combined(
+            "Lex sort (on qualities)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            combined_baseline,
+            |_i, _seq, qual| qual.as_bytes().to_vec(),
+        );
+
+        // Mean quality sort, apply to both
+        bench_combined(
+            "Mean ASCII (on qualities)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            combined_baseline,
+            |_i, _seq, qual| {
+                let bytes = qual.as_bytes();
+                let mean = bytes.iter().map(|&b| b as u64).sum::<u64>() / bytes.len().max(1) as u64;
+                vec![mean as u8]
+            },
+        );
+
+        // Multi-key (mean, variance) on qualities
+        bench_combined(
+            "Multi-key mean+var (on qualities)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            combined_baseline,
+            |_i, _seq, qual| {
+                let bytes = qual.as_bytes();
+                let n = bytes.len().max(1) as u64;
+                let sum: u64 = bytes.iter().map(|&b| b as u64).sum();
+                let mean = sum / n;
+                let var: u64 = bytes
+                    .iter()
+                    .map(|&b| {
+                        let d = (b as i64) - (mean as i64);
+                        (d * d) as u64
+                    })
+                    .sum::<u64>()
+                    / n;
+                let mut key = Vec::with_capacity(3);
+                key.push(mean as u8);
+                key.extend_from_slice(&(var as u16).to_le_bytes());
+                key
+            },
+        );
+
+        // RC-canonical + lex on sequences
+        bench_combined(
+            "RC-canonical + lex (on sequences)",
+            &sequences,
+            &qualities,
+            total_seq_bytes,
+            total_qual_bytes,
+            combined_baseline,
+            |_i, seq, _qual| {
+                let b = seq.as_bytes();
+                let rc = reverse_complement_bytes(b);
+                if rc < b.to_vec() { rc } else { b.to_vec() }
+            },
+        );
+
+        // Minimizer sort on sequences
+        {
+            let t = Instant::now();
+            let min_hashes: Vec<u64> = sequences
+                .par_iter()
+                .map(|s| canonical_minimizer(s.as_bytes(), 15, 10))
+                .collect();
+            let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+            perm.sort_unstable_by_key(|&i| min_hashes[i as usize]);
+            let elapsed = t.elapsed();
+
+            let seq_reord: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| sequences[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let qual_reord: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| qualities[i as usize].as_bytes())
+                .copied()
+                .collect();
+
+            let seq_comp = bsc::compress_parallel_adaptive(&seq_reord).unwrap();
+            let qual_comp = bsc::compress_parallel_adaptive(&qual_reord).unwrap();
+
+            let net = seq_comp.len() + qual_comp.len();
+            let delta = net as i64 - combined_baseline as i64;
+            println!(
+                "{:<50} {:>10} B {:>10} B {:>10}   {:>10} B {:>+9} B  {:.0}ms",
+                "Minimizer (k=15,w=10) [free perm]",
+                seq_comp.len(),
+                qual_comp.len(),
+                0,
+                net,
+                delta,
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+
+        // Syncmer sort on sequences
+        {
+            let anchor_k = 31usize;
+            let s = anchor_k.saturating_sub(3).max(5);
+            let t_end = anchor_k - s;
+
+            let t = Instant::now();
+            let sort_keys: Vec<u64> = sequences
+                .par_iter()
+                .map(|seq| {
+                    let sb = seq.as_bytes();
+                    if sb.len() < anchor_k {
+                        return u64::MAX;
                     }
-                }
-                min_hash
-            })
-            .collect();
-        let mut perm: Vec<u32> = (0..num_reads as u32).collect();
-        perm.sort_unstable_by_key(|&i| sort_keys[i as usize]);
-        let elapsed = t.elapsed();
+                    let positions = syncmers::find_syncmers_pos(anchor_k, s, &[0, t_end], sb);
+                    let mut min_hash = u64::MAX;
+                    for pos in positions {
+                        if pos + anchor_k > sb.len() {
+                            continue;
+                        }
+                        let kmer = &sb[pos..pos + anchor_k];
+                        if let Some(fwd) = kmer_to_hash(kmer) {
+                            let rc = reverse_complement_hash(fwd, anchor_k);
+                            let canon = fwd.min(rc);
+                            if canon < min_hash {
+                                min_hash = canon;
+                            }
+                        }
+                    }
+                    min_hash
+                })
+                .collect();
+            let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+            perm.sort_unstable_by_key(|&i| sort_keys[i as usize]);
+            let elapsed = t.elapsed();
 
-        let seq_reord: Vec<u8> = perm.iter().flat_map(|&i| sequences[i as usize].as_bytes()).copied().collect();
-        let qual_reord: Vec<u8> = perm.iter().flat_map(|&i| qualities[i as usize].as_bytes()).copied().collect();
+            let seq_reord: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| sequences[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let qual_reord: Vec<u8> = perm
+                .iter()
+                .flat_map(|&i| qualities[i as usize].as_bytes())
+                .copied()
+                .collect();
 
-        let seq_comp = bsc::compress_parallel_adaptive(&seq_reord).unwrap();
-        let qual_comp = bsc::compress_parallel_adaptive(&qual_reord).unwrap();
+            let seq_comp = bsc::compress_parallel_adaptive(&seq_reord).unwrap();
+            let qual_comp = bsc::compress_parallel_adaptive(&qual_reord).unwrap();
 
-        let net = seq_comp.len() + qual_comp.len();
-        let delta = net as i64 - combined_baseline as i64;
-        println!(
-            "{:<50} {:>10} B {:>10} B {:>10}   {:>10} B {:>+9} B  {:.0}ms",
-            "Syncmer (k=31,s=28) [free perm]",
-            seq_comp.len(),
-            qual_comp.len(),
-            0,
-            net,
-            delta,
-            elapsed.as_secs_f64() * 1000.0,
-        );
-    }
+            let net = seq_comp.len() + qual_comp.len();
+            let delta = net as i64 - combined_baseline as i64;
+            println!(
+                "{:<50} {:>10} B {:>10} B {:>10}   {:>10} B {:>+9} B  {:.0}ms",
+                "Syncmer (k=31,s=28) [free perm]",
+                seq_comp.len(),
+                qual_comp.len(),
+                0,
+                net,
+                delta,
+                elapsed.as_secs_f64() * 1000.0,
+            );
+        }
 
-    println!("{}", "-".repeat(112));
+        println!("{}", "-".repeat(112));
+    } // end run_section("combined")
 
     // ========================================================================
     // PERMUTATION ENCODING COMPARISON
     // ========================================================================
     // Use lex-sort on qualities (worst permutation cost) as the test case.
-    println!("\n\n=== PERMUTATION ENCODING METHODS (lex-sort on qualities) ===\n");
-    {
-        let mut perm_lex: Vec<u32> = (0..num_reads as u32).collect();
-        perm_lex.sort_by(|&a, &b| qualities[a as usize].cmp(&qualities[b as usize]));
+    if run_section("perm") {
+        println!("\n\n=== PERMUTATION ENCODING METHODS (lex-sort on qualities) ===\n");
+        {
+            let mut perm_lex: Vec<u32> = (0..num_reads as u32).collect();
+            perm_lex.sort_by(|&a, &b| qualities[a as usize].cmp(&qualities[b as usize]));
 
-        // Reorder qualities (same for all encoding methods)
-        let reordered: Vec<u8> = perm_lex
-            .iter()
-            .flat_map(|&i| qualities[i as usize].as_bytes())
-            .copied()
-            .collect();
-        let qual_comp = bsc::compress_parallel_adaptive(&reordered).unwrap();
+            // Reorder qualities (same for all encoding methods)
+            let reordered: Vec<u8> = perm_lex
+                .iter()
+                .flat_map(|&i| qualities[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let qual_comp = bsc::compress_parallel_adaptive(&reordered).unwrap();
 
-        println!(
-            "{:<55} {:>12} {:>12} {:>12}",
-            "Encoding method", "Perm size", "Net total", "vs baseline"
-        );
-        println!("{}", "-".repeat(95));
-        println!(
-            "{:<55} {:>10}   {:>10} B {:>+10} B",
-            "Quality baseline (no sort)",
-            "-",
-            qual_baseline,
-            0,
-        );
-        println!(
-            "{:<55} {:>10}   {:>10} B",
-            "Sorted quality stream (all methods share this)",
-            "-",
-            qual_comp.len(),
-        );
-        println!();
+            println!(
+                "{:<55} {:>12} {:>12} {:>12}",
+                "Encoding method", "Perm size", "Net total", "vs baseline"
+            );
+            println!("{}", "-".repeat(95));
+            println!(
+                "{:<55} {:>10}   {:>10} B {:>+10} B",
+                "Quality baseline (no sort)", "-", qual_baseline, 0,
+            );
+            println!(
+                "{:<55} {:>10}   {:>10} B",
+                "Sorted quality stream (all methods share this)",
+                "-",
+                qual_comp.len(),
+            );
+            println!();
 
-        // Method A: Forward perm, delta-zigzag-varint + BSC (current)
-        let fwd_cost = compress_perm_delta_zigzag(&perm_lex);
-        println!(
-            "{:<55} {:>10} B {:>10} B {:>+10} B",
-            "A. Forward delta-zigzag-varint + BSC",
-            fwd_cost,
-            qual_comp.len() + fwd_cost,
-            (qual_comp.len() + fwd_cost) as i64 - qual_baseline as i64,
-        );
+            // Method A: Forward perm, delta-zigzag-varint + BSC (current)
+            let fwd_cost = compress_perm_delta_zigzag(&perm_lex);
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>+10} B",
+                "A. Forward delta-zigzag-varint + BSC",
+                fwd_cost,
+                qual_comp.len() + fwd_cost,
+                (qual_comp.len() + fwd_cost) as i64 - qual_baseline as i64,
+            );
 
-        // Method B: Inverse perm, delta-zigzag-varint + BSC
-        let inv_perm = invert_permutation(&perm_lex);
-        let inv_cost = compress_perm_delta_zigzag(&inv_perm);
-        println!(
-            "{:<55} {:>10} B {:>10} B {:>+10} B",
-            "B. Inverse delta-zigzag-varint + BSC",
-            inv_cost,
-            qual_comp.len() + inv_cost,
-            (qual_comp.len() + inv_cost) as i64 - qual_baseline as i64,
-        );
+            // Method B: Inverse perm, delta-zigzag-varint + BSC
+            let inv_perm = invert_permutation(&perm_lex);
+            let inv_cost = compress_perm_delta_zigzag(&inv_perm);
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>+10} B",
+                "B. Inverse delta-zigzag-varint + BSC",
+                inv_cost,
+                qual_comp.len() + inv_cost,
+                (qual_comp.len() + inv_cost) as i64 - qual_baseline as i64,
+            );
 
-        // Method C: Raw u32 + BSC (no delta encoding)
-        let raw_perm: Vec<u8> = perm_lex.iter().flat_map(|&i| i.to_le_bytes()).collect();
-        let raw_cost = bsc::compress_parallel_adaptive(&raw_perm).unwrap().len();
-        println!(
-            "{:<55} {:>10} B {:>10} B {:>+10} B",
-            "C. Raw u32 + BSC (no delta)",
-            raw_cost,
-            qual_comp.len() + raw_cost,
-            (qual_comp.len() + raw_cost) as i64 - qual_baseline as i64,
-        );
+            // Method C: Raw u32 + BSC (no delta encoding)
+            let raw_perm: Vec<u8> = perm_lex.iter().flat_map(|&i| i.to_le_bytes()).collect();
+            let raw_cost = bsc::compress_parallel_adaptive(&raw_perm).unwrap().len();
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>+10} B",
+                "C. Raw u32 + BSC (no delta)",
+                raw_cost,
+                qual_comp.len() + raw_cost,
+                (qual_comp.len() + raw_cost) as i64 - qual_baseline as i64,
+            );
 
-        // Method D: Raw inverse u32 + BSC
-        let raw_inv: Vec<u8> = inv_perm.iter().flat_map(|&i| i.to_le_bytes()).collect();
-        let raw_inv_cost = bsc::compress_parallel_adaptive(&raw_inv).unwrap().len();
-        println!(
-            "{:<55} {:>10} B {:>10} B {:>+10} B",
-            "D. Raw inverse u32 + BSC",
-            raw_inv_cost,
-            qual_comp.len() + raw_inv_cost,
-            (qual_comp.len() + raw_inv_cost) as i64 - qual_baseline as i64,
-        );
+            // Method D: Raw inverse u32 + BSC
+            let raw_inv: Vec<u8> = inv_perm.iter().flat_map(|&i| i.to_le_bytes()).collect();
+            let raw_inv_cost = bsc::compress_parallel_adaptive(&raw_inv).unwrap().len();
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>+10} B",
+                "D. Raw inverse u32 + BSC",
+                raw_inv_cost,
+                qual_comp.len() + raw_inv_cost,
+                (qual_comp.len() + raw_inv_cost) as i64 - qual_baseline as i64,
+            );
 
-        // Method E: Cycle encoding + BSC
-        let cycle_cost = compress_perm_cycles(&perm_lex);
-        println!(
-            "{:<55} {:>10} B {:>10} B {:>+10} B",
-            "E. Cycle encoding + BSC",
-            cycle_cost,
-            qual_comp.len() + cycle_cost,
-            (qual_comp.len() + cycle_cost) as i64 - qual_baseline as i64,
-        );
+            // Method E: Cycle encoding + BSC
+            let cycle_cost = compress_perm_cycles(&perm_lex);
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>+10} B",
+                "E. Cycle encoding + BSC",
+                cycle_cost,
+                qual_comp.len() + cycle_cost,
+                (qual_comp.len() + cycle_cost) as i64 - qual_baseline as i64,
+            );
 
-        // Method F: Sort key (1B mean qual) + BSC — recomputable!
-        let mean_keys: Vec<u8> = qualities
-            .iter()
-            .map(|q| {
-                let b = q.as_bytes();
-                (b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64) as u8
-            })
-            .collect();
-        let key_cost = bsc::compress_parallel_adaptive(&mean_keys).unwrap().len();
+            // Method F: Sort key (1B mean qual) + BSC — recomputable!
+            let mean_keys: Vec<u8> = qualities
+                .iter()
+                .map(|q| {
+                    let b = q.as_bytes();
+                    (b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64) as u8
+                })
+                .collect();
+            let key_cost = bsc::compress_parallel_adaptive(&mean_keys).unwrap().len();
 
-        // Sort by mean key and measure quality compression
-        let mut perm_mean: Vec<u32> = (0..num_reads as u32).collect();
-        perm_mean.sort_by_key(|&i| mean_keys[i as usize]);
-        let mean_reord: Vec<u8> = perm_mean
-            .iter()
-            .flat_map(|&i| qualities[i as usize].as_bytes())
-            .copied()
-            .collect();
-        let mean_qual_comp = bsc::compress_parallel_adaptive(&mean_reord).unwrap();
-        println!(
-            "{:<55} {:>10} B {:>10} B {:>+10} B",
-            "F. Recomputable key (1B mean) + BSC [mean sort]",
-            key_cost,
-            mean_qual_comp.len() + key_cost,
-            (mean_qual_comp.len() + key_cost) as i64 - qual_baseline as i64,
-        );
+            // Sort by mean key and measure quality compression
+            let mut perm_mean: Vec<u32> = (0..num_reads as u32).collect();
+            perm_mean.sort_by_key(|&i| mean_keys[i as usize]);
+            let mean_reord: Vec<u8> = perm_mean
+                .iter()
+                .flat_map(|&i| qualities[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let mean_qual_comp = bsc::compress_parallel_adaptive(&mean_reord).unwrap();
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>+10} B",
+                "F. Recomputable key (1B mean) + BSC [mean sort]",
+                key_cost,
+                mean_qual_comp.len() + key_cost,
+                (mean_qual_comp.len() + key_cost) as i64 - qual_baseline as i64,
+            );
 
-        // Method G: Sort key (3B mean+var) + BSC — recomputable!
-        let mv_keys: Vec<u8> = qualities
-            .iter()
-            .flat_map(|q| {
-                let b = q.as_bytes();
-                let n = b.len().max(1) as u64;
-                let sum: u64 = b.iter().map(|&v| v as u64).sum();
-                let mean = sum / n;
-                let var: u64 = b.iter().map(|&v| {
-                    let d = (v as i64) - (mean as i64);
-                    (d * d) as u64
-                }).sum::<u64>() / n;
-                [mean as u8, (var & 0xFF) as u8, ((var >> 8) & 0xFF) as u8]
-            })
-            .collect();
-        let mv_cost = bsc::compress_parallel_adaptive(&mv_keys).unwrap().len();
+            // Method G: Sort key (3B mean+var) + BSC — recomputable!
+            let mv_keys: Vec<u8> = qualities
+                .iter()
+                .flat_map(|q| {
+                    let b = q.as_bytes();
+                    let n = b.len().max(1) as u64;
+                    let sum: u64 = b.iter().map(|&v| v as u64).sum();
+                    let mean = sum / n;
+                    let var: u64 = b
+                        .iter()
+                        .map(|&v| {
+                            let d = (v as i64) - (mean as i64);
+                            (d * d) as u64
+                        })
+                        .sum::<u64>()
+                        / n;
+                    [mean as u8, (var & 0xFF) as u8, ((var >> 8) & 0xFF) as u8]
+                })
+                .collect();
+            let mv_cost = bsc::compress_parallel_adaptive(&mv_keys).unwrap().len();
 
-        let mut perm_mv: Vec<u32> = (0..num_reads as u32).collect();
-        perm_mv.sort_by(|&a, &b| {
-            let ak = &mv_keys[a as usize * 3..a as usize * 3 + 3];
-            let bk = &mv_keys[b as usize * 3..b as usize * 3 + 3];
-            ak.cmp(bk)
-        });
-        let mv_reord: Vec<u8> = perm_mv
-            .iter()
-            .flat_map(|&i| qualities[i as usize].as_bytes())
-            .copied()
-            .collect();
-        let mv_qual_comp = bsc::compress_parallel_adaptive(&mv_reord).unwrap();
-        println!(
-            "{:<55} {:>10} B {:>10} B {:>+10} B",
-            "G. Recomputable key (3B mean+var) + BSC [mv sort]",
-            mv_cost,
-            mv_qual_comp.len() + mv_cost,
-            (mv_qual_comp.len() + mv_cost) as i64 - qual_baseline as i64,
-        );
-    }
+            let mut perm_mv: Vec<u32> = (0..num_reads as u32).collect();
+            perm_mv.sort_by(|&a, &b| {
+                let ak = &mv_keys[a as usize * 3..a as usize * 3 + 3];
+                let bk = &mv_keys[b as usize * 3..b as usize * 3 + 3];
+                ak.cmp(bk)
+            });
+            let mv_reord: Vec<u8> = perm_mv
+                .iter()
+                .flat_map(|&i| qualities[i as usize].as_bytes())
+                .copied()
+                .collect();
+            let mv_qual_comp = bsc::compress_parallel_adaptive(&mv_reord).unwrap();
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>+10} B",
+                "G. Recomputable key (3B mean+var) + BSC [mv sort]",
+                mv_cost,
+                mv_qual_comp.len() + mv_cost,
+                (mv_qual_comp.len() + mv_cost) as i64 - qual_baseline as i64,
+            );
+        }
+    } // end run_section("perm")
+
+    // ========================================================================
+    // APPROXIMATE SORTS WITH KEY STORAGE (order-preserving)
+    // ========================================================================
+    // Method F variant applied to seq+qual: store the recomputable per-read
+    // sort key in original order (BSC compressed) instead of the permutation.
+    // Decoder reconstructs perm by stable-sorting on the recomputed key.
+    // Only viable when the key has low entropy (few distinct values).
+    if run_section("approx") {
+        println!("\n\n=== APPROXIMATE SORTS WITH KEY STORAGE (order-preserving) ===\n");
+        {
+            println!(
+                "{:<55} {:>12} {:>12} {:>12} {:>12} {:>10}",
+                "Strategy", "Seq BSC", "Qual BSC", "Key cost", "Net total", "vs base"
+            );
+            println!("{}", "-".repeat(120));
+            let combined_base = seq_baseline + qual_baseline;
+            println!(
+                "{:<55} {:>10} B {:>10} B {:>10}   {:>10} B {:>10}",
+                "Baseline (no sort)", seq_baseline, qual_baseline, "-", combined_base, "-",
+            );
+
+            let bench_approx = |name: &str, keys: &[Vec<u8>]| {
+                let t = Instant::now();
+                // Stable sort indices by key (encoder)
+                let mut perm: Vec<u32> = (0..num_reads as u32).collect();
+                perm.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
+
+                // Apply same perm to seq and qual
+                let seq_reord: Vec<u8> = perm
+                    .iter()
+                    .flat_map(|&i| sequences[i as usize].as_bytes())
+                    .copied()
+                    .collect();
+                let qual_reord: Vec<u8> = perm
+                    .iter()
+                    .flat_map(|&i| qualities[i as usize].as_bytes())
+                    .copied()
+                    .collect();
+                let seq_comp = bsc::compress_parallel_adaptive(&seq_reord).unwrap();
+                let qual_comp = bsc::compress_parallel_adaptive(&qual_reord).unwrap();
+
+                // Store keys in ORIGINAL order — decoder recomputes per-read key from
+                // restored seqs and stable-sorts to recover the encoder's perm.
+                let key_bytes: Vec<u8> = keys.iter().flat_map(|k| k.iter().copied()).collect();
+                let key_comp = bsc::compress_parallel_adaptive(&key_bytes).unwrap().len();
+
+                let elapsed = t.elapsed();
+                let net = seq_comp.len() + qual_comp.len() + key_comp;
+                let delta = net as i64 - combined_base as i64;
+                println!(
+                    "{:<55} {:>10} B {:>10} B {:>10} B {:>10} B {:>+9} B  {:.0}ms",
+                    name,
+                    seq_comp.len(),
+                    qual_comp.len(),
+                    key_comp,
+                    net,
+                    delta,
+                    elapsed.as_secs_f64() * 1000.0,
+                );
+            };
+
+            // 1. mean_ASCII (1B, ~30 buckets) — pure Method F baseline
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let m = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
+                        vec![m as u8]
+                    })
+                    .collect();
+                bench_approx("1. mean_ASCII (1B, ~30 buckets)", &keys);
+            }
+
+            // 2. mean × 4 (1B, ~120 buckets) — quarter-precision mean
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let sum: u64 = b.iter().map(|&v| v as u64).sum();
+                        let m4 = (4 * sum) / b.len().max(1) as u64;
+                        // mean*4 lies in ~[260, 336]; subtract 256 to fit u8
+                        vec![m4.saturating_sub(256) as u8]
+                    })
+                    .collect();
+                bench_approx("2. mean × 4 (1B, ~120 buckets)", &keys);
+            }
+
+            // 3. (mean_ASCII, minimizer-derived 4-bit bucket) (2B, ~480 buckets)
+            // canonical_minimizer only uses low 30 bits (k=15 × 2-bit packing), so
+            // mix via Fibonacci constant before taking top bits.
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let m = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
+                        let mh = canonical_minimizer(b, 15, 10);
+                        let mixed = mh.wrapping_mul(0x9E3779B97F4A7C15);
+                        let mh_4 = ((mixed >> 60) & 0x0F) as u8;
+                        vec![m as u8, mh_4]
+                    })
+                    .collect();
+                bench_approx("3. (mean_ASCII, min_mix4) (2B, ~480 buckets)", &keys);
+            }
+
+            // 4. (mean_ASCII, minimizer-derived 8-bit bucket) (2B, ~7680 buckets)
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let m = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
+                        let mh = canonical_minimizer(b, 15, 10);
+                        let mixed = mh.wrapping_mul(0x9E3779B97F4A7C15);
+                        let mh_8 = (mixed >> 56) as u8;
+                        vec![m as u8, mh_8]
+                    })
+                    .collect();
+                bench_approx("4. (mean_ASCII, min_mix8) (2B, ~7680 buckets)", &keys);
+            }
+
+            // 5. (mean_first_half, mean_second_half) (2B, ~900 buckets)
+            // Captures positional composition variation along the read
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let mid = b.len() / 2;
+                        let m1 =
+                            b[..mid].iter().map(|&v| v as u64).sum::<u64>() / mid.max(1) as u64;
+                        let m2 = b[mid..].iter().map(|&v| v as u64).sum::<u64>()
+                            / (b.len() - mid).max(1) as u64;
+                        vec![m1 as u8, m2 as u8]
+                    })
+                    .collect();
+                bench_approx("5. (mean_1st_half, mean_2nd_half) (2B)", &keys);
+            }
+
+            // Per-base weight maps for alternative compositional keys.
+            // Returns a 1-byte mean of weighted base values.
+            fn weighted_mean(b: &[u8], w_a: u32, w_c: u32, w_g: u32, w_t: u32, w_n: u32) -> u8 {
+                let mut sum: u64 = 0;
+                for &x in b {
+                    sum += match x {
+                        b'A' => w_a,
+                        b'C' => w_c,
+                        b'G' => w_g,
+                        b'T' => w_t,
+                        _ => w_n,
+                    } as u64;
+                }
+                let m = sum / b.len().max(1) as u64;
+                m.min(255) as u8
+            }
+
+            // 6. User's mapping: A=1, T=2, C=3, G=4, N=5 (×50 to spread across byte range)
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| vec![weighted_mean(s.as_bytes(), 50, 150, 200, 100, 250)])
+                    .collect();
+                bench_approx("6. weighted A=50,T=100,C=150,G=200,N=250 (1B)", &keys);
+            }
+
+            // 7. True GC content: A=0, T=0, C=1, G=1, N=0; mean × 200 to spread 0..150 in byte
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let gc: u64 = b
+                            .iter()
+                            .map(|&x| if x == b'C' || x == b'G' { 1u64 } else { 0 })
+                            .sum();
+                        // gc ∈ [0, len]; map to byte
+                        let v = (gc * 255) / b.len().max(1) as u64;
+                        vec![v as u8]
+                    })
+                    .collect();
+                bench_approx("7. GC content (1B, ~150 distinct values)", &keys);
+            }
+
+            // 8. GC skew (G - C, offset to byte range)
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let mut g: i32 = 0;
+                        let mut c: i32 = 0;
+                        for &x in b {
+                            match x {
+                                b'G' => g += 1,
+                                b'C' => c += 1,
+                                _ => {}
+                            }
+                        }
+                        // skew ∈ [-len, +len]; offset by len, scale to byte
+                        let skew = g - c + b.len() as i32;
+                        let v = (skew as u64 * 255) / (2 * b.len().max(1) as u64);
+                        vec![v as u8]
+                    })
+                    .collect();
+                bench_approx("8. GC skew G-C signed (1B)", &keys);
+            }
+
+            // 9. Purine count (A+G), orthogonal axis to GC
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let pu: u64 = b
+                            .iter()
+                            .map(|&x| if x == b'A' || x == b'G' { 1u64 } else { 0 })
+                            .sum();
+                        let v = (pu * 255) / b.len().max(1) as u64;
+                        vec![v as u8]
+                    })
+                    .collect();
+                bench_approx("9. Purine count A+G (1B)", &keys);
+            }
+
+            // 10. First-4-bp packed (2 bits/base × 4 = 1 byte exactly)
+            fn pack4bp(b: &[u8]) -> u8 {
+                let mut v: u8 = 0;
+                for i in 0..4 {
+                    let bits = match b.get(i).copied().unwrap_or(b'N') {
+                        b'A' => 0,
+                        b'C' => 1,
+                        b'G' => 2,
+                        b'T' => 3,
+                        _ => 0,
+                    };
+                    v = (v << 2) | bits;
+                }
+                v
+            }
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| vec![pack4bp(s.as_bytes())])
+                    .collect();
+                bench_approx("10. First-4-bp packed (1B, 256 buckets)", &keys);
+            }
+
+            // 11. (GC count, GC skew) — content + asymmetry
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let mut g = 0i32;
+                        let mut c = 0i32;
+                        let mut gc = 0u64;
+                        for &x in b {
+                            match x {
+                                b'G' => {
+                                    g += 1;
+                                    gc += 1;
+                                }
+                                b'C' => {
+                                    c += 1;
+                                    gc += 1;
+                                }
+                                _ => {}
+                            }
+                        }
+                        let len = b.len().max(1) as u64;
+                        let gc_byte = ((gc * 255) / len) as u8;
+                        let skew = g - c + b.len() as i32;
+                        let skew_byte = ((skew as u64 * 255) / (2 * len)) as u8;
+                        vec![gc_byte, skew_byte]
+                    })
+                    .collect();
+                bench_approx("11. (GC count, GC skew) (2B)", &keys);
+            }
+
+            // 12. (mean_ASCII, first-4-bp) — global composition + local prefix
+            {
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let m = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
+                        vec![m as u8, pack4bp(b)]
+                    })
+                    .collect();
+                bench_approx("12. (mean_ASCII, first-4-bp) (2B)", &keys);
+            }
+
+            // 13–17: Coarser quantizations of mean_ASCII.
+            // Real WGS reads have mean_ASCII clustered around 70–75. Reducing the
+            // bucket count drops key entropy further; the question is whether the
+            // seq BSC gain drops faster.
+            // mean is in approximately [65, 84]; subtract 64 to start at 1, then
+            // divide by the quantization step. Smaller step = more buckets.
+            for &step in &[2u64, 4, 8, 16, 20] {
+                let buckets_estimate = (84 - 65) / step + 1;
+                let keys: Vec<Vec<u8>> = sequences
+                    .par_iter()
+                    .map(|s| {
+                        let b = s.as_bytes();
+                        let m = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
+                        // Center around the typical mean (~72) and quantize.
+                        let q = (m.saturating_sub(64)) / step;
+                        vec![q as u8]
+                    })
+                    .collect();
+                bench_approx(
+                    &format!(
+                        "13. mean_ASCII / {} (1B, ~{} buckets)",
+                        step, buckets_estimate
+                    ),
+                    &keys,
+                );
+            }
+
+            // 18. Above/below median (binary, ~2 buckets) — extreme floor case
+            // First pass: compute global median of means
+            let all_means: Vec<u8> = sequences
+                .par_iter()
+                .map(|s| {
+                    let b = s.as_bytes();
+                    let m = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
+                    m as u8
+                })
+                .collect();
+            let median = {
+                let mut sorted = all_means.clone();
+                sorted.sort_unstable();
+                sorted[sorted.len() / 2]
+            };
+            {
+                let keys: Vec<Vec<u8>> = all_means
+                    .iter()
+                    .map(|&m| vec![if m < median { 0u8 } else { 1 }])
+                    .collect();
+                bench_approx(
+                    &format!("18. above/below median={} (1B, 2 buckets)", median),
+                    &keys,
+                );
+            }
+
+            println!("{}", "-".repeat(120));
+        }
+    } // end run_section("approx")
 
     // ========================================================================
     // BLOCK-BASED REORDERING
     // ========================================================================
-    println!("\n\n=== BLOCK-BASED REORDERING (qualities) ===");
-    println!("Sort blocks of reads together instead of individual reads.\n");
-    {
-        println!(
-            "{:<50} {:>8} {:>12} {:>12} {:>12} {:>12}",
-            "Strategy", "BlkSize", "Qual BSC", "Perm cost", "Net total", "vs baseline"
-        );
-        println!("{}", "-".repeat(110));
-        println!(
-            "{:<50} {:>8} {:>10} B {:>10}   {:>10} B {:>10}",
-            "Baseline (no sort)", "-", qual_baseline, "-", qual_baseline, "-",
-        );
-
-        // Test block-based reordering for several strategies x block sizes
-        let block_sizes = [32, 64, 128, 256, 512, 1024, 4096];
-
-        // Strategy: Lex sort on qualities
-        for &bs in &block_sizes {
-            bench_block_sort(
-                "Lex-sort (qualities)",
-                &qualities,
-                total_qual_bytes,
-                qual_baseline,
-                bs,
-                |qual| qual.as_bytes().to_vec(),
+    if run_section("block-q") {
+        println!("\n\n=== BLOCK-BASED REORDERING (qualities) ===");
+        println!("Sort blocks of reads together instead of individual reads.\n");
+        {
+            println!(
+                "{:<50} {:>8} {:>12} {:>12} {:>12} {:>12}",
+                "Strategy", "BlkSize", "Qual BSC", "Perm cost", "Net total", "vs baseline"
             );
-        }
-        println!();
-
-        // Strategy: Mean quality sort
-        for &bs in &block_sizes {
-            bench_block_sort(
-                "Mean-sort (qualities)",
-                &qualities,
-                total_qual_bytes,
-                qual_baseline,
-                bs,
-                |qual| {
-                    let b = qual.as_bytes();
-                    let mean = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
-                    vec![mean as u8]
-                },
+            println!("{}", "-".repeat(110));
+            println!(
+                "{:<50} {:>8} {:>10} B {:>10}   {:>10} B {:>10}",
+                "Baseline (no sort)", "-", qual_baseline, "-", qual_baseline, "-",
             );
-        }
-        println!();
 
-        // Strategy: Quantized profile 16-bin
-        for &bs in &block_sizes {
-            bench_block_sort(
-                "Quantized 16-bin (qualities)",
-                &qualities,
-                total_qual_bytes,
-                qual_baseline,
-                bs,
-                |qual| quantize_profile(qual.as_bytes(), 16),
-            );
-        }
-        println!();
+            // Test block-based reordering for several strategies x block sizes
+            let block_sizes = [32, 64, 128, 256, 512, 1024, 4096];
 
-        // Strategy: Multi-key (mean, variance)
-        for &bs in &block_sizes {
-            bench_block_sort(
-                "Mean+var (qualities)",
-                &qualities,
-                total_qual_bytes,
-                qual_baseline,
-                bs,
-                |qual| {
-                    let b = qual.as_bytes();
-                    let n = b.len().max(1) as u64;
-                    let sum: u64 = b.iter().map(|&v| v as u64).sum();
-                    let mean = sum / n;
-                    let var: u64 = b.iter().map(|&v| {
-                        let d = (v as i64) - (mean as i64);
-                        (d * d) as u64
-                    }).sum::<u64>() / n;
-                    let mut key = Vec::with_capacity(3);
-                    key.push(mean as u8);
-                    key.extend_from_slice(&(var as u16).to_le_bytes());
-                    key
-                },
-            );
+            // Strategy: Lex sort on qualities
+            for &bs in &block_sizes {
+                bench_block_sort(
+                    "Lex-sort (qualities)",
+                    &qualities,
+                    total_qual_bytes,
+                    qual_baseline,
+                    bs,
+                    |qual| qual.as_bytes().to_vec(),
+                );
+            }
+            println!();
+
+            // Strategy: Mean quality sort
+            for &bs in &block_sizes {
+                bench_block_sort(
+                    "Mean-sort (qualities)",
+                    &qualities,
+                    total_qual_bytes,
+                    qual_baseline,
+                    bs,
+                    |qual| {
+                        let b = qual.as_bytes();
+                        let mean = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
+                        vec![mean as u8]
+                    },
+                );
+            }
+            println!();
+
+            // Strategy: Quantized profile 16-bin
+            for &bs in &block_sizes {
+                bench_block_sort(
+                    "Quantized 16-bin (qualities)",
+                    &qualities,
+                    total_qual_bytes,
+                    qual_baseline,
+                    bs,
+                    |qual| quantize_profile(qual.as_bytes(), 16),
+                );
+            }
+            println!();
+
+            // Strategy: Multi-key (mean, variance)
+            for &bs in &block_sizes {
+                bench_block_sort(
+                    "Mean+var (qualities)",
+                    &qualities,
+                    total_qual_bytes,
+                    qual_baseline,
+                    bs,
+                    |qual| {
+                        let b = qual.as_bytes();
+                        let n = b.len().max(1) as u64;
+                        let sum: u64 = b.iter().map(|&v| v as u64).sum();
+                        let mean = sum / n;
+                        let var: u64 = b
+                            .iter()
+                            .map(|&v| {
+                                let d = (v as i64) - (mean as i64);
+                                (d * d) as u64
+                            })
+                            .sum::<u64>()
+                            / n;
+                        let mut key = Vec::with_capacity(3);
+                        key.push(mean as u8);
+                        key.extend_from_slice(&(var as u16).to_le_bytes());
+                        key
+                    },
+                );
+            }
         }
-    }
+    } // end run_section("block-q")
 
     // ========================================================================
     // BLOCK-BASED REORDERING (sequences)
     // ========================================================================
-    println!("\n\n=== BLOCK-BASED REORDERING (sequences) ===\n");
-    {
-        println!(
-            "{:<50} {:>8} {:>12} {:>12} {:>12} {:>12}",
-            "Strategy", "BlkSize", "Seq BSC", "Perm cost", "Net total", "vs baseline"
-        );
-        println!("{}", "-".repeat(110));
-        println!(
-            "{:<50} {:>8} {:>10} B {:>10}   {:>10} B {:>10}",
-            "Baseline (no sort)", "-", seq_baseline, "-", seq_baseline, "-",
-        );
-
-        let block_sizes = [32, 64, 128, 256, 512, 1024, 4096];
-
-        // Strategy: Lex sort on sequences
-        for &bs in &block_sizes {
-            bench_block_sort(
-                "Lex-sort (sequences)",
-                &sequences,
-                total_seq_bytes,
-                seq_baseline,
-                bs,
-                |seq| seq.as_bytes().to_vec(),
+    if run_section("block-s") {
+        println!("\n\n=== BLOCK-BASED REORDERING (sequences) ===\n");
+        {
+            println!(
+                "{:<50} {:>8} {:>12} {:>12} {:>12} {:>12}",
+                "Strategy", "BlkSize", "Seq BSC", "Perm cost", "Net total", "vs baseline"
             );
-        }
-        println!();
-
-        // Strategy: Mean ASCII sort on sequences
-        for &bs in &block_sizes {
-            bench_block_sort(
-                "Mean-ASCII (sequences)",
-                &sequences,
-                total_seq_bytes,
-                seq_baseline,
-                bs,
-                |seq| {
-                    let b = seq.as_bytes();
-                    let mean = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
-                    vec![mean as u8]
-                },
+            println!("{}", "-".repeat(110));
+            println!(
+                "{:<50} {:>8} {:>10} B {:>10}   {:>10} B {:>10}",
+                "Baseline (no sort)", "-", seq_baseline, "-", seq_baseline, "-",
             );
-        }
-        println!();
 
-        // Strategy: Quantized profile 8-bin on sequences
-        for &bs in &block_sizes {
-            bench_block_sort(
-                "Quantized 8-bin (sequences)",
-                &sequences,
-                total_seq_bytes,
-                seq_baseline,
-                bs,
-                |seq| quantize_profile(seq.as_bytes(), 8),
-            );
+            let block_sizes = [32, 64, 128, 256, 512, 1024, 4096];
+
+            // Strategy: Lex sort on sequences
+            for &bs in &block_sizes {
+                bench_block_sort(
+                    "Lex-sort (sequences)",
+                    &sequences,
+                    total_seq_bytes,
+                    seq_baseline,
+                    bs,
+                    |seq| seq.as_bytes().to_vec(),
+                );
+            }
+            println!();
+
+            // Strategy: Mean ASCII sort on sequences
+            for &bs in &block_sizes {
+                bench_block_sort(
+                    "Mean-ASCII (sequences)",
+                    &sequences,
+                    total_seq_bytes,
+                    seq_baseline,
+                    bs,
+                    |seq| {
+                        let b = seq.as_bytes();
+                        let mean = b.iter().map(|&v| v as u64).sum::<u64>() / b.len().max(1) as u64;
+                        vec![mean as u8]
+                    },
+                );
+            }
+            println!();
+
+            // Strategy: Quantized profile 8-bin on sequences
+            for &bs in &block_sizes {
+                bench_block_sort(
+                    "Quantized 8-bin (sequences)",
+                    &sequences,
+                    total_seq_bytes,
+                    seq_baseline,
+                    bs,
+                    |seq| quantize_profile(seq.as_bytes(), 8),
+                );
+            }
         }
-    }
+    } // end run_section("block-s")
 
     println!("\n{}", "-".repeat(112));
     println!(
@@ -1719,17 +2163,23 @@ fn print_result(
 
 /// Compute minimum canonical syncmer hash for a sequence (closed syncmers).
 fn compute_min_syncmer_hash(seq: &[u8], k: usize, s: usize) -> u64 {
-    if seq.len() < k { return u64::MAX; }
+    if seq.len() < k {
+        return u64::MAX;
+    }
     let t_end = k - s;
     let positions = syncmers::find_syncmers_pos(k, s, &[0, t_end], seq);
     let mut min_hash = u64::MAX;
     for pos in positions {
-        if pos + k > seq.len() { continue; }
+        if pos + k > seq.len() {
+            continue;
+        }
         let kmer = &seq[pos..pos + k];
         if let Some(fwd) = kmer_to_hash(kmer) {
             let rc = reverse_complement_hash(fwd, k);
             let canon = fwd.min(rc);
-            if canon < min_hash { min_hash = canon; }
+            if canon < min_hash {
+                min_hash = canon;
+            }
         }
     }
     min_hash
@@ -1737,12 +2187,16 @@ fn compute_min_syncmer_hash(seq: &[u8], k: usize, s: usize) -> u64 {
 
 /// Compute minimum canonical open syncmer hash with position.
 fn compute_min_open_syncmer_hash_with_pos(seq: &[u8], k: usize, s: usize) -> (u64, u16) {
-    if seq.len() < k { return (u64::MAX, 0); }
+    if seq.len() < k {
+        return (u64::MAX, 0);
+    }
     let positions = syncmers::find_syncmers_pos(k, s, &[0], seq);
     let mut min_hash = u64::MAX;
     let mut min_pos = 0u16;
     for pos in positions {
-        if pos + k > seq.len() { continue; }
+        if pos + k > seq.len() {
+            continue;
+        }
         let kmer = &seq[pos..pos + k];
         if let Some(fwd) = kmer_to_hash(kmer) {
             let rc = reverse_complement_hash(fwd, k);
@@ -1759,16 +2213,22 @@ fn compute_min_open_syncmer_hash_with_pos(seq: &[u8], k: usize, s: usize) -> (u6
 /// Compute minimum canonical open syncmer hash.
 /// Open syncmer: smallest s-mer is at position 0 only (not at end).
 fn compute_min_open_syncmer_hash(seq: &[u8], k: usize, s: usize) -> u64 {
-    if seq.len() < k { return u64::MAX; }
+    if seq.len() < k {
+        return u64::MAX;
+    }
     let positions = syncmers::find_syncmers_pos(k, s, &[0], seq);
     let mut min_hash = u64::MAX;
     for pos in positions {
-        if pos + k > seq.len() { continue; }
+        if pos + k > seq.len() {
+            continue;
+        }
         let kmer = &seq[pos..pos + k];
         if let Some(fwd) = kmer_to_hash(kmer) {
             let rc = reverse_complement_hash(fwd, k);
             let canon = fwd.min(rc);
-            if canon < min_hash { min_hash = canon; }
+            if canon < min_hash {
+                min_hash = canon;
+            }
         }
     }
     min_hash
@@ -1776,13 +2236,17 @@ fn compute_min_open_syncmer_hash(seq: &[u8], k: usize, s: usize) -> u64 {
 
 /// Compute top-2 smallest canonical syncmer hashes.
 fn compute_top2_syncmer_hashes(seq: &[u8], k: usize, s: usize) -> (u64, u64) {
-    if seq.len() < k { return (u64::MAX, u64::MAX); }
+    if seq.len() < k {
+        return (u64::MAX, u64::MAX);
+    }
     let t_end = k - s;
     let positions = syncmers::find_syncmers_pos(k, s, &[0, t_end], seq);
     let mut h1 = u64::MAX;
     let mut h2 = u64::MAX;
     for pos in positions {
-        if pos + k > seq.len() { continue; }
+        if pos + k > seq.len() {
+            continue;
+        }
         let kmer = &seq[pos..pos + k];
         if let Some(fwd) = kmer_to_hash(kmer) {
             let rc = reverse_complement_hash(fwd, k);
@@ -1800,13 +2264,17 @@ fn compute_top2_syncmer_hashes(seq: &[u8], k: usize, s: usize) -> (u64, u64) {
 
 /// Compute minimum canonical syncmer hash and its position in the read.
 fn compute_min_syncmer_hash_with_pos(seq: &[u8], k: usize, s: usize) -> (u64, u16) {
-    if seq.len() < k { return (u64::MAX, 0); }
+    if seq.len() < k {
+        return (u64::MAX, 0);
+    }
     let t_end = k - s;
     let positions = syncmers::find_syncmers_pos(k, s, &[0, t_end], seq);
     let mut min_hash = u64::MAX;
     let mut min_pos = 0u16;
     for pos in positions {
-        if pos + k > seq.len() { continue; }
+        if pos + k > seq.len() {
+            continue;
+        }
         let kmer = &seq[pos..pos + k];
         if let Some(fwd) = kmer_to_hash(kmer) {
             let rc = reverse_complement_hash(fwd, k);
@@ -1822,12 +2290,16 @@ fn compute_min_syncmer_hash_with_pos(seq: &[u8], k: usize, s: usize) -> (u64, u1
 
 /// Compute sorted top-N canonical syncmer hashes (MinHash sketch).
 fn compute_sorted_syncmer_hashes(seq: &[u8], k: usize, s: usize, n: usize) -> Vec<u64> {
-    if seq.len() < k { return vec![u64::MAX; n]; }
+    if seq.len() < k {
+        return vec![u64::MAX; n];
+    }
     let t_end = k - s;
     let positions = syncmers::find_syncmers_pos(k, s, &[0, t_end], seq);
     let mut hashes: Vec<u64> = Vec::with_capacity(positions.len());
     for pos in positions {
-        if pos + k > seq.len() { continue; }
+        if pos + k > seq.len() {
+            continue;
+        }
         let kmer = &seq[pos..pos + k];
         if let Some(fwd) = kmer_to_hash(kmer) {
             let rc = reverse_complement_hash(fwd, k);
@@ -1845,7 +2317,9 @@ fn compute_sorted_syncmer_hashes(seq: &[u8], k: usize, s: usize, n: usize) -> Ve
 
 /// Compute top-2 smallest canonical minimizer hashes.
 fn compute_top2_minimizer_hashes(seq: &[u8], k: usize, w: usize) -> (u64, u64) {
-    if seq.len() < k { return (u64::MAX, u64::MAX); }
+    if seq.len() < k {
+        return (u64::MAX, u64::MAX);
+    }
     let mut h1 = u64::MAX;
     let mut h2 = u64::MAX;
 
@@ -1868,7 +2342,9 @@ fn compute_top2_minimizer_hashes(seq: &[u8], k: usize, w: usize) -> (u64, u64) {
 
 /// Compute canonical minimizer with its position.
 fn canonical_minimizer_with_pos(seq: &[u8], k: usize, w: usize) -> (u64, u16) {
-    if seq.len() < k { return (u64::MAX, 0); }
+    if seq.len() < k {
+        return (u64::MAX, 0);
+    }
     let mut min_hash = u64::MAX;
     let mut min_pos = 0u16;
 
@@ -1892,11 +2368,7 @@ fn canonical_minimizer_with_pos(seq: &[u8], k: usize, w: usize) -> (u64, u16) {
 fn print_delta(compressed: usize, perm_cost: usize, baseline: usize) {
     let net = compressed + perm_cost;
     let delta = net as i64 - baseline as i64;
-    println!(
-        "{:<50} {:>73}",
-        "",
-        format!("({:+} B vs baseline)", delta),
-    );
+    println!("{:<50} {:>73}", "", format!("({:+} B vs baseline)", delta),);
 }
 
 /// Invert a permutation: if perm[sorted_idx] = original_idx,
@@ -1935,7 +2407,9 @@ fn compress_perm_cycles(perm: &[u32]) -> usize {
     let mut cycle_buf: Vec<u8> = Vec::with_capacity(n * 5);
 
     for start in 0..n {
-        if visited[start] { continue; }
+        if visited[start] {
+            continue;
+        }
         // Collect cycle
         let mut cycle = Vec::new();
         let mut cur = start;
@@ -1982,7 +2456,7 @@ fn bench_block_sort<F>(
     F: Fn(&String) -> Vec<u8>,
 {
     let num_reads = data.len();
-    let num_blocks = (num_reads + block_size - 1) / block_size;
+    let num_blocks = num_reads.div_ceil(block_size);
 
     // Compute sort key per block (use mean of sort keys within block, or just first read's key)
     let mut block_keys: Vec<(Vec<u8>, usize)> = (0..num_blocks)

@@ -9,19 +9,27 @@ description = "High-performance BAM compression library using columnar encoding 
 [lib]
 name = "bz_lib"
 
+[features]
+# Pass through qz-lib's GPU (libcubwt CUDA BWT) so a cuda-built bz uses the GPU
+# for its BSC streams. Opt-in: `cargo build -p bz-cli --features cuda`.
+cuda = ["qz-lib/cuda"]
+
 [dependencies]
 qz-lib.workspace = true
 noodles.workspace = true
+noodles-bgzf.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
 tracing.workspace = true
 tempfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-zstd.workspace = true
 flate2.workspace = true
 
 [dev-dependencies]
 tracing-subscriber.workspace = true
 noodles.workspace = true
 tempfile.workspace = true
+
+[lints]
+workspace = true

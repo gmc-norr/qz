@@ -15,3 +15,7 @@ qz-lib.workspace = true
 pyo3.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+mimalloc = "0.1.50"
+
+[lints]
+workspace = true
